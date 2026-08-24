@@ -9,7 +9,7 @@ const VIDEO_JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30분 넘게 안 끝나면 포�
 const VIDEO_POLL_CRON = '*/5 * * * *'; // 이 크론이 실행되면 콘텐츠 발행 대신 영상 작업 폴링만 함
 const CF_AI_GATEWAY = 'yzusb';
 const VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
-const SCENE_COUNT = 6; // 슬라이드쇼에 쓸 장면 이미지 개수 — Workers 무료 플랜 서브요청 50개 제한 때문에 10→6으로 축소
+const SCENE_COUNT = 10; // 슬라이드쇼에 쓸 장면 이미지 개수 — 유료 플랜 전환(서브요청 10,000개)으로 다시 10장
 
 const STYLE = `
   :root{
@@ -309,7 +309,7 @@ async function searchPixabayImage(query, env, attempt = 0) {
   if (!env.PIXABAY_API_KEY) return null;
   try {
     const res = await fetch(`https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&image_type=photo&orientation=horizontal&per_page=3&safesearch=true`);
-    if (res.status === 429 && attempt < 1) {
+    if (res.status === 429 && attempt < 2) {
       await res.text().catch(() => {});
       const backoffMs = 800 * (attempt + 1); // 레이트리밋이면 잠깐 쉬었다가 최대 2번 더 시도
       console.log(`Pixabay 요청 제한("${query}"), ${backoffMs}ms 대기 후 재시도`);
@@ -348,7 +348,7 @@ async function searchPexelsImage(query, env, attempt = 0) {
     const res = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape`, {
       headers: { Authorization: env.PEXELS_API_KEY },
     });
-    if (res.status === 429 && attempt < 1) {
+    if (res.status === 429 && attempt < 2) {
       await res.text().catch(() => {});
       const backoffMs = 800 * (attempt + 1);
       console.log(`Pexels 요청 제한("${query}"), ${backoffMs}ms 대기 후 재시도`);
