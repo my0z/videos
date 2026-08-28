@@ -58,6 +58,8 @@ const STYLE = `
   .slideshow .slide.active{ opacity:1; }
   .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:1px solid rgba(255,255,255,0.4); padding:8px 16px; border-radius:20px; font-size:13px; font-weight:600; cursor:pointer; backdrop-filter:blur(4px); }
   .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
+  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:40px; z-index:4; min-height:0; background:rgba(0,0,0,0.68); color:#fff; border-radius:12px; padding:20px 24px; font-family:'Black Han Sans','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:26px; line-height:1.45; white-space:pre-line; text-align:center; text-shadow:0 2px 6px rgba(0,0,0,0.9); }
+  .slideshow .caption-box:empty{ display:none; }
 `;
 
 const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Black+Han+Sans&display=swap" rel="stylesheet">`;
@@ -287,18 +289,18 @@ function isUsableImage(buffer) {
 }
 
 async function generateScenePrompts(topic, articleTitle, env) {
-  const systemPrompt = `너는 짧은 슬라이드쇼 영상을 위한 아트 디렉터다. 주어진 주제와 글 제목을 참고해서, 정지 이미지로 표현할 장면 ${SCENE_COUNT}개를 구상한다. 각 장면은 서로 다른 각도/구도로 주제를 시각화하며, 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 각 장면마다 두 가지를 만든다: 1) keyword — 실제 스톡사진 사이트(Pexels)에서 진짜로 검색될 만한, 실존하는 사물/장소/상황을 나타내는 짧은 영어 키워드(2~4단어). 너무 추상적이거나 상상 속 장면이 아니라, 사진작가가 실제로 찍었을 법한 평범하고 구체적인 소재로 만든다(예: "laptop office desk", "grocery shopping supermarket", "family dinner table"). 2) prompt — 만약 실사진이 없을 경우에 대비한 AI 이미지 생성용 상세한 장면 묘사(사진처럼 사실적인 스타일, 한국어 또는 영어). 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"scenes": [{"keyword": "영어 검색어", "prompt": "상세 장면 묘사"}, ...]} (배열 길이는 정확히 ${SCENE_COUNT}개)`;
+  const systemPrompt = `너는 짧은 슬라이드쇼 영상을 위한 아트 디렉터다. 주어진 주제와 글 제목을 참고해서, 정지 이미지로 표현할 장면 ${SCENE_COUNT}개를 구상한다. 각 장면은 서로 다른 각도/구도로 주제를 시각화하며, 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 각 장면마다 두 가지를 만든다: 1) keyword — 실제 스톡사진 사이트(Pexels)에서 진짜로 검색될 만한, 실존하는 사물/장소/상황을 나타내는 짧은 영어 키워드(2~4단어). 너무 추상적이거나 상상 속 장면이 아니라, 사진작가가 실제로 찍었을 법한 평범하고 구체적인 소재로 만든다(예: "laptop office desk", "grocery shopping supermarket", "family dinner table"). 2) prompt — 만약 실사진이 없을 경우에 대비한 AI 이미지 생성용 상세한 장면 묘사. 이 프롬프트는 반드시 영어로만 작성한다(한국어 절대 금지) — 이미지 생성 모델이 영어 캡션으로 학습되어 있어서 한국어를 넣으면 엉뚱한 결과가 나옴. 사진처럼 사실적인 스타일, 카메라 앵글/조명까지 구체적으로 묘사. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"scenes": [{"keyword": "영어 검색어", "prompt": "영어로만 작성된 상세 장면 묘사"}, ...]} (배열 길이는 정확히 ${SCENE_COUNT}개)`;
   const userPrompt = `주제: ${topic}\n글 제목: ${articleTitle}`;
   const { result } = await callAiChain(systemPrompt, userPrompt, env);
   if (Array.isArray(result?.scenes) && result.scenes.length) {
     return result.scenes.slice(0, SCENE_COUNT).map((s) => ({
       keyword: typeof s === 'string' ? topic : (s.keyword || topic),
-      prompt: typeof s === 'string' ? s : (s.prompt || `${topic}을(를) 표현하는 사실적인 사진`),
+      prompt: typeof s === 'string' ? s : (s.prompt || `A realistic photo representing: ${topic}`),
     }));
   }
   return Array.from({ length: SCENE_COUNT }, (_, i) => ({
     keyword: topic,
-    prompt: `${topic}을(를) 표현하는 사실적인 사진, 장면 ${i + 1}`,
+    prompt: `A realistic photo representing: ${topic}, scene ${i + 1}`,
   }));
 }
 
@@ -426,7 +428,11 @@ async function getSceneImage(scene, topic, env) {
 async function generateSceneImage(prompt, env) {
   if (!env.AI) return null;
   try {
-    const response = await env.AI.run('@cf/black-forest-labs/flux-1-schnell', { prompt }, { gateway: { id: CF_AI_GATEWAY } });
+    // flux-1-schnell은 prompt/seed/steps만 지원 (width/height 파라미터 없음 — FLUX.2 계열 얘기와 다름)
+    const response = await env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
+      prompt,
+      steps: 4,
+    }, { gateway: { id: CF_AI_GATEWAY } });
     if (!response?.image) return null;
     const binary = atob(response.image);
     const bytes = new Uint8Array(binary.length);
@@ -549,19 +555,20 @@ const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
 // 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
-async function startRelayRender(rawImageKeys, audioKey, outputKey, weights, captions, env) {
+async function startRelayRender(imageKeys, audioKey, outputKey, weights, captionBeats, env) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
-  if (!rawImageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
+  if (!imageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
-  const imageUrls = rawImageKeys.map((k) => `${SITE_ORIGIN}/media/${k}`);
+  const imageUrls = imageKeys.map((k) => `${SITE_ORIGIN}/media/${k}`);
   const audioUrl = audioKey ? `${SITE_ORIGIN}/media/${audioKey}` : null;
 
   try {
     const res = await fetch(`${env.RELAY_URL}/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
-      // weights: 이미지별 자막 글자수 비율(노출시간 배분용), captions: 이미지별 실제 자막 텍스트(drawtext로 mp4에 번인)
-      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights, captions }),
+      // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
+      // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림)
+      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights, captionBeats }),
     });
     if (!res.ok) {
       const bodyText = await res.text();
@@ -630,12 +637,12 @@ async function pollPendingRenderJobs(env) {
       const post = JSON.parse(postRaw);
       post.video = job.r2Key;
 
-      // mp4가 완성되면 SVG 이미지·mp3는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
-      const toDelete = [...(post.images || []), ...(job.rawImageKeys || [])];
+      // mp4가 완성되면 이미지·mp3는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
+      const toDelete = [...(post.images || [])];
       if (post.audio) toDelete.push(post.audio);
       if (toDelete.length) {
         await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
-        console.log(`[${keyInfo.name}] SVG/mp3/원본jpg ${toDelete.length}개 정리 완료 — mp4만 남김`);
+        console.log(`[${keyInfo.name}] 이미지/mp3 ${toDelete.length}개 정리 완료 — mp4만 남김`);
       }
       post.images = [];
       post.audio = null;
@@ -756,12 +763,13 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
-// 문장을 N개 구간으로 나누되, 문장 "개수"가 아니라 "글자수"가 균등해지도록 배분 —
+// 문장을 N개 구간(이미지 개수)으로 나누되, 문장 "개수"가 아니라 "글자수"가 균등해지도록 배분 —
 // 이래야 각 이미지에 배정된 자막 분량이 실제 발화 시간과 비례해서, 나레이션 속도와 슬라이드 전환이 맞아떨어짐.
+// 문장 배열을 그대로 들고 있어야, 한 이미지에 문장이 여러 개 몰렸을 때 그걸 순서대로 갈아끼울 수 있음(자막 잘림 방지).
 function splitTextIntoNChunks(text, n) {
   const sentences = (text || '').split(/(?<=[.!?。！？])\s+/).filter(Boolean);
   if (n <= 0) return [];
-  if (!sentences.length) return Array.from({ length: n }, () => ({ text: '', weight: 1 / n }));
+  if (!sentences.length) return Array.from({ length: n }, () => ({ sentences: [], weight: 1 / n }));
 
   const totalChars = sentences.reduce((sum, s) => sum + s.length, 0) || 1;
   const target = totalChars / n;
@@ -788,14 +796,28 @@ function splitTextIntoNChunks(text, n) {
   // 문장이 여러 개 들어간 컷일수록 실제보다 더 짧게 잡히는 문제가 있었음.
   // → 문장 하나당 "정지시간에 해당하는 글자수"를 가상으로 더해서 가중치를 보정.
   const PAUSE_EQUIVALENT_CHARS = 6;
-  const chunkTexts = chunks.map((sents) => sents.join(' ').trim());
   const rawWeights = chunks.map((sents) => {
     const chars = sents.reduce((sum, s) => sum + s.length, 0);
     const pauseChars = sents.length * PAUSE_EQUIVALENT_CHARS;
     return Math.max(chars + pauseChars, PAUSE_EQUIVALENT_CHARS); // 빈 칸도 최소 노출시간은 보장
   });
   const sumWeights = rawWeights.reduce((a, b) => a + b, 0) || 1;
-  return chunkTexts.map((text, i) => ({ text, weight: rawWeights[i] / sumWeights }));
+  return chunks.map((sentences, i) => ({ sentences, weight: rawWeights[i] / sumWeights }));
+}
+
+// 한 이미지에 배정된 문장들을 "자막 비트"로 쪼갬 — 문장 하나당 비트 하나, 그 이미지가 떠 있는 동안
+// 이 비트들을 순서대로(시간순으로) 갈아끼워서 보여줌. 이전엔 문장을 다 합쳐서 3줄로 자르다 보니
+// 뒤 문장이 통째로 잘려나가는 문제가 있었는데, 비트 단위로 나누면 각 문장이 자기 몫의 시간 동안
+// 온전히 다 노출됨.
+function buildCaptionBeats(sentences) {
+  if (!sentences.length) return [];
+  const PAUSE_EQUIVALENT_CHARS = 6;
+  const rawWeights = sentences.map((s) => Math.max(s.length + PAUSE_EQUIVALENT_CHARS, PAUSE_EQUIVALENT_CHARS));
+  const sumWeights = rawWeights.reduce((a, b) => a + b, 0) || 1;
+  return sentences.map((s, i) => ({
+    text: wrapCaptionLines(s, 20, 4).join('\n'),
+    weight: rawWeights[i] / sumWeights,
+  }));
 }
 
 function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
@@ -814,39 +836,6 @@ function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
   }
   if (current) lines.push(current);
   return lines.slice(0, maxLines);
-}
-
-// 자막 스타일: mp4(ffmpeg drawtext)와 동일하게 Black Han Sans 굵은 서체 + 진한 배경 박스로 통일.
-// 그라데이션 대신 확실한 반투명 박스를 깔아서 어떤 사진 위에서도 대비가 확보되게 함.
-function buildCaptionedImageSvg(imageBuffer, caption) {
-  const width = 1280;
-  const height = 720;
-  const dataUri = `data:image/jpeg;base64,${arrayBufferToBase64(imageBuffer)}`;
-  const lines = wrapCaptionLines(caption, 20, 3);
-  const fontSize = 48;
-  const lineHeight = 60;
-  const boxPaddingV = 28;
-  const textBlockHeight = lines.length * lineHeight;
-  const boxHeight = lines.length ? textBlockHeight + boxPaddingV * 2 : 0;
-  const boxY = height - boxHeight - 40;
-  const firstLineY = boxY + boxPaddingV + fontSize * 0.78;
-  const tspans = lines
-    .map((line, i) => `<tspan x="${width / 2}" y="${firstLineY + i * lineHeight}">${escapeXml(line)}</tspan>`)
-    .join('');
-  const captionMarkup = lines.length
-    ? `<rect x="24" y="${boxY}" width="${width - 48}" height="${boxHeight}" rx="12" fill="#000000" fill-opacity="0.68"/>
-       <text
-         font-family="'Black Han Sans','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif"
-         font-size="${fontSize}" font-weight="400" text-anchor="middle"
-         letter-spacing="0.3"
-         paint-order="stroke fill" stroke="rgba(0,0,0,0.9)" stroke-width="8" stroke-linejoin="round"
-         fill="#ffffff"
-       >${tspans}</text>`
-    : '';
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-    <image href="${dataUri}" x="0" y="0" width="${width}" height="${height}" preserveAspectRatio="xMidYMid slice"/>
-    ${captionMarkup}
-  </svg>`;
 }
 
 // 동시성 제한된 map — 한꺼번에 다 병렬로 쏘면 Pixabay 초당 요청 제한(429)에 바로 걸림
@@ -895,41 +884,33 @@ async function generateAndSavePost(topic, env) {
   }
 
   let images = [];
-  let rawImageKeys = [];
   let captionWeights = [];
-  let captionTexts = []; // ffmpeg drawtext용 — 줄바꿈까지 미리 적용된 자막 텍스트
+  let captionBeats = []; // 이미지별 자막 "비트" 배열 — 한 이미지에 문장 여러 개면 순서대로 갈아끼울 목록
   if (env.MEDIA) {
-    // 이미지 소스는 저작권이 명확한 것만 사용: Pixabay/Pexels(무료 라이선스) → FLUX(직접 생성) 순서
+    // 이미지 소스는 저작권이 명확한 것만 사용: FLUX 우선 생성 → 실패시 Pixabay → Pexels
     const scenes = await generateScenePrompts(topic, article.title, env);
     const rawImages = (await mapWithConcurrency(scenes, 3, (s) => getSceneImage(s, topic, env))).filter(Boolean);
     console.log(`장면 원본 이미지 ${rawImages.length}/${scenes.length}개 확보`);
 
-    // 내레이션 텍스트를 확보된 이미지 개수만큼 나눠서, 각 이미지 파일 안에 자막으로 직접 그려넣음(번인) — 웹 슬라이드쇼용.
-    // 글자수 비례로 나눈 chunk의 weight를 그대로 저장해뒀다가, 웹 슬라이드쇼 전환 속도/mp4 렌더링 이미지 노출시간에
-    // 동일하게 적용해서 자막 분량과 실제 노출시간이 항상 비례하도록 함(= 나레이션 속도와 자막 싱크).
-    const perImageCaptions = splitTextIntoNChunks(narrationText, rawImages.length || 1);
+    // 내레이션 텍스트를 확보된 이미지 개수만큼 나눠서 각 이미지에 배정 — 자막은 이미지에 직접 굽지 않고
+    // 웹/mp4 둘 다 "그 이미지가 떠 있는 동안 문장을 순서대로 갈아끼우는" 방식으로 오버레이함
+    // (한 이미지에 문장이 여러 개 몰려도 잘려나가지 않고 전부 노출됨).
+    const perImageChunks = splitTextIntoNChunks(narrationText, rawImages.length || 1);
     for (let i = 0; i < rawImages.length; i++) {
-      const chunk = perImageCaptions[i] || { text: '', weight: 1 / (rawImages.length || 1) };
-      const svg = buildCaptionedImageSvg(rawImages[i], chunk.text);
-      const key = `${slug}-scene-${i}.svg`;
-      await env.MEDIA.put(key, svg, { httpMetadata: { contentType: 'image/svg+xml' } });
+      const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (rawImages.length || 1) };
+      const key = `${slug}-scene-${i}.jpg`;
+      await env.MEDIA.put(key, rawImages[i], { httpMetadata: { contentType: 'image/jpeg' } });
       images.push(key);
       captionWeights.push(chunk.weight);
-      // SVG랑 똑같은 줄바꿈 규칙으로 미리 wrap해서 relay에 넘김 — mp4에도 동일한 자막이 그대로 들어가게
-      captionTexts.push(wrapCaptionLines(chunk.text, 20, 3).join('\n'));
-
-      // ffmpeg가 안정적으로 읽을 수 있게 자막 없는 순수 JPEG 원본도 별도 저장 (mp4 렌더링 전용, 자막은 relay가 drawtext로 입힘)
-      const rawKey = `${slug}-raw-${i}.jpg`;
-      await env.MEDIA.put(rawKey, rawImages[i], { httpMetadata: { contentType: 'image/jpeg' } });
-      rawImageKeys.push(rawKey);
+      captionBeats.push(buildCaptionBeats(chunk.sentences));
     }
-    console.log(`자막이 삽입된 이미지 ${images.length}개 + ffmpeg용 원본 이미지 ${rawImageKeys.length}개 저장 완료`);
+    console.log(`장면 이미지 ${images.length}개 저장 완료`);
   }
 
   const post = {
     slug, topic, title: article.title, createdAt: new Date().toISOString(),
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
-    images, audio: audioKey, usedNews, captionWeights,
+    images, audio: audioKey, usedNews, captionWeights, captionBeats,
   };
   await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
   const idxRaw = await env.POSTS.get('index');
@@ -938,12 +919,12 @@ async function generateAndSavePost(topic, env) {
   await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
 
   // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
-  if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && rawImageKeys.length) {
+  if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && images.length) {
     const outputKey = `${slug}.mp4`;
-    const render = await startRelayRender(rawImageKeys, audioKey, outputKey, captionWeights, captionTexts, env);
+    const render = await startRelayRender(images, audioKey, outputKey, captionWeights, captionBeats, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
-        jobId: render.jobId, slug, r2Key: outputKey, rawImageKeys, startedAt: Date.now(),
+        jobId: render.jobId, slug, r2Key: outputKey, imageKeys: images, startedAt: Date.now(),
       }));
       console.log(`릴레이 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
     } else {
@@ -962,13 +943,18 @@ function renderSlideshow(post) {
   const audioTag = hasAudio ? `<audio id="narration-${post.slug}" src="/media/${post.audio}" preload="auto"></audio>` : '';
   // 자동재생 없음 — 항상 이 버튼을 눌러야 슬라이드쇼(+음성)가 시작됨
   const playBtn = `<button class="playbtn" id="playbtn-${post.slug}">▶ 재생</button>`;
+  const captionBox = `<div class="caption-box" id="caption-${post.slug}"></div>`;
   const weightsJson = JSON.stringify(Array.isArray(post.captionWeights) ? post.captionWeights : []);
+  // 이미지별 자막 "비트" — 그 이미지가 떠 있는 동안 순서대로 갈아끼울 문장 목록(문장이 여러 개 몰려도 안 잘림)
+  const beatsJson = JSON.stringify(Array.isArray(post.captionBeats) ? post.captionBeats : []);
   const script = `<script>
     (function(){
       var root = document.getElementById('slideshow-${post.slug}');
       var slides = root.querySelectorAll('.slide');
+      var captionEl = document.getElementById('caption-${post.slug}');
       var weights = ${weightsJson};
-      var current = 0, timerId = null, isPlaying = false;
+      var beatsPerSlide = ${beatsJson};
+      var current = 0, timerId = null, beatTimerId = null, isPlaying = false;
       var DEFAULT_MS = 6000;
       function show(i){ slides.forEach(function(s,idx){ s.classList.toggle('active', idx===i); }); }
       // 자막 글자수 비율(weights)이 있으면 그 비율대로, 없으면 균등 분배 — 어느 쪽이든 합은 totalMs
@@ -980,10 +966,27 @@ function renderSlideshow(post) {
         return slides.length ? Array.from({length:slides.length}, function(){ return totalMs/slides.length; }) : [];
       }
       var currentDurations = durationsFor(DEFAULT_MS * slides.length);
+      // 현재 슬라이드에 배정된 문장(비트)들을 그 슬라이드 노출시간 안에서 순서대로 갈아끼움
+      function playBeats(slideIndex, slideDurationMs){
+        clearTimeout(beatTimerId);
+        var beats = beatsPerSlide[slideIndex];
+        if (!beats || !beats.length) { captionEl.textContent = ''; return; }
+        var sum = beats.reduce(function(a,b){ return a + (b.weight || 1); }, 0) || 1;
+        var bIdx = 0;
+        function showBeat(){
+          if (bIdx >= beats.length) return;
+          captionEl.textContent = beats[bIdx].text || '';
+          var ms = Math.max(800, (beats[bIdx].weight / sum) * slideDurationMs);
+          bIdx++;
+          if (bIdx < beats.length) beatTimerId = setTimeout(showBeat, ms);
+        }
+        showBeat();
+      }
       function scheduleNext(){
         clearTimeout(timerId);
         if (!slides.length || !isPlaying) return;
         var d = currentDurations[current] || DEFAULT_MS;
+        playBeats(current, d);
         timerId = setTimeout(function(){
           current = (current + 1) % slides.length;
           show(current);
@@ -1002,6 +1005,7 @@ function renderSlideshow(post) {
         isPlaying = false;
         btn.textContent = '▶ 재생';
         clearTimeout(timerId);
+        clearTimeout(beatTimerId);
         ${hasAudio ? 'audio.pause();' : ''}
       }
       btn.addEventListener('click', function(){
@@ -1020,7 +1024,7 @@ function renderSlideshow(post) {
       ` : ''}
     })();
   </script>`;
-  return `<div class="slideshow" id="slideshow-${post.slug}">${slides}${playBtn}</div>${audioTag}${script}`;
+  return `<div class="slideshow" id="slideshow-${post.slug}">${slides}${captionBox}${playBtn}</div>${audioTag}${script}`;
 }
 
 async function renderHomePage(env) {
