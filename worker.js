@@ -385,16 +385,8 @@ async function searchPexelsImage(query, env, attempt = 0) {
 }
 
 async function getSceneImage(scene, topic, env) {
-  // 1순위: Workers AI(FLUX) — 요청 제한(429) 걱정 없이 바로 생성, 초상권/저작권 문제 원천 차단
-  let image = await generateSceneImage(scene.prompt, env);
-  if (image) {
-    console.log(`FLUX 이미지 생성 사용: "${scene.keyword}"`);
-    return image;
-  }
-
-  // 2순위: FLUX 실패(바인딩 오류 등 드문 경우)했을 때만 Pixabay로 보완
-  console.log(`FLUX 생성 실패, Pixabay로 대체 시도: "${scene.keyword}"`);
-  image = await searchPixabayImage(scene.keyword, env);
+  // 1순위: Pixabay — 규모가 크고(1900만+) 빠름(다운로드 위주라 FLUX 생성보다 훨씬 짧게 걸림)
+  let image = await searchPixabayImage(scene.keyword, env);
   if (image) {
     console.log(`Pixabay 이미지 사용(장면 키워드): "${scene.keyword}"`);
     return image;
@@ -407,7 +399,7 @@ async function getSceneImage(scene, topic, env) {
     }
   }
 
-  // 3순위: 그래도 안 되면 Pexels까지
+  // 2순위: Pexels — 마찬가지로 라이선스 안전한 스톡사진, Pixabay에 없을 때 보조
   image = await searchPexelsImage(scene.keyword, env);
   if (image) {
     console.log(`Pexels 이미지 사용(장면 키워드): "${scene.keyword}"`);
@@ -420,6 +412,11 @@ async function getSceneImage(scene, topic, env) {
       return image;
     }
   }
+
+  // 3순위: 실사진을 못 찾았을 때만 FLUX로 생성(느림, 최후 수단)
+  console.log(`Pixabay/Pexels 결과 없음(장면/주제 둘 다), FLUX로 생성: "${scene.keyword}"`);
+  image = await generateSceneImage(scene.prompt, env);
+  if (image) return image;
 
   console.log(`모든 이미지 소스 실패: "${scene.keyword}"`);
   return null;
