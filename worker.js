@@ -626,7 +626,14 @@ async function pollPendingRenderJobs(env) {
     }
 
     if (isFailed) {
-      console.log(`[${keyInfo.name}] 릴레이 렌더링 실패 — ${data?.error || '알 수 없는 오류'}`);
+      const errMsg = data?.error || '알 수 없는 오류';
+      console.log(`[${keyInfo.name}] 릴레이 렌더링 실패 — ${errMsg}`);
+      const failedPostRaw = await env.POSTS.get(`post:${job.slug}`);
+      if (failedPostRaw) {
+        const failedPost = JSON.parse(failedPostRaw);
+        failedPost.videoError = errMsg;
+        await env.POSTS.put(`post:${job.slug}`, JSON.stringify(failedPost));
+      }
       await env.POSTS.delete(keyInfo.name);
       continue;
     }
@@ -928,8 +935,14 @@ async function generateAndSavePost(topic, env) {
       }));
       console.log(`릴레이 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
     } else {
+      // 시작 자체가 실패한 경우 admin 화면에 이유가 보이게 post에도 남겨둠 (안 그러면 "—"로만 보여서 뭔지 알 수 없음)
+      post.videoError = render.error;
+      await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
       console.log(`릴레이 렌더링 작업 시작 실패(글 발행은 계속 진행): ${render.error}`);
     }
+  } else if (!env.RELAY_URL || !env.RELAY_SECRET) {
+    post.videoError = 'RELAY_URL/RELAY_SECRET 미설정';
+    await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
   }
 
   console.log(`발행 완료: ${slug}`);
@@ -1038,7 +1051,7 @@ async function renderHomePage(env) {
 
   const entries = posts.map((p) => {
     const excerpt = makeExcerpt(p.intro);
-    const dateStr = new Date(p.createdAt).toLocaleDateString('ko-KR', { month: 'long', day: 'numeric' });
+    const dateStr = new Date(p.createdAt).toLocaleDateString('ko-KR', { month: 'long', day: 'numeric', timeZone: 'Asia/Seoul' });
     const thumb = p.images?.[0] ? `<div class="entry-thumb"><img src="/media/${p.images[0]}" alt="${escapeHtml(p.title)}"></div>` : '';
     return `<a class="entry" href="/${p.slug}">
       <div class="entry-main">
@@ -1081,7 +1094,7 @@ async function renderPostPage(env, slug) {
   const body = `${siteHeader()}
     <div class="wrap post-body">
       <h1>${escapeHtml(p.title)}</h1>
-      <div class="meta">${escapeHtml(p.topic)} · ${new Date(p.createdAt).toLocaleDateString('ko-KR')}</div>
+      <div class="meta">${escapeHtml(p.topic)} · ${new Date(p.createdAt).toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul' })}</div>
       ${veoVideoBlock}
       ${slideshow}
       ${p.intro}
@@ -1119,13 +1132,15 @@ async function renderAdminPage(env) {
       ? '🎬 mp4 완료'
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
-        : '—';
+        : p.videoError
+          ? `❌ 실패: ${escapeHtml(p.videoError.slice(0, 60))}`
+          : '—';
     return `<tr>
       <td>${escapeHtml(p.title)}</td>
       <td class="mono">${escapeHtml(p.topic)}</td>
       <td class="mono">${mediaStatus}</td>
       <td class="mono">${videoStatus}</td>
-      <td class="mono">${new Date(p.createdAt).toLocaleString('ko-KR')}</td>
+      <td class="mono">${new Date(p.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}</td>
       <td><a href="/${p.slug}" target="_blank">보기</a></td>
       <td><form method="POST" action="/admin/delete" style="margin:0;"><input type="hidden" name="slug" value="${p.slug}"><button class="danger" type="submit">삭제</button></form></td>
     </tr>`;
