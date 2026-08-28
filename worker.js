@@ -70,6 +70,7 @@ export default {
       if (path === '/') return await renderHomePage(env);
       if (path === '/admin') return await renderAdminPage(env);
       if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env);
+      if (path === '/api/generate' && request.method === 'POST') return await handleApiGenerate(request, env);
       if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
       if (path === '/admin/render-progress') return await handleRenderProgress(request, env);
       if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
@@ -382,8 +383,16 @@ async function searchPexelsImage(query, env, attempt = 0) {
 }
 
 async function getSceneImage(scene, topic, env) {
-  // 1순위: Pixabay — 규모가 훨씬 크고(1900만+), 요청 제한도 없어서 매칭률이 더 좋음
-  let image = await searchPixabayImage(scene.keyword, env);
+  // 1순위: Workers AI(FLUX) — 요청 제한(429) 걱정 없이 바로 생성, 초상권/저작권 문제 원천 차단
+  let image = await generateSceneImage(scene.prompt, env);
+  if (image) {
+    console.log(`FLUX 이미지 생성 사용: "${scene.keyword}"`);
+    return image;
+  }
+
+  // 2순위: FLUX 실패(바인딩 오류 등 드문 경우)했을 때만 Pixabay로 보완
+  console.log(`FLUX 생성 실패, Pixabay로 대체 시도: "${scene.keyword}"`);
+  image = await searchPixabayImage(scene.keyword, env);
   if (image) {
     console.log(`Pixabay 이미지 사용(장면 키워드): "${scene.keyword}"`);
     return image;
@@ -396,7 +405,7 @@ async function getSceneImage(scene, topic, env) {
     }
   }
 
-  // 2순위: Pexels — 마찬가지로 라이선스 안전한 스톡사진, Pixabay에 없을 때 보조
+  // 3순위: 그래도 안 되면 Pexels까지
   image = await searchPexelsImage(scene.keyword, env);
   if (image) {
     console.log(`Pexels 이미지 사용(장면 키워드): "${scene.keyword}"`);
@@ -410,9 +419,8 @@ async function getSceneImage(scene, topic, env) {
     }
   }
 
-  // 3순위: 저작권이 확인되는 실사진을 못 찾으면 그때만 AI로 비슷하게 생성
-  console.log(`Pixabay/Pexels 결과 없음(장면/주제 둘 다), FLUX로 생성: "${scene.keyword}"`);
-  return await generateSceneImage(scene.prompt, env);
+  console.log(`모든 이미지 소스 실패: "${scene.keyword}"`);
+  return null;
 }
 
 async function generateSceneImage(prompt, env) {
@@ -1199,6 +1207,34 @@ async function handleGenerate(request, env) {
   const result = await generateAndSavePost(topic, env);
   const msg = result.ok ? `발행 완료: ${result.post.title}` : `생성 실패 — ${result.reason}`;
   return new Response(null, { status: 302, headers: { Location: '/admin?msg=' + encodeURIComponent(msg) } });
+}
+
+// 다른 워커(zerozistocks 등)가 프로그램적으로 영상 생성을 트리거하는 용도 — API 키 인증 필요.
+// 동기 응답으로 slug/url을 바로 돌려줌(글+이미지+음성까지는 동기 완료, mp4 렌더링만 백그라운드로 이어짐) —
+// 호출한 쪽은 이 url을 그 자리에서 바로 자기 콘텐츠에 링크로 박아 넣으면 됨.
+async function handleApiGenerate(request, env) {
+  if (!env.VIDEO_API_KEY) return new Response(JSON.stringify({ ok: false, error: 'VIDEO_API_KEY 미설정' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  const key = request.headers.get('x-api-key');
+  if (key !== env.VIDEO_API_KEY) return new Response(JSON.stringify({ ok: false, error: 'unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: 'invalid json' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  }
+  const topic = (body.topic || '').toString().trim().slice(0, 100);
+  if (!topic) return new Response(JSON.stringify({ ok: false, error: 'topic 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+
+  const result = await generateAndSavePost(topic, env);
+  if (!result.ok) return new Response(JSON.stringify({ ok: false, error: result.reason }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+
+  return new Response(JSON.stringify({
+    ok: true,
+    slug: result.post.slug,
+    title: result.post.title,
+    url: `${SITE_ORIGIN}/${result.post.slug}`,
+  }), { headers: { 'Content-Type': 'application/json' } });
 }
 
 async function handleDelete(request, env) {
