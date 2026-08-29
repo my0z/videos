@@ -60,7 +60,7 @@ const STYLE = `
   .slideshow .slide.active{ opacity:1; }
   .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:1px solid rgba(255,255,255,0.4); padding:8px 16px; border-radius:20px; font-size:13px; font-weight:600; cursor:pointer; backdrop-filter:blur(4px); }
   .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
-  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:10px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Do Hyeon','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:35px; line-height:1.3; white-space:pre-line; text-align:center;
+  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:80px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Do Hyeon','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:35px; line-height:1.3; white-space:pre-line; text-align:center;
     -webkit-text-stroke:7px #000;
     paint-order:stroke fill;
     text-shadow:-6px -6px 0 #000, 6px -6px 0 #000, -6px 6px 0 #000, 6px 6px 0 #000, 0 -6px 0 #000, 0 6px 0 #000, -6px 0 0 #000, 6px 0 0 #000;
