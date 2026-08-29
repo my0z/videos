@@ -60,7 +60,7 @@ const STYLE = `
   .slideshow .slide.active{ opacity:1; }
   .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:1px solid rgba(255,255,255,0.4); padding:8px 16px; border-radius:20px; font-size:13px; font-weight:600; cursor:pointer; backdrop-filter:blur(4px); }
   .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
-  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:40px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Do Hyeon','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:20px; line-height:1.4; white-space:pre-line; text-align:center;
+  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:10px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Do Hyeon','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:14px; line-height:1.3; white-space:pre-line; text-align:center;
     -webkit-text-stroke:3px #000;
     paint-order:stroke fill;
     text-shadow:-2.5px -2.5px 0 #000, 2.5px -2.5px 0 #000, -2.5px 2.5px 0 #000, 2.5px 2.5px 0 #000, 0 -2.5px 0 #000, 0 2.5px 0 #000, -2.5px 0 0 #000, 2.5px 0 0 #000;
@@ -601,6 +601,41 @@ async function startRelayRender(imageKeys, audioKey, outputKey, weights, caption
   }
 }
 
+// 렌더링 완료/실패 처리를 공통 함수로 분리 — 5분 크론뿐 아니라 admin 페이지가 실시간으로 상태를
+// 물어볼 때도(handleRenderProgress) 그 자리에서 바로 반영시켜서, "완료라고 뜨는데 실제로는 최대 5분
+// 기다려야 반영되는" 시차를 없앰.
+async function finalizeRenderDone(job, renderJobKeyName, env) {
+  const postRaw = await env.POSTS.get(`post:${job.slug}`);
+  if (postRaw) {
+    const post = JSON.parse(postRaw);
+    post.video = job.r2Key;
+
+    // mp4가 완성되면 이미지·mp3는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
+    const toDelete = [...(post.images || [])];
+    if (post.audio) toDelete.push(post.audio);
+    if (toDelete.length) {
+      await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
+    }
+    post.images = [];
+    post.audio = null;
+
+    await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
+  }
+  await env.POSTS.delete(renderJobKeyName);
+  console.log(`[${renderJobKeyName}] 릴레이 렌더링 완료 및 저장: ${job.r2Key}`);
+}
+
+async function finalizeRenderFailed(job, renderJobKeyName, errMsg, env) {
+  const failedPostRaw = await env.POSTS.get(`post:${job.slug}`);
+  if (failedPostRaw) {
+    const failedPost = JSON.parse(failedPostRaw);
+    failedPost.videoError = errMsg;
+    await env.POSTS.put(`post:${job.slug}`, JSON.stringify(failedPost));
+  }
+  await env.POSTS.delete(renderJobKeyName);
+  console.log(`[${renderJobKeyName}] 릴레이 렌더링 실패 — ${errMsg}`);
+}
+
 async function pollPendingRenderJobs(env) {
   const list = await env.POSTS.list({ prefix: 'renderJob:' });
   if (!list.keys.length) {
@@ -646,39 +681,11 @@ async function pollPendingRenderJobs(env) {
     }
 
     if (isFailed) {
-      const errMsg = data?.error || '알 수 없는 오류';
-      console.log(`[${keyInfo.name}] 릴레이 렌더링 실패 — ${errMsg}`);
-      const failedPostRaw = await env.POSTS.get(`post:${job.slug}`);
-      if (failedPostRaw) {
-        const failedPost = JSON.parse(failedPostRaw);
-        failedPost.videoError = errMsg;
-        await env.POSTS.put(`post:${job.slug}`, JSON.stringify(failedPost));
-      }
-      await env.POSTS.delete(keyInfo.name);
+      await finalizeRenderFailed(job, keyInfo.name, data?.error || '알 수 없는 오류', env);
       continue;
     }
 
-    // 릴레이가 이미 R2(env.MEDIA와 동일 버킷)에 mp4를 직접 업로드해둔 상태 — 재다운로드/재업로드 불필요
-    const postRaw = await env.POSTS.get(`post:${job.slug}`);
-    if (postRaw) {
-      const post = JSON.parse(postRaw);
-      post.video = job.r2Key;
-
-      // mp4가 완성되면 이미지·mp3는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
-      const toDelete = [...(post.images || [])];
-      if (post.audio) toDelete.push(post.audio);
-      if (toDelete.length) {
-        await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
-        console.log(`[${keyInfo.name}] 이미지/mp3 ${toDelete.length}개 정리 완료 — mp4만 남김`);
-      }
-      post.images = [];
-      post.audio = null;
-
-      await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
-    }
-
-    await env.POSTS.delete(keyInfo.name);
-    console.log(`[${keyInfo.name}] 릴레이 렌더링 완료 및 저장: ${job.r2Key}`);
+    await finalizeRenderDone(job, keyInfo.name, env);
   }
 }
 
@@ -832,19 +839,23 @@ function splitTextIntoNChunks(text, n) {
   return chunks.map((sentences, i) => ({ sentences, weight: rawWeights[i] / sumWeights }));
 }
 
-// 한 이미지에 배정된 문장들을 "자막 비트"로 쪼갬 — 문장 하나당 비트 하나, 그 이미지가 떠 있는 동안
-// 이 비트들을 순서대로(시간순으로) 갈아끼워서 보여줌. 이전엔 문장을 다 합쳐서 3줄로 자르다 보니
-// 뒤 문장이 통째로 잘려나가는 문제가 있었는데, 비트 단위로 나누면 각 문장이 자기 몫의 시간 동안
-// 온전히 다 노출됨.
+// 한 이미지에 배정된 문장들을 "자막 비트"로 쪼갬 — 이번엔 문장 단위가 아니라 "줄" 단위로 쪼개서,
+// 화면엔 항상 한 줄만 보이고 그 줄이 순서대로 갈아끼워짐(긴 문장이 여러 줄 한꺼번에 뜨지 않음).
+// 각 줄의 노출시간은 글자수 비례, 문장이 끝나는 마지막 줄에만 정지시간(가상 글자수)을 더해줌.
 function buildCaptionBeats(sentences) {
   if (!sentences.length) return [];
   const PAUSE_EQUIVALENT_CHARS = 6;
-  const rawWeights = sentences.map((s) => Math.max(s.length + PAUSE_EQUIVALENT_CHARS, PAUSE_EQUIVALENT_CHARS));
-  const sumWeights = rawWeights.reduce((a, b) => a + b, 0) || 1;
-  return sentences.map((s, i) => ({
-    text: wrapCaptionLines(s, 20, 4).join('\n'),
-    weight: rawWeights[i] / sumWeights,
-  }));
+  const beats = [];
+  for (const s of sentences) {
+    const lines = wrapCaptionLines(s, 20, 50); // 줄 수 제한 없이 문장 전체를 다 담음(한 줄씩 보여줄 거라 잘릴 일 없음)
+    lines.forEach((line, li) => {
+      const isLastLineOfSentence = li === lines.length - 1;
+      const weight = Math.max(line.length + (isLastLineOfSentence ? PAUSE_EQUIVALENT_CHARS : 0), 4);
+      beats.push({ text: line, weight });
+    });
+  }
+  const sumWeights = beats.reduce((a, b) => a + b.weight, 0) || 1;
+  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights }));
 }
 
 function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
@@ -1227,6 +1238,45 @@ async function renderAdminPage(env, requestUrl) {
   const hasGenPending = genJobs.some((j) => !j.failed);
   const progressScript = (hasPending || hasGenPending) ? `<script>
     (function(){
+      function bumpCount(delta){
+        var h2 = document.querySelector('h2');
+        if (!h2) return;
+        var m = h2.textContent.match(/\\d+/);
+        if (m) h2.textContent = h2.textContent.replace(/\\d+/, (parseInt(m[0], 10) + delta));
+      }
+      function esc(s){ return (s == null ? '' : String(s)); }
+      function insertPostRow(p){
+        var emptyRow = document.getElementById('empty-row');
+        if (emptyRow) emptyRow.remove();
+        var anchor = document.getElementById('posts-anchor');
+        if (!anchor) return;
+        var tr = document.createElement('tr');
+
+        var tdTitle = document.createElement('td'); tdTitle.textContent = esc(p.title); tr.appendChild(tdTitle);
+        var tdTopic = document.createElement('td'); tdTopic.className = 'mono'; tdTopic.textContent = esc(p.topic); tr.appendChild(tdTopic);
+
+        var tdMedia = document.createElement('td'); tdMedia.className = 'mono';
+        tdMedia.textContent = (p.imageCount ? ('🖼️ ' + p.imageCount + '장') : '이미지 없음') + (p.audio ? ' · 🔊 음성' : '') + (p.usedNews ? ' · 📰 뉴스참고' : '');
+        tr.appendChild(tdMedia);
+
+        var tdVideo = document.createElement('td'); tdVideo.className = 'mono';
+        var span = document.createElement('span'); span.className = 'render-progress'; span.dataset.slug = p.slug; span.textContent = '대기 중 · 0%';
+        tdVideo.appendChild(span); tr.appendChild(tdVideo);
+
+        var tdDate = document.createElement('td'); tdDate.className = 'mono'; tdDate.textContent = esc(p.createdAtText); tr.appendChild(tdDate);
+
+        var tdView = document.createElement('td');
+        var a = document.createElement('a'); a.href = '/' + p.slug; a.target = '_blank'; a.textContent = '보기';
+        tdView.appendChild(a); tr.appendChild(tdView);
+
+        var tdDel = document.createElement('td');
+        var form = document.createElement('form'); form.method = 'POST'; form.action = '/admin/delete'; form.style.margin = '0';
+        var inp = document.createElement('input'); inp.type = 'hidden'; inp.name = 'slug'; inp.value = p.slug; form.appendChild(inp);
+        var btn = document.createElement('button'); btn.className = 'danger'; btn.type = 'submit'; btn.textContent = '삭제'; form.appendChild(btn);
+        tdDel.appendChild(form); tr.appendChild(tdDel);
+
+        anchor.insertAdjacentElement('afterend', tr); // 매번 앵커 바로 뒤에 꽂으면 최신순 유지됨
+      }
       function pollRender(){
         var renderEls = document.querySelectorAll('.render-progress');
         renderEls.forEach(function(el){
@@ -1264,8 +1314,11 @@ async function renderAdminPage(env, requestUrl) {
             .then(function(r){ return r.json(); })
             .then(function(data){
               if (data.status === 'done') {
-                el.textContent = '✅ 완료: ' + (data.topic || '') + ' — 새로 만들어진 글은 아래 목록에 곧 나타나요';
                 el.dataset.terminal = '1';
+                var tr = el.closest('tr');
+                if (tr) tr.remove(); // 진행률 줄 없애고, 실제 글 행으로 교체
+                if (data.post) insertPostRow(data.post);
+                bumpCount(1);
                 return;
               }
               if (data.status === 'not_found') {
@@ -1298,7 +1351,7 @@ async function renderAdminPage(env, requestUrl) {
       <button type="submit">글+슬라이드쇼 생성</button>
     </form>
     <div class="table-scroll"><table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>작성일</th><th></th><th></th></tr></thead>
-    <tbody>${genJobRows}${rows || (genJobRows ? '' : '<tr><td colspan="7">글이 없습니다.</td></tr>')}</tbody></table></div>
+    <tbody>${genJobRows}<tr id="posts-anchor" style="display:none;"><td colspan="7"></td></tr>${rows || '<tr id="empty-row"><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table></div>
   </div>${progressScript}`;
 
   return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
@@ -1422,7 +1475,17 @@ async function handleGenerateStep(request, env) {
     job = await runGenerationStep(job, env);
     if (job.stage === 'done') {
       await env.POSTS.delete(`genJob:${id}`);
-      return new Response(JSON.stringify({ status: 'done', slug: job.slug }), { headers: { 'Content-Type': 'application/json' } });
+      const postRaw = await env.POSTS.get(`post:${job.slug}`);
+      const post = postRaw ? JSON.parse(postRaw) : null;
+      return new Response(JSON.stringify({
+        status: 'done',
+        slug: job.slug,
+        post: post ? {
+          title: post.title, topic: post.topic, slug: post.slug,
+          imageCount: post.images?.length || 0, audio: !!post.audio, usedNews: !!post.usedNews,
+          createdAtText: new Date(post.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }),
+        } : null,
+      }), { headers: { 'Content-Type': 'application/json' } });
     }
     job.startedAt = Date.now(); // 마지막 갱신 시각(멈춤 판정용)
     await env.POSTS.put(`genJob:${id}`, JSON.stringify(job));
@@ -1459,6 +1522,12 @@ async function handleRenderProgress(request, env) {
       return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
     }
     const data = await res.json();
+    // 릴레이가 done/failed라고 하면 여기서 바로 post에 반영 — 5분 크론까지 기다리게 하지 않음
+    if (data.status === 'done') {
+      await finalizeRenderDone(job, `renderJob:${slug}`, env);
+    } else if (data.status === 'failed') {
+      await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
+    }
     return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
