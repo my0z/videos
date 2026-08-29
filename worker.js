@@ -75,10 +75,11 @@ export default {
     try {
       if (path === '/') return await renderHomePage(env);
       if (path === '/admin') return await renderAdminPage(env);
-      if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env);
+      if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env, ctx);
       if (path === '/api/generate' && request.method === 'POST') return await handleApiGenerate(request, env);
       if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
       if (path === '/admin/render-progress') return await handleRenderProgress(request, env);
+      if (path === '/admin/generate-progress') return await handleGenerateProgress(request, env);
       if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
       const rootSlugMatch = path.match(/^\/([^\/]+)$/);
       if (rootSlugMatch) return await renderPostPage(env, decodeURIComponent(rootSlugMatch[1]));
@@ -861,13 +862,16 @@ async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
-async function generateAndSavePost(topic, env) {
+async function generateAndSavePost(topic, env, onProgress) {
+  const report = (stage, percent) => { if (onProgress) onProgress(stage, percent); };
   if (!env.POSTS) return { ok: false, reason: 'POSTS(KV) 바인딩 없음' };
 
+  report('뉴스 검색 중', 5);
   // 실제로 운영 중인 사이트(뉴스)가 있는지 최우선으로 검색 — 글 작성 근거이자 이미지 출처로도 재사용
   const newsResults = await searchNaverNews(topic, env);
   const usedNews = newsResults.length > 0;
 
+  report('글 작성 중', 15);
   const { article, error: articleError, modelUsed } = await generateArticle(topic, newsResults, env);
   if (!article) {
     return { ok: false, reason: `글 생성 실패 — ${articleError || '알 수 없는 오류'}` };
@@ -879,6 +883,7 @@ async function generateAndSavePost(topic, env) {
   // 내레이션 텍스트(음성+자막 공용) — 실제 음성으로 변환되는 길이(3000자)로 맞춤
   const narrationText = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ').slice(0, 3000);
 
+  report('음성 생성 중', 30);
   let audioKey = null;
   if (env.MEDIA) {
     const audioBuffer = await generateNarrationAudio(narrationText, env);
@@ -891,13 +896,20 @@ async function generateAndSavePost(topic, env) {
     }
   }
 
+  report('이미지 준비 중', 40);
   let images = [];
   let captionWeights = [];
   let captionBeats = []; // 이미지별 자막 "비트" 배열 — 한 이미지에 문장 여러 개면 순서대로 갈아끼울 목록
   if (env.MEDIA) {
     // 이미지 소스는 저작권이 명확한 것만 사용: FLUX 우선 생성 → 실패시 Pixabay → Pexels
     const scenes = await generateScenePrompts(topic, article.title, env);
-    const rawImages = (await mapWithConcurrency(scenes, 3, (s) => getSceneImage(s, topic, env))).filter(Boolean);
+    let doneCount = 0;
+    const rawImages = (await mapWithConcurrency(scenes, 3, async (s) => {
+      const img = await getSceneImage(s, topic, env);
+      doneCount++;
+      report(`이미지 수집 중 (${doneCount}/${scenes.length})`, 40 + Math.round((doneCount / scenes.length) * 35)); // 40~75%
+      return img;
+    })).filter(Boolean);
     console.log(`장면 원본 이미지 ${rawImages.length}/${scenes.length}개 확보`);
 
     // 내레이션 텍스트를 확보된 이미지 개수만큼 나눠서 각 이미지에 배정 — 자막은 이미지에 직접 굽지 않고
@@ -915,6 +927,7 @@ async function generateAndSavePost(topic, env) {
     console.log(`장면 이미지 ${images.length}개 저장 완료`);
   }
 
+  report('글 저장 중', 80);
   const post = {
     slug, topic, title: article.title, createdAt: new Date().toISOString(),
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
@@ -926,6 +939,7 @@ async function generateAndSavePost(topic, env) {
   idx.unshift(slug);
   await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
 
+  report('영상 렌더링 등록 중', 90);
   // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
   if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && images.length) {
     const outputKey = `${slug}.mp4`;
@@ -946,6 +960,7 @@ async function generateAndSavePost(topic, env) {
     await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
   }
 
+  report('완료', 100);
   console.log(`발행 완료: ${slug}`);
   return { ok: true, post };
 }
@@ -1126,6 +1141,20 @@ async function renderAdminPage(env) {
   const pendingRenderJobs = await env.POSTS.list({ prefix: 'renderJob:' });
   const pendingRenderSlugs = new Set(pendingRenderJobs.keys.map((k) => k.name.split(':')[1]));
 
+  // 생성 중인(글+이미지+음성 아직 안 끝난) 작업들 — 완료되면 post로 바뀌면서 이 목록에서 빠짐
+  const pendingGenJobsRaw = await env.POSTS.list({ prefix: 'genJob:' });
+  const genJobs = [];
+  for (const k of pendingGenJobsRaw.keys) {
+    const raw = await env.POSTS.get(k.name);
+    if (raw) genJobs.push({ id: k.name.split(':')[1], ...JSON.parse(raw) });
+  }
+
+  const genJobRows = genJobs.map((j) => `<tr>
+    <td colspan="7" class="mono" style="background:#F7F8FA;">
+      <span class="gen-progress" data-id="${j.id}">${j.failed ? `❌ 생성 실패: ${escapeHtml((j.error || '').slice(0, 80))}` : `${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`}</span>
+    </td>
+  </tr>`).join('');
+
   const rows = posts.map((p) => {
     const mediaStatus = `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : ''}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
     const isRendering = pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug);
@@ -1148,23 +1177,31 @@ async function renderAdminPage(env) {
   }).join('');
 
   const hasPending = posts.some((p) => !p.video && (pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug)));
-  const progressScript = hasPending ? `<script>
+  const hasGenPending = genJobs.some((j) => !j.failed);
+  const progressScript = (hasPending || hasGenPending) ? `<script>
     (function(){
       function poll(){
-        var els = document.querySelectorAll('.render-progress');
-        if (!els.length) return;
-        var pending = false;
-        els.forEach(function(el){
+        var renderEls = document.querySelectorAll('.render-progress');
+        var genEls = document.querySelectorAll('.gen-progress');
+        var needReload = false;
+        renderEls.forEach(function(el){
           var slug = el.dataset.slug;
           fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
             .then(function(r){ return r.json(); })
             .then(function(data){
-              if (data.status === 'done' || data.status === 'failed') {
-                location.reload();
-                return;
-              }
-              pending = true;
+              if (data.status === 'done' || data.status === 'failed') { location.reload(); return; }
               el.textContent = (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
+            })
+            .catch(function(){});
+        });
+        genEls.forEach(function(el){
+          var id = el.dataset.id;
+          fetch('/admin/generate-progress?id=' + encodeURIComponent(id))
+            .then(function(r){ return r.json(); })
+            .then(function(data){
+              if (data.status === 'done' || data.status === 'not_found') { location.reload(); return; }
+              if (data.status === 'failed') { el.textContent = '❌ 생성 실패: ' + (data.error || '').slice(0, 80); return; }
+              el.textContent = (data.topic || '') + ' — ' + (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
             })
             .catch(function(){});
         });
@@ -1176,16 +1213,30 @@ async function renderAdminPage(env) {
 
   const body = `${siteHeader()}<div class="wrap" style="padding:32px 0;">
     <h2>관리자 (총 ${idx.length}건)</h2>
-    <p class="mono" style="color:var(--muted);font-size:12px;">생성은 동기 처리라 완료까지 페이지가 대기해요 (보통 몇십 초 내외).</p>
+    <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아오고, 진행률은 아래에서 실시간으로 확인할 수 있어요.</p>
     <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;">
       <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;" required>
       <button type="submit">글+슬라이드쇼 생성</button>
     </form>
     <table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>작성일</th><th></th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table>
+    <tbody>${genJobRows}${rows || (genJobRows ? '' : '<tr><td colspan="7">글이 없습니다.</td></tr>')}</tbody></table>
   </div>${progressScript}`;
 
   return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+async function handleGenerateProgress(request, env) {
+  const url = new URL(request.url);
+  const id = url.searchParams.get('id');
+  if (!id) return new Response(JSON.stringify({ error: 'id 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+
+  const raw = await env.POSTS.get(`genJob:${id}`);
+  if (!raw) return new Response(JSON.stringify({ status: 'not_found' }), { headers: { 'Content-Type': 'application/json' } });
+  const job = JSON.parse(raw);
+  return new Response(JSON.stringify({
+    status: job.failed ? 'failed' : 'processing',
+    topic: job.topic, stage: job.stage, percent: job.percent, error: job.error,
+  }), { headers: { 'Content-Type': 'application/json' } });
 }
 
 async function handleRenderProgress(request, env) {
@@ -1219,14 +1270,33 @@ async function handleRenderProgress(request, env) {
   }
 }
 
-async function handleGenerate(request, env) {
+async function handleGenerate(request, env, ctx) {
   const form = await request.formData();
   const topic = (form.get('topic') || '').toString().trim().slice(0, 100);
   if (!topic) return new Response('주제를 입력해주세요', { status: 400 });
 
-  const result = await generateAndSavePost(topic, env);
-  const msg = result.ok ? `발행 완료: ${result.post.title}` : `생성 실패 — ${result.reason}`;
-  return new Response(null, { status: 302, headers: { Location: '/admin?msg=' + encodeURIComponent(msg) } });
+  // 기다리지 않고 백그라운드로 넘김 — 관리자 페이지는 바로 돌아가고, 진행률은 폴링으로 확인
+  const jobId = crypto.randomUUID();
+  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: '대기 중', percent: 0, startedAt: Date.now() }));
+
+  const runInBackground = (async () => {
+    try {
+      const result = await generateAndSavePost(topic, env, async (stage, percent) => {
+        await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage, percent, startedAt: Date.now() })).catch(() => {});
+      });
+      if (result.ok) {
+        await env.POSTS.delete(`genJob:${jobId}`);
+      } else {
+        await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: '실패', percent: 0, error: result.reason, failed: true, startedAt: Date.now() }));
+      }
+    } catch (e) {
+      await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() })).catch(() => {});
+    }
+  })();
+  if (ctx) ctx.waitUntil(runInBackground);
+  else await runInBackground; // ctx 없는 예외적 상황 대비 폴백
+
+  return new Response(null, { status: 302, headers: { Location: '/admin?msg=' + encodeURIComponent(`생성 시작됨: ${topic} (진행률은 아래 목록에서 확인)`) } });
 }
 
 // 다른 워커(zerozistocks 등)가 프로그램적으로 영상 생성을 트리거하는 용도 — API 키 인증 필요.
