@@ -1211,6 +1211,10 @@ async function renderAdminPage(env) {
             .then(function(data){
               if (data.status === 'done' || data.status === 'not_found') { location.reload(); return; }
               if (data.status === 'failed') { el.textContent = '❌ 생성 실패: ' + (data.error || '').slice(0, 80); return; }
+              if (data.status === 'stalled') {
+                el.textContent = '⚠️ 응답 없음(멈춤) — ' + (data.topic || '') + ' · 마지막 상태: ' + (data.stage || '') + ' ' + (data.percent || 0) + '% (재시도해주세요)';
+                return;
+              }
               el.textContent = (data.topic || '') + ' — ' + (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
             })
             .catch(function(){});
@@ -1243,8 +1247,10 @@ async function handleGenerateProgress(request, env) {
   const raw = await env.POSTS.get(`genJob:${id}`);
   if (!raw) return new Response(JSON.stringify({ status: 'not_found' }), { headers: { 'Content-Type': 'application/json' } });
   const job = JSON.parse(raw);
+  const STALE_MS = 3 * 60 * 1000;
+  const isStale = !job.failed && (Date.now() - (job.startedAt || 0) > STALE_MS);
   return new Response(JSON.stringify({
-    status: job.failed ? 'failed' : 'processing',
+    status: job.failed ? 'failed' : isStale ? 'stalled' : 'processing',
     topic: job.topic, stage: job.stage, percent: job.percent, error: job.error,
   }), { headers: { 'Content-Type': 'application/json' } });
 }
