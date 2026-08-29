@@ -476,8 +476,7 @@ const KOREAN_TTS_VOICES_FALLBACK = ['ko-KR-Wavenet-A', 'ko-KR-Wavenet-B', 'ko-KR
 
 async function generateNarrationAudio(text, env) {
   if (!env.GOOGLE_TTS_API_KEY) {
-    console.log('음성합성 건너뜀: GOOGLE_TTS_API_KEY 미설정');
-    return null;
+    return { buffer: null, error: 'GOOGLE_TTS_API_KEY 환경변수 미설정' };
   }
   const trimmed = text.slice(0, 3000); // Google Cloud TTS는 요청당 5000바이트 제한이라 여유있게 자름
 
@@ -508,28 +507,25 @@ async function generateNarrationAudio(text, env) {
     let attempt = await tryVoice(naturalVoice, true);
 
     if (!attempt.ok) {
-      console.log(`음성합성 실패(목소리: ${naturalVoice}): ${attempt.error} — 폴백 음성으로 재시도`);
+      const firstError = attempt.error;
       voiceName = KOREAN_TTS_VOICES_FALLBACK[Math.floor(Math.random() * KOREAN_TTS_VOICES_FALLBACK.length)];
       attempt = await tryVoice(voiceName, false);
       if (!attempt.ok) {
-        console.log(`음성합성 폴백도 실패(목소리: ${voiceName}): ${attempt.error}`);
-        return null;
+        return { buffer: null, error: `Chirp3-HD 실패(${firstError}) / Wavenet 폴백도 실패(${attempt.error})` };
       }
     }
 
     const data = attempt.data;
     if (!data?.audioContent) {
-      console.log('음성합성 실패: 응답에 audioContent 없음 — raw: ' + JSON.stringify(data).slice(0, 300));
-      return null;
+      return { buffer: null, error: '응답에 audioContent 없음 — raw: ' + JSON.stringify(data).slice(0, 300) };
     }
     const binary = atob(data.audioContent);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     console.log(`음성합성 성공 (Google Cloud TTS, 목소리: ${voiceName})`);
-    return bytes.buffer;
+    return { buffer: bytes.buffer, error: null };
   } catch (e) {
-    console.log('음성합성 오류: ' + e.message);
-    return null;
+    return { buffer: null, error: `오류: ${e.message}` };
   }
 }
 
@@ -918,14 +914,16 @@ async function generateAndSavePost(topic, env, onProgress) {
 
   report('음성 생성 중', 30);
   let audioKey = null;
+  let audioError = null;
   if (env.MEDIA) {
-    const audioBuffer = await generateNarrationAudio(narrationText, env);
+    const { buffer: audioBuffer, error } = await generateNarrationAudio(narrationText, env);
     if (audioBuffer) {
       audioKey = `${slug}-narration.mp3`;
       await env.MEDIA.put(audioKey, audioBuffer, { httpMetadata: { contentType: 'audio/mpeg' } });
       console.log('내레이션 음성 생성 완료');
     } else {
-      console.log('내레이션 음성 생성 실패(글 발행은 계속 진행)');
+      audioError = error;
+      console.log(`내레이션 음성 생성 실패(글 발행은 계속 진행): ${error}`);
     }
   }
 
@@ -964,7 +962,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   const post = {
     slug, topic, title: article.title, createdAt: new Date().toISOString(),
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
-    images, audio: audioKey, usedNews, captionWeights, captionBeats,
+    images, audio: audioKey, audioError, usedNews, captionWeights, captionBeats,
   };
   await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
   const idxRaw = await env.POSTS.get('index');
@@ -1016,10 +1014,11 @@ function renderSlideshow(post) {
       var captionEl = document.getElementById('caption-${post.slug}');
       var weights = ${weightsJson};
       var beatsPerSlide = ${beatsJson};
-      var current = 0, timerId = null, beatTimerId = null, isPlaying = false;
+      var isPlaying = false, rafId = null, startTimestamp = 0;
       var DEFAULT_MS = 6000;
       function show(i){ slides.forEach(function(s,idx){ s.classList.toggle('active', idx===i); }); }
-      // 자막 글자수 비율(weights)이 있으면 그 비율대로, 없으면 균등 분배 — 어느 쪽이든 합은 totalMs
+
+      // 이미지별 노출시간(가중치 비율대로) — 웹/mp4 공통 로직과 동일
       function durationsFor(totalMs){
         if (weights.length === slides.length && slides.length) {
           var sum = weights.reduce(function(a,b){ return a+b; }, 0) || 1;
@@ -1027,47 +1026,70 @@ function renderSlideshow(post) {
         }
         return slides.length ? Array.from({length:slides.length}, function(){ return totalMs/slides.length; }) : [];
       }
-      var currentDurations = durationsFor(DEFAULT_MS * slides.length);
-      // 현재 슬라이드에 배정된 문장(비트)들을 그 슬라이드 노출시간 안에서 순서대로 갈아끼움
-      function playBeats(slideIndex, slideDurationMs){
-        clearTimeout(beatTimerId);
-        var beats = beatsPerSlide[slideIndex];
-        if (!beats || !beats.length) { captionEl.textContent = ''; return; }
-        var sum = beats.reduce(function(a,b){ return a + (b.weight || 1); }, 0) || 1;
-        var bIdx = 0;
-        function showBeat(){
-          if (bIdx >= beats.length) return;
-          captionEl.textContent = beats[bIdx].text || '';
-          var ms = Math.max(800, (beats[bIdx].weight / sum) * slideDurationMs);
-          bIdx++;
-          if (bIdx < beats.length) beatTimerId = setTimeout(showBeat, ms);
+
+      // 절대 시간표(schedule)를 한 번에 통째로 미리 계산 — "이 구간(start~end)엔 이 슬라이드의 이 자막"
+      // 형태로 전부 펼쳐두고, 재생 중엔 지금 시각(오디오 currentTime 또는 경과시간)이 어느 구간에 속하는지만
+      // 찾아서 반영함. setTimeout을 연쇄로 걸지 않아서 타이머 오차가 누적될 일이 없음(= 뒤로 갈수록 밀리는 문제 원천 차단).
+      var schedule = [];
+      var totalScheduleMs = 0;
+      function buildSchedule(totalMs){
+        var durations = durationsFor(totalMs);
+        var list = [];
+        var cursor = 0;
+        for (var i = 0; i < slides.length; i++) {
+          var slideStart = cursor;
+          var slideDur = durations[i] || 0;
+          var beats = beatsPerSlide[i];
+          if (beats && beats.length) {
+            var sum = beats.reduce(function(a,b){ return a + (b.weight || 1); }, 0) || 1;
+            var t = slideStart;
+            for (var j = 0; j < beats.length; j++) {
+              var d = Math.max(800, (beats[j].weight / sum) * slideDur);
+              list.push({ start: t, end: t + d, slideIdx: i, text: beats[j].text || '' });
+              t += d;
+            }
+          } else {
+            list.push({ start: slideStart, end: slideStart + slideDur, slideIdx: i, text: '' });
+          }
+          cursor = slideStart + slideDur;
         }
-        showBeat();
+        totalScheduleMs = cursor;
+        return list;
       }
-      function scheduleNext(){
-        clearTimeout(timerId);
-        if (!slides.length || !isPlaying) return;
-        var d = currentDurations[current] || DEFAULT_MS;
-        playBeats(current, d);
-        timerId = setTimeout(function(){
-          current = (current + 1) % slides.length;
-          show(current);
-          scheduleNext();
-        }, d);
-      }
+      schedule = buildSchedule(DEFAULT_MS * slides.length);
+
+      var cursorIdx = 0, lastSlideIdx = -1, lastText = null;
+      function resetCursor(){ cursorIdx = 0; lastSlideIdx = -1; lastText = null; }
+
       var btn = document.getElementById('playbtn-${post.slug}');
       ${hasAudio ? "var audio = document.getElementById('narration-" + post.slug + "');" : ''}
+
+      function tick(){
+        if (!isPlaying) return;
+        var elapsedMs = ${hasAudio ? 'audio.currentTime * 1000' : '(Date.now() - startTimestamp)'};
+        while (cursorIdx < schedule.length - 1 && elapsedMs >= schedule[cursorIdx].end) cursorIdx++;
+        var seg = schedule[cursorIdx];
+        if (seg) {
+          if (seg.slideIdx !== lastSlideIdx) { show(seg.slideIdx); lastSlideIdx = seg.slideIdx; }
+          if (seg.text !== lastText) { captionEl.textContent = seg.text; lastText = seg.text; }
+        }
+        ${hasAudio ? '' : `
+        if (elapsedMs >= totalScheduleMs) { pause(); resetCursor(); show(0); captionEl.textContent=''; return; }
+        `}
+        rafId = requestAnimationFrame(tick);
+      }
+
       function play(){
         isPlaying = true;
         btn.textContent = '⏸ 정지';
+        startTimestamp = Date.now();
         ${hasAudio ? 'audio.play();' : ''}
-        scheduleNext();
+        rafId = requestAnimationFrame(tick);
       }
       function pause(){
         isPlaying = false;
         btn.textContent = '▶ 재생';
-        clearTimeout(timerId);
-        clearTimeout(beatTimerId);
+        if (rafId) cancelAnimationFrame(rafId);
         ${hasAudio ? 'audio.pause();' : ''}
       }
       btn.addEventListener('click', function(){
@@ -1075,12 +1097,12 @@ function renderSlideshow(post) {
       });
       ${hasAudio ? `
       audio.addEventListener('loadedmetadata', function(){
-        // 실제 음성 길이를 알면 그 길이 기준으로 각 이미지 노출시간을 자막 비율대로 재계산 (나레이션과 싱크)
-        currentDurations = durationsFor(Math.max(4000 * slides.length, audio.duration * 1000));
+        // 실제 음성 길이를 알면 그 길이 기준으로 전체 시간표를 다시 계산(나레이션과 싱크)
+        schedule = buildSchedule(Math.max(4000 * slides.length, audio.duration * 1000));
+        resetCursor();
       });
       audio.addEventListener('ended', function(){
-        currentDurations = durationsFor(DEFAULT_MS * slides.length);
-        current = 0; show(0);
+        resetCursor(); show(0); captionEl.textContent = '';
         pause();
       });
       ` : ''}
@@ -1218,7 +1240,7 @@ async function renderAdminPage(env, requestUrl) {
   }).join('');
 
   const rows = posts.map((p) => {
-    const mediaStatus = `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : ''}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
+    const mediaStatus = `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패(${escapeHtml(p.audioError.slice(0, 40))})` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
     const isRendering = pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug);
     const videoStatus = p.video
       ? '🎬 mp4 완료'
@@ -1260,7 +1282,7 @@ async function renderAdminPage(env, requestUrl) {
         var tdTopic = document.createElement('td'); tdTopic.className = 'mono'; tdTopic.textContent = esc(p.topic); tr.appendChild(tdTopic);
 
         var tdMedia = document.createElement('td'); tdMedia.className = 'mono';
-        tdMedia.textContent = (p.imageCount ? ('🖼️ ' + p.imageCount + '장') : '이미지 없음') + (p.audio ? ' · 🔊 음성' : '') + (p.usedNews ? ' · 📰 뉴스참고' : '');
+        tdMedia.textContent = (p.imageCount ? ('🖼️ ' + p.imageCount + '장') : '이미지 없음') + (p.audio ? ' · 🔊 음성' : (p.audioError ? ' · ⚠️ 음성실패' : ' · 🔇 음성없음')) + (p.usedNews ? ' · 📰 뉴스참고' : '');
         tr.appendChild(tdMedia);
 
         var tdVideo = document.createElement('td'); tdVideo.className = 'mono';
@@ -1394,15 +1416,18 @@ async function runGenerationStep(job, env) {
 
   if (job.stage === 'audio') {
     let audioKey = null;
+    let audioError = null;
     if (env.MEDIA) {
-      const audioBuffer = await generateNarrationAudio(job.narrationText, env);
+      const { buffer: audioBuffer, error } = await generateNarrationAudio(job.narrationText, env);
       if (audioBuffer) {
         audioKey = `${job.slug}-narration.mp3`;
         await env.MEDIA.put(audioKey, audioBuffer, { httpMetadata: { contentType: 'audio/mpeg' } });
+      } else {
+        audioError = error;
       }
     }
     const scenes = env.MEDIA ? await generateScenePrompts(topic, job.article.title, env) : [];
-    return { ...job, audioKey, scenes, sceneIndex: 0, images: [], stage: scenes.length ? 'images' : 'finalize', percent: 30 };
+    return { ...job, audioKey, audioError, scenes, sceneIndex: 0, images: [], stage: scenes.length ? 'images' : 'finalize', percent: 30 };
   }
 
   if (job.stage === 'images') {
@@ -1437,7 +1462,7 @@ async function runGenerationStep(job, env) {
     const post = {
       slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
       intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
-      images: job.images, audio: job.audioKey, usedNews: job.usedNews, captionWeights, captionBeats,
+      images: job.images, audio: job.audioKey, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats,
     };
     await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
     const idxRaw = await env.POSTS.get('index');
@@ -1503,7 +1528,7 @@ async function handleGenerateStep(request, env) {
         slug: job.slug,
         post: post ? {
           title: post.title, topic: post.topic, slug: post.slug,
-          imageCount: post.images?.length || 0, audio: !!post.audio, usedNews: !!post.usedNews,
+          imageCount: post.images?.length || 0, audio: !!post.audio, audioError: post.audioError || null, usedNews: !!post.usedNews,
           createdAtText: new Date(post.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }),
         } : null,
       }), { headers: { 'Content-Type': 'application/json' } });
