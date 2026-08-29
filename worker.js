@@ -60,7 +60,7 @@ const STYLE = `
   .slideshow .slide.active{ opacity:1; }
   .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:1px solid rgba(255,255,255,0.4); padding:8px 16px; border-radius:20px; font-size:13px; font-weight:600; cursor:pointer; backdrop-filter:blur(4px); }
   .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
-  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:80px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Do Hyeon','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:35px; line-height:1.3; white-space:pre-line; text-align:center;
+  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:80px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Gowun Dodum','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:35px; line-height:1.3; white-space:pre-line; text-align:center;
     -webkit-text-stroke:7px #000;
     paint-order:stroke fill;
     text-shadow:-6px -6px 0 #000, 6px -6px 0 #000, -6px 6px 0 #000, 6px 6px 0 #000, 0 -6px 0 #000, 0 6px 0 #000, -6px 0 0 #000, 6px 0 0 #000;
@@ -68,7 +68,7 @@ const STYLE = `
   .slideshow .caption-box:empty{ display:none; }
 `;
 
-const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Do+Hyeon&display=swap" rel="stylesheet">`;
+const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&display=swap" rel="stylesheet">`;
 
 export default {
   async fetch(request, env, ctx) {
@@ -1315,7 +1315,9 @@ async function renderAdminPage(env, requestUrl) {
   }).join('');
 
   const rows = posts.map((p) => {
-    const mediaStatus = `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패(${escapeHtml(p.audioError.slice(0, 40))})` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
+    const mediaStatus = p.video
+      ? `✅ 이미지·음성 사용 완료(mp4로 통합됨)${p.usedNews ? ' · 📰 뉴스참고' : ''}`
+      : `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패(${escapeHtml(p.audioError.slice(0, 40))})` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
     const isRendering = pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug);
     const videoStatus = p.video
       ? '🎬 mp4 완료'
@@ -1389,6 +1391,8 @@ async function renderAdminPage(env, requestUrl) {
               if (data.status === 'done') {
                 el.textContent = '🎬 mp4 완료';
                 el.dataset.terminal = '1';
+                var mediaCell = el.closest('tr') ? el.closest('tr').children[2] : null;
+                if (mediaCell) mediaCell.textContent = '✅ 이미지·음성 사용 완료(mp4로 통합됨)';
                 return;
               }
               if (data.status === 'failed') {
