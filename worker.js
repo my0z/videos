@@ -1161,15 +1161,17 @@ async function renderAdminPage(env, requestUrl) {
   const pendingGenJobsRaw = await env.POSTS.list({ prefix: 'genJob:' });
   const STALE_MS = 3 * 60 * 1000; // 3분 넘게 갱신 없으면 "멈춤" 경고 표시
   const CLEANUP_MS = 10 * 60 * 1000; // 10분 넘게 멈춰있으면 자동으로 지워서 목록에서 치움
+  const FAILED_CLEANUP_MS = 3 * 60 * 1000; // 실패는 3분 정도 보여주고 나서 정리 (읽을 시간은 주되 계속 쌓이지 않게)
   const genJobs = [];
   const seenGenIds = new Set();
   for (const k of pendingGenJobsRaw.keys) {
     const raw = await env.POSTS.get(k.name);
     if (!raw) continue;
     const job = JSON.parse(raw);
-    const isVeryStale = !job.failed && (Date.now() - (job.startedAt || 0) > CLEANUP_MS);
+    const cleanupThreshold = job.failed ? FAILED_CLEANUP_MS : CLEANUP_MS;
+    const isVeryStale = Date.now() - (job.startedAt || 0) > cleanupThreshold;
     if (isVeryStale) {
-      await env.POSTS.delete(k.name).catch(() => {}); // 죽은 작업 자동 정리 — 화면엔 아예 안 보여줌
+      await env.POSTS.delete(k.name).catch(() => {}); // 죽은/실패한 작업 자동 정리 — 화면엔 아예 안 보여줌
       continue;
     }
     genJobs.push({ id: k.name.split(':')[1], ...job });
@@ -1264,7 +1266,7 @@ async function renderAdminPage(env, requestUrl) {
   const body = `${siteHeader()}<div class="wrap" style="padding:32px 0;">
     <h2>관리자 (총 ${idx.length}건)</h2>
     <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아오고, 진행률은 아래에서 실시간으로 확인할 수 있어요.</p>
-    <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;">
+    <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;" onsubmit="this.querySelector('button').disabled=true; this.querySelector('button').textContent='생성 중...';">
       <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;" required>
       <button type="submit">글+슬라이드쇼 생성</button>
     </form>
@@ -1364,7 +1366,11 @@ async function runGenerationStep(job, env) {
     return { ...job, stage: 'done', percent: 100 };
   }
 
-  return job; // 'done' 등 — 더 진행할 게 없으면 그대로 반환
+  if (job.stage === 'done') return job;
+
+  // 예전 방식으로 만들어지다 만 유령 작업(형식이 안 맞음) — 계속 살려두면 정리 타이머가 매번 리셋돼서
+  // 영원히 "진행 중"처럼 보이게 됨. 여기서 확실히 실패로 끊어서 정리 대상이 되게 함.
+  throw new Error('알 수 없는 상태 — 예전 버전에서 만들다 만 작업으로 보입니다. 삭제하고 다시 시도해주세요.');
 }
 
 async function handleGenerateStep(request, env) {
