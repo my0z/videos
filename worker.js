@@ -58,7 +58,11 @@ const STYLE = `
   .slideshow .slide.active{ opacity:1; }
   .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:1px solid rgba(255,255,255,0.4); padding:8px 16px; border-radius:20px; font-size:13px; font-weight:600; cursor:pointer; backdrop-filter:blur(4px); }
   .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
-  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:40px; z-index:4; min-height:0; background:rgba(0,0,0,0.68); color:#fff; border-radius:12px; padding:20px 24px; font-family:'Black Han Sans','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:26px; line-height:1.45; white-space:pre-line; text-align:center; text-shadow:0 2px 6px rgba(0,0,0,0.9); }
+  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:40px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Black Han Sans','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:28px; line-height:1.5; white-space:pre-line; text-align:center;
+    -webkit-text-stroke:3px #000;
+    paint-order:stroke fill;
+    text-shadow:-2.5px -2.5px 0 #000, 2.5px -2.5px 0 #000, -2.5px 2.5px 0 #000, 2.5px 2.5px 0 #000, 0 -2.5px 0 #000, 0 2.5px 0 #000, -2.5px 0 0 #000, 2.5px 0 0 #000;
+  }
   .slideshow .caption-box:empty{ display:none; }
 `;
 
