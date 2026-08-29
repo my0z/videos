@@ -141,6 +141,7 @@ async function callAiChain(systemPrompt, userPrompt, env) {
           temperature: 0.7,
           max_tokens: 2000,
         }),
+        signal: AbortSignal.timeout(20000),
       });
       if (res.ok) {
         const data = await res.json();
@@ -178,6 +179,7 @@ async function callAiChain(systemPrompt, userPrompt, env) {
             temperature: 0.7,
             max_tokens: 2000,
           }),
+          signal: AbortSignal.timeout(20000),
         });
         if (res.ok) {
           const data = await res.json();
@@ -210,10 +212,10 @@ async function callAiChain(systemPrompt, userPrompt, env) {
 
   if (env.AI) {
     try {
-      const response = await env.AI.run('@cf/zai-org/glm-4.7-flash', {
+      const response = await withTimeout(env.AI.run('@cf/zai-org/glm-4.7-flash', {
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
         max_tokens: 2000,
-      }, { gateway: { id: CF_AI_GATEWAY } });
+      }, { gateway: { id: CF_AI_GATEWAY } }), 20000, 'workers-ai 글 생성');
       let raw = response?.response;
       if (raw) {
         raw = raw.trim().replace(/^```json\s*|\s*```$/gm, '').trim();
@@ -248,6 +250,7 @@ async function searchNaverNews(topic, env) {
         'X-Naver-Client-Id': env.NAVER_CLIENT_ID,
         'X-Naver-Client-Secret': env.NAVER_CLIENT_SECRET,
       },
+      signal: AbortSignal.timeout(10000),
     });
     if (!res.ok) {
       await res.text().catch(() => {}); // body 미소비 시 "stalled response" 경고 발생 방지
@@ -311,6 +314,15 @@ async function generateScenePrompts(topic, articleTitle, env) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// env.AI.run()은 fetch가 아니라 바인딩 호출이라 AbortSignal이 안 먹힘 — Promise.race로 강제 타임아웃.
+// (이게 없어서 응답이 하염없이 안 돌아오면 진행률이 특정 %에서 영원히 멈추는 문제가 있었음)
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} 타임아웃(${ms}ms)`)), ms)),
+  ]);
 }
 
 async function searchPixabayImage(query, env, attempt = 0) {
@@ -432,10 +444,10 @@ async function generateSceneImage(prompt, env) {
   if (!env.AI) return null;
   try {
     // flux-1-schnell은 prompt/seed/steps만 지원 (width/height 파라미터 없음 — FLUX.2 계열 얘기와 다름)
-    const response = await env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
+    const response = await withTimeout(env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
       prompt,
       steps: 4,
-    }, { gateway: { id: CF_AI_GATEWAY } });
+    }, { gateway: { id: CF_AI_GATEWAY } }), 20000, 'FLUX 이미지 생성');
     if (!response?.image) return null;
     const binary = atob(response.image);
     const bytes = new Uint8Array(binary.length);
@@ -475,6 +487,7 @@ async function generateNarrationAudio(text, env) {
         voice: { languageCode: 'ko-KR', name: voiceName },
         audioConfig,
       }),
+      signal: AbortSignal.timeout(20000),
     });
     if (!res.ok) {
       const bodyText = await res.text();
@@ -572,6 +585,7 @@ async function startRelayRender(imageKeys, audioKey, outputKey, weights, caption
       // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
       // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림)
       body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights, captionBeats }),
+      signal: AbortSignal.timeout(15000),
     });
     if (!res.ok) {
       const bodyText = await res.text();
@@ -602,6 +616,7 @@ async function pollPendingRenderJobs(env) {
     try {
       res = await fetch(`${env.RELAY_URL}/render/status?jobId=${encodeURIComponent(job.jobId)}`, {
         headers: { 'x-relay-secret': env.RELAY_SECRET },
+        signal: AbortSignal.timeout(10000),
       });
     } catch (e) {
       console.log(`[${keyInfo.name}] 릴레이 상태 조회 네트워크 오류: ${e.message}`);
@@ -1144,19 +1159,27 @@ async function renderAdminPage(env) {
 
   // 생성 중인(글+이미지+음성 아직 안 끝난) 작업들 — 완료되면 post로 바뀌면서 이 목록에서 빠짐
   const pendingGenJobsRaw = await env.POSTS.list({ prefix: 'genJob:' });
+  const STALE_MS = 3 * 60 * 1000; // 3분 넘게 갱신 없으면 "멈춤" 경고 표시
+  const CLEANUP_MS = 10 * 60 * 1000; // 10분 넘게 멈춰있으면 자동으로 지워서 목록에서 치움
   const genJobs = [];
   for (const k of pendingGenJobsRaw.keys) {
     const raw = await env.POSTS.get(k.name);
-    if (raw) genJobs.push({ id: k.name.split(':')[1], ...JSON.parse(raw) });
+    if (!raw) continue;
+    const job = JSON.parse(raw);
+    const isVeryStale = !job.failed && (Date.now() - (job.startedAt || 0) > CLEANUP_MS);
+    if (isVeryStale) {
+      await env.POSTS.delete(k.name).catch(() => {}); // 죽은 작업 자동 정리 — 화면엔 아예 안 보여줌
+      continue;
+    }
+    genJobs.push({ id: k.name.split(':')[1], ...job });
   }
 
-  const STALE_MS = 3 * 60 * 1000; // 3분 넘게 진행률 갱신이 없으면 멈춘 걸로 간주
   const genJobRows = genJobs.map((j) => {
     const isStale = !j.failed && (Date.now() - (j.startedAt || 0) > STALE_MS);
     const label = j.failed
       ? `❌ 생성 실패: ${escapeHtml((j.error || '').slice(0, 80))}`
       : isStale
-        ? `⚠️ 응답 없음(멈춤) — ${escapeHtml(j.topic)} · 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (새로고침해도 안 바뀌면 재시도해주세요)`
+        ? `⚠️ 응답 없음(멈춤) — ${escapeHtml(j.topic)} · 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (10분 지나면 자동으로 정리돼요)`
         : `${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
     return `<tr>
     <td colspan="7" class="mono" style="background:#FEE2E2;color:#B91C1C;font-weight:700;border-left:4px solid #DC2626;">
@@ -1248,6 +1271,11 @@ async function handleGenerateProgress(request, env) {
   if (!raw) return new Response(JSON.stringify({ status: 'not_found' }), { headers: { 'Content-Type': 'application/json' } });
   const job = JSON.parse(raw);
   const STALE_MS = 3 * 60 * 1000;
+  const CLEANUP_MS = 10 * 60 * 1000;
+  if (!job.failed && (Date.now() - (job.startedAt || 0) > CLEANUP_MS)) {
+    await env.POSTS.delete(`genJob:${id}`).catch(() => {});
+    return new Response(JSON.stringify({ status: 'not_found' }), { headers: { 'Content-Type': 'application/json' } });
+  }
   const isStale = !job.failed && (Date.now() - (job.startedAt || 0) > STALE_MS);
   return new Response(JSON.stringify({
     status: job.failed ? 'failed' : isStale ? 'stalled' : 'processing',
@@ -1274,6 +1302,7 @@ async function handleRenderProgress(request, env) {
   try {
     const res = await fetch(`${env.RELAY_URL}/render/status?jobId=${encodeURIComponent(job.jobId)}`, {
       headers: { 'x-relay-secret': env.RELAY_SECRET },
+      signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) {
       await res.text().catch(() => {});
