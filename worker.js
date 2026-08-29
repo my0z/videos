@@ -1445,6 +1445,30 @@ async function handleGenerate(request, env) {
   const topic = (form.get('topic') || '').toString().trim().slice(0, 100);
   if (!topic) return new Response('주제를 입력해주세요', { status: 400 });
 
+  // 같은 주제로 최근에 이미 처리 중이거나 방금 만들어진 게 있으면 중복 생성 막음
+  // (진행 상황이 안 보여서 여러 번 누르는 경우가 많았음 — 서버가 대신 걸러줌)
+  const DUP_WINDOW_MS = 10 * 60 * 1000;
+  const pendingGenJobsRaw = await env.POSTS.list({ prefix: 'genJob:' });
+  for (const k of pendingGenJobsRaw.keys) {
+    const raw = await env.POSTS.get(k.name);
+    if (!raw) continue;
+    const job = JSON.parse(raw);
+    if (!job.failed && job.topic === topic && Date.now() - (job.startedAt || 0) < DUP_WINDOW_MS) {
+      const existingId = k.name.split(':')[1];
+      return new Response(null, { status: 302, headers: { Location: '/admin?genId=' + existingId + '&msg=' + encodeURIComponent(`"${topic}"은(는) 이미 처리 중이에요 — 아래에서 진행 상황 확인하세요`) } });
+    }
+  }
+  const idxRaw = await env.POSTS.get('index');
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  for (const slug of idx.slice(0, 5)) { // 최근 몇 개만 확인 — 너무 오래된 글까지 다 볼 필요 없음
+    const raw = await env.POSTS.get(`post:${slug}`);
+    if (!raw) continue;
+    const post = JSON.parse(raw);
+    if (post.topic === topic && Date.now() - new Date(post.createdAt).getTime() < DUP_WINDOW_MS) {
+      return new Response(null, { status: 302, headers: { Location: '/admin?msg=' + encodeURIComponent(`"${topic}"은(는) 방금 이미 만들어졌어요 — 목록에서 확인하세요`) } });
+    }
+  }
+
   // ctx.waitUntil()은 응답 보낸 뒤 최대 30초까지만 보장돼서, 전체 생성(몇십 초~1분 이상)엔 부족함 —
   // 여기선 작업 "등록"만 하고, 실제 진행은 관리자 페이지가 /admin/generate-step을 반복 호출하며
   // 한 단계씩(글쓰기/음성/이미지 1장씩/저장/렌더링등록) 진행시킴. 각 단계는 몇 초 안에 끝나서 시간제한에 안 걸림.
