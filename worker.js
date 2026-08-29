@@ -583,17 +583,35 @@ async function generateNarrationAudio(text, env) {
   };
 
   try {
-    const naturalVoice = KOREAN_TTS_VOICES_NATURAL[Math.floor(Math.random() * KOREAN_TTS_VOICES_NATURAL.length)];
-    let voiceName = naturalVoice;
-    let attempt = await tryVoice(naturalVoice, true);
+    // 각 목소리군마다 최대 2번씩 시도(사이에 잠깐 대기) — 일시적인 오류(타임아웃, 순간 과부하 등)면
+    // 재시도로 넘어갈 수 있는데, 예전엔 한 번 실패하면 바로 포기해서 음성 없이 발행되는 경우가 잦았음.
+    const RETRIES_PER_TIER = 2;
+    const attemptErrors = [];
+    let voiceName = null;
+    let attempt = null;
+
+    for (let i = 0; i < RETRIES_PER_TIER && !attempt?.ok; i++) {
+      voiceName = KOREAN_TTS_VOICES_NATURAL[Math.floor(Math.random() * KOREAN_TTS_VOICES_NATURAL.length)];
+      attempt = await tryVoice(voiceName, true);
+      if (!attempt.ok) {
+        attemptErrors.push(`Chirp3-HD 시도${i + 1}(${voiceName}) 실패: ${attempt.error}`);
+        if (i < RETRIES_PER_TIER - 1) await sleep(1000);
+      }
+    }
 
     if (!attempt.ok) {
-      const firstError = attempt.error;
-      voiceName = KOREAN_TTS_VOICES_FALLBACK[Math.floor(Math.random() * KOREAN_TTS_VOICES_FALLBACK.length)];
-      attempt = await tryVoice(voiceName, false);
-      if (!attempt.ok) {
-        return { buffer: null, error: `Chirp3-HD 실패(${firstError}) / Wavenet 폴백도 실패(${attempt.error})` };
+      for (let i = 0; i < RETRIES_PER_TIER && !attempt.ok; i++) {
+        voiceName = KOREAN_TTS_VOICES_FALLBACK[Math.floor(Math.random() * KOREAN_TTS_VOICES_FALLBACK.length)];
+        attempt = await tryVoice(voiceName, false);
+        if (!attempt.ok) {
+          attemptErrors.push(`Wavenet 시도${i + 1}(${voiceName}) 실패: ${attempt.error}`);
+          if (i < RETRIES_PER_TIER - 1) await sleep(1000);
+        }
       }
+    }
+
+    if (!attempt.ok) {
+      return { buffer: null, error: attemptErrors.join(' / ') };
     }
 
     const data = attempt.data;
