@@ -435,7 +435,9 @@ async function getSceneImage(scene, topic, env) {
 
   // 3순위: 실사진을 못 찾았을 때만 FLUX로 생성(느림, 최후 수단)
   console.log(`Pixabay/Pexels 결과 없음(장면/주제 둘 다), FLUX로 생성: "${scene.keyword}"`);
-  image = await generateSceneImage(scene.prompt, env);
+  // FLUX는 네거티브 프롬프트가 아예 안 먹혀서(구조적 제약), 원하는 걸 긍정문으로 항상 덧붙여줌
+  const qualitySuffix = ', photorealistic, sharp focus, natural lighting, high detail, professional photography';
+  image = await generateSceneImage(scene.prompt + qualitySuffix, env);
   if (image) return image;
 
   console.log(`모든 이미지 소스 실패: "${scene.keyword}"`);
@@ -446,10 +448,12 @@ async function generateSceneImage(prompt, env) {
   if (!env.AI) return null;
   try {
     // flux-1-schnell은 prompt/seed/steps만 지원 (width/height 파라미터 없음 — FLUX.2 계열 얘기와 다름)
+    // steps 4(기본) → 6으로 올려서 품질 개선(최대 8, 그 이상은 효과 미미하고 느려지기만 함)
+    // 네거티브 프롬프트는 구조상 아예 안 먹혀서 품질 키워드는 프롬프트 자체(긍정문)에 미리 박아둠(generateScenePrompts 참고)
     const response = await withTimeout(env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
       prompt,
-      steps: 4,
-    }, { gateway: { id: CF_AI_GATEWAY } }), 20000, 'FLUX 이미지 생성');
+      steps: 6,
+    }, { gateway: { id: CF_AI_GATEWAY } }), 25000, 'FLUX 이미지 생성');
     if (!response?.image) return null;
     const binary = atob(response.image);
     const bytes = new Uint8Array(binary.length);
@@ -1306,6 +1310,18 @@ async function renderAdminPage(env, requestUrl) {
         var genEls = document.querySelectorAll('.gen-progress');
         genEls.forEach(function(el){
           if (el.dataset.terminal === '1') return;
+          if (el.dataset.inflight === '1') return; // 이전 요청이 아직 응답 안 왔으면 중복 발사 안 함
+          el.dataset.inflight = '1';
+
+          // 서버 응답 오기 전까지, 로컬에서 "N초째 처리 중"만 계속 갱신 — FLUX처럼 이미지 한 장에
+          // 몇 초씩 걸릴 때도 화면이 죽은 것처럼 안 보이고 계속 움직이는 걸 보여줌
+          var baseText = el.textContent;
+          var waitStarted = Date.now();
+          var tickId = setInterval(function(){
+            var sec = Math.floor((Date.now() - waitStarted) / 1000);
+            el.textContent = baseText + ' · 처리 중… ' + sec + '초';
+          }, 500);
+
           var id = el.dataset.id;
           fetch('/admin/generate-step', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1313,6 +1329,8 @@ async function renderAdminPage(env, requestUrl) {
           })
             .then(function(r){ return r.json(); })
             .then(function(data){
+              clearInterval(tickId);
+              el.dataset.inflight = '0';
               if (data.status === 'done') {
                 el.dataset.terminal = '1';
                 var tr = el.closest('tr');
@@ -1333,7 +1351,10 @@ async function renderAdminPage(env, requestUrl) {
               }
               el.textContent = (data.topic || '') + ' — ' + (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
             })
-            .catch(function(){});
+            .catch(function(){
+              clearInterval(tickId);
+              el.dataset.inflight = '0';
+            });
         });
       }
       pollRender();
