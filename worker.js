@@ -74,7 +74,7 @@ export default {
     const path = url.pathname;
     try {
       if (path === '/') return await renderHomePage(env);
-      if (path === '/admin') return await renderAdminPage(env);
+      if (path === '/admin') return await renderAdminPage(env, url);
       if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env, ctx);
       if (path === '/api/generate' && request.method === 'POST') return await handleApiGenerate(request, env);
       if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
@@ -1144,7 +1144,7 @@ async function renderPostPage(env, slug) {
   });
 }
 
-async function renderAdminPage(env) {
+async function renderAdminPage(env, requestUrl) {
   const idxRaw = await env.POSTS.get('index');
   const idx = idxRaw ? JSON.parse(idxRaw) : [];
   const posts = [];
@@ -1162,6 +1162,7 @@ async function renderAdminPage(env) {
   const STALE_MS = 3 * 60 * 1000; // 3분 넘게 갱신 없으면 "멈춤" 경고 표시
   const CLEANUP_MS = 10 * 60 * 1000; // 10분 넘게 멈춰있으면 자동으로 지워서 목록에서 치움
   const genJobs = [];
+  const seenGenIds = new Set();
   for (const k of pendingGenJobsRaw.keys) {
     const raw = await env.POSTS.get(k.name);
     if (!raw) continue;
@@ -1172,6 +1173,15 @@ async function renderAdminPage(env) {
       continue;
     }
     genJobs.push({ id: k.name.split(':')[1], ...job });
+    seenGenIds.add(k.name.split(':')[1]);
+  }
+
+  // 방금 생성 버튼을 눌러 리다이렉트돼온 경우 — KV list()의 전세계 전파 지연으로 위 목록에 아직 안 잡혔을 수 있어서,
+  // URL에 실어온 genId를 exact get으로 직접 확인해서 놓치지 않고 화면에 끼워넣음
+  const freshGenId = requestUrl?.searchParams?.get('genId');
+  if (freshGenId && !seenGenIds.has(freshGenId)) {
+    const freshRaw = await env.POSTS.get(`genJob:${freshGenId}`);
+    if (freshRaw) genJobs.unshift({ id: freshGenId, ...JSON.parse(freshRaw) });
   }
 
   const genJobRows = genJobs.map((j) => {
@@ -1341,7 +1351,7 @@ async function handleGenerate(request, env, ctx) {
   if (ctx) ctx.waitUntil(runInBackground);
   else await runInBackground; // ctx 없는 예외적 상황 대비 폴백
 
-  return new Response(null, { status: 302, headers: { Location: '/admin?msg=' + encodeURIComponent(`생성 시작됨: ${topic} (진행률은 아래 목록에서 확인)`) } });
+  return new Response(null, { status: 302, headers: { Location: '/admin?genId=' + jobId + '&msg=' + encodeURIComponent(`생성 시작됨: ${topic} (진행률은 아래 목록에서 확인)`) } });
 }
 
 // 다른 워커(zerozistocks 등)가 프로그램적으로 영상 생성을 트리거하는 용도 — API 키 인증 필요.
