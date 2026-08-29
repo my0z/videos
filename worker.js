@@ -48,8 +48,10 @@ const STYLE = `
   .post-body h2{ font-size:20px; margin:28px 0 10px; }
   .post-body p{ margin:0 0 16px; color:var(--text); }
   footer{ border-top:1px solid var(--border); padding:24px 0; color:var(--muted); font-size:13px; }
-  table{ width:100%; border-collapse:collapse; margin-top:16px; }
-  th,td{ text-align:left; padding:10px; border-bottom:1px solid var(--border); font-size:13px; }
+  .table-scroll{ width:100%; overflow-x:auto; margin-top:16px; -webkit-overflow-scrolling:touch; }
+  table{ width:100%; min-width:640px; border-collapse:collapse; }
+  th,td{ text-align:left; padding:10px; border-bottom:1px solid var(--border); font-size:13px; word-break:keep-all; overflow-wrap:break-word; white-space:normal; vertical-align:top; }
+  th:first-child,td:first-child{ min-width:160px; }
   input[type=text]{ padding:9px 12px; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:13px; font-family:inherit; }
   button{ background:var(--teal); color:#0B1210; border:none; padding:10px 16px; border-radius:6px; font-weight:700; cursor:pointer; }
   button.danger{ background:#E06C6C; color:#fff; }
@@ -58,7 +60,7 @@ const STYLE = `
   .slideshow .slide.active{ opacity:1; }
   .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:1px solid rgba(255,255,255,0.4); padding:8px 16px; border-radius:20px; font-size:13px; font-weight:600; cursor:pointer; backdrop-filter:blur(4px); }
   .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
-  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:40px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Do Hyeon','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:28px; line-height:1.5; white-space:pre-line; text-align:center;
+  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:40px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Do Hyeon','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:20px; line-height:1.4; white-space:pre-line; text-align:center;
     -webkit-text-stroke:3px #000;
     paint-order:stroke fill;
     text-shadow:-2.5px -2.5px 0 #000, 2.5px -2.5px 0 #000, -2.5px 2.5px 0 #000, 2.5px 2.5px 0 #000, 0 -2.5px 0 #000, 0 2.5px 0 #000, -2.5px 0 0 #000, 2.5px 0 0 #000;
@@ -585,7 +587,7 @@ async function startRelayRender(imageKeys, audioKey, outputKey, weights, caption
       // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
       // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림)
       body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights, captionBeats }),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) {
       const bodyText = await res.text();
@@ -1270,8 +1272,8 @@ async function renderAdminPage(env, requestUrl) {
       <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;" required>
       <button type="submit">글+슬라이드쇼 생성</button>
     </form>
-    <table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>작성일</th><th></th><th></th></tr></thead>
-    <tbody>${genJobRows}${rows || (genJobRows ? '' : '<tr><td colspan="7">글이 없습니다.</td></tr>')}</tbody></table>
+    <div class="table-scroll"><table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>작성일</th><th></th><th></th></tr></thead>
+    <tbody>${genJobRows}${rows || (genJobRows ? '' : '<tr><td colspan="7">글이 없습니다.</td></tr>')}</tbody></table></div>
   </div>${progressScript}`;
 
   return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
