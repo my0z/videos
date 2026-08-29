@@ -316,7 +316,7 @@ function sleep(ms) {
 async function searchPixabayImage(query, env, attempt = 0) {
   if (!env.PIXABAY_API_KEY) return null;
   try {
-    const res = await fetch(`https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&image_type=photo&orientation=horizontal&per_page=3&safesearch=true`);
+    const res = await fetch(`https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&image_type=photo&orientation=horizontal&per_page=3&safesearch=true`, { signal: AbortSignal.timeout(10000) });
     if (res.status === 429 && attempt < 2) {
       await res.text().catch(() => {});
       const backoffMs = 800 * (attempt + 1); // 레이트리밋이면 잠깐 쉬었다가 최대 2번 더 시도
@@ -333,7 +333,7 @@ async function searchPixabayImage(query, env, attempt = 0) {
     const hit = data?.hits?.[0];
     const imageUrl = hit?.largeImageURL || hit?.webformatURL;
     if (!imageUrl) return null;
-    const imgRes = await fetch(imageUrl);
+    const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
     if (!imgRes.ok) {
       await imgRes.text().catch(() => {});
       return null;
@@ -345,7 +345,7 @@ async function searchPixabayImage(query, env, attempt = 0) {
     }
     return buffer;
   } catch (e) {
-    console.log(`Pixabay 검색 오류("${query}"): ${e.message}`);
+    console.log(`Pixabay 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
     return null;
   }
 }
@@ -355,6 +355,7 @@ async function searchPexelsImage(query, env, attempt = 0) {
   try {
     const res = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape`, {
       headers: { Authorization: env.PEXELS_API_KEY },
+      signal: AbortSignal.timeout(10000),
     });
     if (res.status === 429 && attempt < 2) {
       await res.text().catch(() => {});
@@ -372,7 +373,7 @@ async function searchPexelsImage(query, env, attempt = 0) {
     const photo = data?.photos?.[0];
     const imageUrl = photo?.src?.large || photo?.src?.medium;
     if (!imageUrl) return null;
-    const imgRes = await fetch(imageUrl);
+    const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
     if (!imgRes.ok) {
       await imgRes.text().catch(() => {});
       return null;
@@ -384,7 +385,7 @@ async function searchPexelsImage(query, env, attempt = 0) {
     }
     return buffer;
   } catch (e) {
-    console.log(`Pexels 검색 오류("${query}"): ${e.message}`);
+    console.log(`Pexels 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
     return null;
   }
 }
@@ -1149,11 +1150,20 @@ async function renderAdminPage(env) {
     if (raw) genJobs.push({ id: k.name.split(':')[1], ...JSON.parse(raw) });
   }
 
-  const genJobRows = genJobs.map((j) => `<tr>
+  const STALE_MS = 3 * 60 * 1000; // 3분 넘게 진행률 갱신이 없으면 멈춘 걸로 간주
+  const genJobRows = genJobs.map((j) => {
+    const isStale = !j.failed && (Date.now() - (j.startedAt || 0) > STALE_MS);
+    const label = j.failed
+      ? `❌ 생성 실패: ${escapeHtml((j.error || '').slice(0, 80))}`
+      : isStale
+        ? `⚠️ 응답 없음(멈춤) — ${escapeHtml(j.topic)} · 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (새로고침해도 안 바뀌면 재시도해주세요)`
+        : `${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
+    return `<tr>
     <td colspan="7" class="mono" style="background:#FEE2E2;color:#B91C1C;font-weight:700;border-left:4px solid #DC2626;">
-      <span class="gen-progress" data-id="${j.id}">${j.failed ? `❌ 생성 실패: ${escapeHtml((j.error || '').slice(0, 80))}` : `${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`}</span>
+      <span class="gen-progress" data-id="${j.id}" data-stale="${isStale ? '1' : '0'}">${label}</span>
     </td>
-  </tr>`).join('');
+  </tr>`;
+  }).join('');
 
   const rows = posts.map((p) => {
     const mediaStatus = `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : ''}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
