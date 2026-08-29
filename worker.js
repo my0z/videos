@@ -1230,20 +1230,32 @@ async function renderAdminPage(env, requestUrl) {
       function pollRender(){
         var renderEls = document.querySelectorAll('.render-progress');
         renderEls.forEach(function(el){
+          if (el.dataset.terminal === '1') return; // 이미 끝난 건 더 조회 안 함(화면은 그대로 유지)
           var slug = el.dataset.slug;
           fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
             .then(function(r){ return r.json(); })
             .then(function(data){
-              if (data.status === 'done' || data.status === 'failed') { location.reload(); return; }
+              if (data.status === 'done') {
+                el.textContent = '🎬 mp4 완료';
+                el.dataset.terminal = '1';
+                return;
+              }
+              if (data.status === 'failed') {
+                el.textContent = '❌ 렌더링 실패';
+                el.dataset.terminal = '1';
+                return;
+              }
               el.textContent = (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
             })
             .catch(function(){});
         });
       }
-      // gen-progress는 폴링 자체가 "다음 한 단계 진행시켜줘"라는 뜻 — 이 탭이 열려있는 동안만 진행됨
+      // gen-progress는 폴링 자체가 "다음 한 단계 진행시켜줘"라는 뜻 — 이 탭이 열려있는 동안만 진행됨.
+      // 화면 전체를 다시 그리지 않고, 이 메시지 한 줄만 그때그때 바뀜(페이지 리로드 없음).
       function stepGen(){
         var genEls = document.querySelectorAll('.gen-progress');
         genEls.forEach(function(el){
+          if (el.dataset.terminal === '1') return;
           var id = el.dataset.id;
           fetch('/admin/generate-step', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1251,8 +1263,21 @@ async function renderAdminPage(env, requestUrl) {
           })
             .then(function(r){ return r.json(); })
             .then(function(data){
-              if (data.status === 'done' || data.status === 'not_found') { location.reload(); return; }
-              if (data.status === 'failed') { el.textContent = '❌ 생성 실패: ' + (data.error || '').slice(0, 80); return; }
+              if (data.status === 'done') {
+                el.textContent = '✅ 완료: ' + (data.topic || '') + ' — 새로 만들어진 글은 아래 목록에 곧 나타나요';
+                el.dataset.terminal = '1';
+                return;
+              }
+              if (data.status === 'not_found') {
+                el.textContent = '(사라진 작업)';
+                el.dataset.terminal = '1';
+                return;
+              }
+              if (data.status === 'failed') {
+                el.textContent = '❌ 생성 실패: ' + (data.error || '').slice(0, 80);
+                el.dataset.terminal = '1';
+                return;
+              }
               el.textContent = (data.topic || '') + ' — ' + (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
             })
             .catch(function(){});
