@@ -327,6 +327,18 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
+// 검색 결과가 실제로 쿼리랑 관련 있는지 대충 확인 — Pixabay tags / Pexels alt 텍스트에
+// 쿼리 단어가 하나라도 들어있으면 "관련 있음"으로 판단. 이걸 통과 못 하면 그 이미지는 버리고
+// 다음 소스(Pexels → 그래도 없으면 FLUX 생성)로 넘어가게 함.
+function isRelevantMatch(query, metaText) {
+  if (!metaText) return false;
+  const stopwords = new Set(['the', 'and', 'with', 'for', 'from', 'this', 'that']);
+  const queryWords = query.toLowerCase().split(/[^a-z0-9가-힣]+/).filter((w) => w.length >= 3 && !stopwords.has(w));
+  if (!queryWords.length) return true; // 쿼리 자체가 너무 짧으면 걸러낼 기준이 없으니 통과시킴
+  const lowerMeta = metaText.toLowerCase();
+  return queryWords.some((w) => lowerMeta.includes(w));
+}
+
 async function searchPixabayImage(query, env, attempt = 0) {
   if (!env.PIXABAY_API_KEY) return null;
   try {
@@ -345,6 +357,11 @@ async function searchPixabayImage(query, env, attempt = 0) {
     }
     const data = await res.json();
     const hit = data?.hits?.[0];
+    if (!hit) return null;
+    if (!isRelevantMatch(query, hit.tags)) {
+      console.log(`Pixabay 결과가 "${query}"랑 안 맞아 보임(태그: ${hit.tags}) — 건너뜀`);
+      return null;
+    }
     const imageUrl = hit?.largeImageURL || hit?.webformatURL;
     if (!imageUrl) return null;
     const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
@@ -385,6 +402,11 @@ async function searchPexelsImage(query, env, attempt = 0) {
     }
     const data = await res.json();
     const photo = data?.photos?.[0];
+    if (!photo) return null;
+    if (!isRelevantMatch(query, photo.alt)) {
+      console.log(`Pexels 결과가 "${query}"랑 안 맞아 보임(alt: ${photo.alt}) — 건너뜀`);
+      return null;
+    }
     const imageUrl = photo?.src?.large || photo?.src?.medium;
     if (!imageUrl) return null;
     const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
@@ -400,6 +422,45 @@ async function searchPexelsImage(query, env, attempt = 0) {
     return buffer;
   } catch (e) {
     console.log(`Pexels 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
+    return null;
+  }
+}
+
+async function searchUnsplashImage(query, env) {
+  if (!env.UNSPLASH_ACCESS_KEY) return null;
+  try {
+    const res = await fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape`, {
+      headers: { Authorization: `Client-ID ${env.UNSPLASH_ACCESS_KEY}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      await res.text().catch(() => {}); // 429(시간당 50건 제한)도 여기서 조용히 넘어감 — 어차피 폴백 체인 마지막이라 재시도 안 함
+      console.log(`Unsplash 검색 실패("${query}"): HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const photo = data?.results?.[0];
+    if (!photo) return null;
+    const altText = [photo.alt_description, photo.description].filter(Boolean).join(' ');
+    if (!isRelevantMatch(query, altText)) {
+      console.log(`Unsplash 결과가 "${query}"랑 안 맞아 보임(설명: ${altText}) — 건너뜀`);
+      return null;
+    }
+    const imageUrl = photo?.urls?.regular || photo?.urls?.small;
+    if (!imageUrl) return null;
+    const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
+    if (!imgRes.ok) {
+      await imgRes.text().catch(() => {});
+      return null;
+    }
+    const buffer = await imgRes.arrayBuffer();
+    if (!isUsableImage(buffer)) {
+      console.log(`Unsplash 이미지가 너무 작아(용량 기준) 못 씀("${query}"): ${buffer.byteLength}바이트`);
+      return null;
+    }
+    return buffer;
+  } catch (e) {
+    console.log(`Unsplash 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
     return null;
   }
 }
@@ -433,8 +494,22 @@ async function getSceneImage(scene, topic, env) {
     }
   }
 
-  // 3순위: 실사진을 못 찾았을 때만 FLUX로 생성(느림, 최후 수단)
-  console.log(`Pixabay/Pexels 결과 없음(장면/주제 둘 다), FLUX로 생성: "${scene.keyword}"`);
+  // 3순위: Unsplash — 퀄리티는 제일 좋은 편인데 요청 제한(시간당 50건)이 셋 중 제일 빡빡해서 마지막에 배치
+  image = await searchUnsplashImage(scene.keyword, env);
+  if (image) {
+    console.log(`Unsplash 이미지 사용(장면 키워드): "${scene.keyword}"`);
+    return image;
+  }
+  if (scene.keyword !== topic) {
+    image = await searchUnsplashImage(topic, env);
+    if (image) {
+      console.log(`Unsplash 이미지 사용(주제 검색): "${topic}"`);
+      return image;
+    }
+  }
+
+  // 4순위: 실사진을 못 찾았을 때만 FLUX로 생성(느림, 최후 수단)
+  console.log(`실사진 소스 전부 실패(장면/주제 둘 다), FLUX로 생성: "${scene.keyword}"`);
   // FLUX는 네거티브 프롬프트가 아예 안 먹혀서(구조적 제약), 원하는 걸 긍정문으로 항상 덧붙여줌
   const qualitySuffix = ', photorealistic, sharp focus, natural lighting, high detail, professional photography';
   image = await generateSceneImage(scene.prompt + qualitySuffix, env);
