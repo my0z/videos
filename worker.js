@@ -1150,7 +1150,7 @@ async function renderAdminPage(env) {
   }
 
   const genJobRows = genJobs.map((j) => `<tr>
-    <td colspan="7" class="mono" style="background:#F7F8FA;">
+    <td colspan="7" class="mono" style="background:#FEE2E2;color:#B91C1C;font-weight:700;border-left:4px solid #DC2626;">
       <span class="gen-progress" data-id="${j.id}">${j.failed ? `❌ 생성 실패: ${escapeHtml((j.error || '').slice(0, 80))}` : `${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`}</span>
     </td>
   </tr>`).join('');
