@@ -1,6 +1,12 @@
 /**
- * life-news - 생활뉴스 주제를 입력하면 글과 "영상"(이미지 슬라이드쇼+음성내레이션)을 함께 생성하는 워커
- * Veo 대신 Workers AI의 이미지생성(FLUX)+음성합성(MeloTTS)만 사용 — 사실상 무료, 폴링 크론 불필요(동기 처리)
+ * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
+ *
+ * 이미지: Pixabay → Pexels → Unsplash(실사진 검색, 키워드 관련성 검사 통과해야 채택) → 다 실패하면 Workers AI(FLUX) 생성
+ * 음성: Google Cloud TTS(Chirp3-HD 우선, 실패시 Wavenet 폴백) — 실패해도 발행은 계속 진행(글에 실패 사유 기록)
+ * 자막: 문장을 줄 단위로 쪼개 이미지별 "비트"로 배정, 나레이션 실제 길이에 비례해 노출시간 계산
+ * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환효과(xfade)/컬러그레이딩/loudnorm/
+ *            음성없을 때 자체 합성 배경음악까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
+ * 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피), 관리자 페이지가 열려있는 동안만 진행됨
  */
 
 const CF_ACCOUNT_ID = '709dcc6af36c8ee7b6d3d99e7a9fe422';
