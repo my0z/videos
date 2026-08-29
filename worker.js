@@ -75,11 +75,11 @@ export default {
     try {
       if (path === '/') return await renderHomePage(env);
       if (path === '/admin') return await renderAdminPage(env, url);
-      if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env, ctx);
+      if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env);
       if (path === '/api/generate' && request.method === 'POST') return await handleApiGenerate(request, env);
       if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
       if (path === '/admin/render-progress') return await handleRenderProgress(request, env);
-      if (path === '/admin/generate-progress') return await handleGenerateProgress(request, env);
+      if (path === '/admin/generate-step' && request.method === 'POST') return await handleGenerateStep(request, env);
       if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
       const rootSlugMatch = path.match(/^\/([^\/]+)$/);
       if (rootSlugMatch) return await renderPostPage(env, decodeURIComponent(rootSlugMatch[1]));
@@ -1223,10 +1223,8 @@ async function renderAdminPage(env, requestUrl) {
   const hasGenPending = genJobs.some((j) => !j.failed);
   const progressScript = (hasPending || hasGenPending) ? `<script>
     (function(){
-      function poll(){
+      function pollRender(){
         var renderEls = document.querySelectorAll('.render-progress');
-        var genEls = document.querySelectorAll('.gen-progress');
-        var needReload = false;
         renderEls.forEach(function(el){
           var slug = el.dataset.slug;
           fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
@@ -1237,24 +1235,29 @@ async function renderAdminPage(env, requestUrl) {
             })
             .catch(function(){});
         });
+      }
+      // gen-progress는 폴링 자체가 "다음 한 단계 진행시켜줘"라는 뜻 — 이 탭이 열려있는 동안만 진행됨
+      function stepGen(){
+        var genEls = document.querySelectorAll('.gen-progress');
         genEls.forEach(function(el){
           var id = el.dataset.id;
-          fetch('/admin/generate-progress?id=' + encodeURIComponent(id))
+          fetch('/admin/generate-step', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: id }),
+          })
             .then(function(r){ return r.json(); })
             .then(function(data){
               if (data.status === 'done' || data.status === 'not_found') { location.reload(); return; }
               if (data.status === 'failed') { el.textContent = '❌ 생성 실패: ' + (data.error || '').slice(0, 80); return; }
-              if (data.status === 'stalled') {
-                el.textContent = '⚠️ 응답 없음(멈춤) — ' + (data.topic || '') + ' · 마지막 상태: ' + (data.stage || '') + ' ' + (data.percent || 0) + '% (재시도해주세요)';
-                return;
-              }
               el.textContent = (data.topic || '') + ' — ' + (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
             })
             .catch(function(){});
         });
       }
-      poll();
-      setInterval(poll, 3000);
+      pollRender();
+      stepGen();
+      setInterval(pollRender, 3000);
+      setInterval(stepGen, 1500);
     })();
   </script>` : '';
 
@@ -1272,25 +1275,129 @@ async function renderAdminPage(env, requestUrl) {
   return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
-async function handleGenerateProgress(request, env) {
-  const url = new URL(request.url);
-  const id = url.searchParams.get('id');
+// 생성 과정을 "한 단계씩" 잘게 쪼갠 상태머신 — 매 호출마다 딱 한 걸음만 진행하고 KV에 상태를 저장.
+// 각 단계가 몇 초 안에 끝나서 Workers/waitUntil 시간제한에 안 걸림. 관리자 페이지가 이걸 반복 호출해서 진행시킴.
+async function runGenerationStep(job, env) {
+  const topic = job.topic;
+
+  if (job.stage === 'start') {
+    const slug = String(Date.now());
+    const newsResults = await searchNaverNews(topic, env);
+    const { article, error: articleError } = await generateArticle(topic, newsResults, env);
+    if (!article) throw new Error(`글 생성 실패 — ${articleError || '알 수 없는 오류'}`);
+    const narrationText = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ').slice(0, 3000);
+    return { ...job, slug, article, usedNews: newsResults.length > 0, narrationText, stage: 'audio', percent: 15 };
+  }
+
+  if (job.stage === 'audio') {
+    let audioKey = null;
+    if (env.MEDIA) {
+      const audioBuffer = await generateNarrationAudio(job.narrationText, env);
+      if (audioBuffer) {
+        audioKey = `${job.slug}-narration.mp3`;
+        await env.MEDIA.put(audioKey, audioBuffer, { httpMetadata: { contentType: 'audio/mpeg' } });
+      }
+    }
+    const scenes = env.MEDIA ? await generateScenePrompts(topic, job.article.title, env) : [];
+    return { ...job, audioKey, scenes, sceneIndex: 0, images: [], stage: scenes.length ? 'images' : 'finalize', percent: 30 };
+  }
+
+  if (job.stage === 'images') {
+    const scene = job.scenes[job.sceneIndex];
+    const images = job.images.slice();
+    if (scene) {
+      const img = await getSceneImage(scene, topic, env);
+      if (img) {
+        const key = `${job.slug}-scene-${images.length}.jpg`;
+        await env.MEDIA.put(key, img, { httpMetadata: { contentType: 'image/jpeg' } });
+        images.push(key);
+      }
+    }
+    const nextIndex = job.sceneIndex + 1;
+    const done = nextIndex >= job.scenes.length;
+    return {
+      ...job, images, sceneIndex: nextIndex,
+      stage: done ? 'finalize' : 'images',
+      percent: 30 + Math.round((nextIndex / job.scenes.length) * 45), // 30~75%
+    };
+  }
+
+  if (job.stage === 'finalize') {
+    const perImageChunks = splitTextIntoNChunks(job.narrationText, job.images.length || 1);
+    const captionWeights = [];
+    const captionBeats = [];
+    for (let i = 0; i < job.images.length; i++) {
+      const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (job.images.length || 1) };
+      captionWeights.push(chunk.weight);
+      captionBeats.push(buildCaptionBeats(chunk.sentences));
+    }
+    const post = {
+      slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
+      intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
+      images: job.images, audio: job.audioKey, usedNews: job.usedNews, captionWeights, captionBeats,
+    };
+    await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
+    const idxRaw = await env.POSTS.get('index');
+    const idx = idxRaw ? JSON.parse(idxRaw) : [];
+    idx.unshift(job.slug);
+    await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
+    return { ...job, captionWeights, captionBeats, stage: 'render', percent: 90 };
+  }
+
+  if (job.stage === 'render') {
+    if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && job.images.length) {
+      const outputKey = `${job.slug}.mp4`;
+      const render = await startRelayRender(job.images, job.audioKey, outputKey, job.captionWeights, job.captionBeats, env);
+      if (render.ok) {
+        await env.POSTS.put(`renderJob:${job.slug}`, JSON.stringify({
+          jobId: render.jobId, slug: job.slug, r2Key: outputKey, startedAt: Date.now(),
+        }));
+      } else {
+        const postRaw = await env.POSTS.get(`post:${job.slug}`);
+        if (postRaw) {
+          const post = JSON.parse(postRaw);
+          post.videoError = render.error;
+          await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
+        }
+      }
+    }
+    return { ...job, stage: 'done', percent: 100 };
+  }
+
+  return job; // 'done' 등 — 더 진행할 게 없으면 그대로 반환
+}
+
+async function handleGenerateStep(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return new Response(JSON.stringify({ error: 'invalid json' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  }
+  const id = body.id;
   if (!id) return new Response(JSON.stringify({ error: 'id 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 
   const raw = await env.POSTS.get(`genJob:${id}`);
   if (!raw) return new Response(JSON.stringify({ status: 'not_found' }), { headers: { 'Content-Type': 'application/json' } });
-  const job = JSON.parse(raw);
-  const STALE_MS = 3 * 60 * 1000;
-  const CLEANUP_MS = 10 * 60 * 1000;
-  if (!job.failed && (Date.now() - (job.startedAt || 0) > CLEANUP_MS)) {
-    await env.POSTS.delete(`genJob:${id}`).catch(() => {});
-    return new Response(JSON.stringify({ status: 'not_found' }), { headers: { 'Content-Type': 'application/json' } });
+  let job = JSON.parse(raw);
+
+  if (job.failed) {
+    return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: job.error }), { headers: { 'Content-Type': 'application/json' } });
   }
-  const isStale = !job.failed && (Date.now() - (job.startedAt || 0) > STALE_MS);
-  return new Response(JSON.stringify({
-    status: job.failed ? 'failed' : isStale ? 'stalled' : 'processing',
-    topic: job.topic, stage: job.stage, percent: job.percent, error: job.error,
-  }), { headers: { 'Content-Type': 'application/json' } });
+
+  try {
+    job = await runGenerationStep(job, env);
+    if (job.stage === 'done') {
+      await env.POSTS.delete(`genJob:${id}`);
+      return new Response(JSON.stringify({ status: 'done', slug: job.slug }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    job.startedAt = Date.now(); // 마지막 갱신 시각(멈춤 판정용)
+    await env.POSTS.put(`genJob:${id}`, JSON.stringify(job));
+    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent }), { headers: { 'Content-Type': 'application/json' } });
+  } catch (e) {
+    await env.POSTS.put(`genJob:${id}`, JSON.stringify({ ...job, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() }));
+    return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: e.message }), { headers: { 'Content-Type': 'application/json' } });
+  }
 }
 
 async function handleRenderProgress(request, env) {
@@ -1325,31 +1432,16 @@ async function handleRenderProgress(request, env) {
   }
 }
 
-async function handleGenerate(request, env, ctx) {
+async function handleGenerate(request, env) {
   const form = await request.formData();
   const topic = (form.get('topic') || '').toString().trim().slice(0, 100);
   if (!topic) return new Response('주제를 입력해주세요', { status: 400 });
 
-  // 기다리지 않고 백그라운드로 넘김 — 관리자 페이지는 바로 돌아가고, 진행률은 폴링으로 확인
+  // ctx.waitUntil()은 응답 보낸 뒤 최대 30초까지만 보장돼서, 전체 생성(몇십 초~1분 이상)엔 부족함 —
+  // 여기선 작업 "등록"만 하고, 실제 진행은 관리자 페이지가 /admin/generate-step을 반복 호출하며
+  // 한 단계씩(글쓰기/음성/이미지 1장씩/저장/렌더링등록) 진행시킴. 각 단계는 몇 초 안에 끝나서 시간제한에 안 걸림.
   const jobId = crypto.randomUUID();
-  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: '대기 중', percent: 0, startedAt: Date.now() }));
-
-  const runInBackground = (async () => {
-    try {
-      const result = await generateAndSavePost(topic, env, async (stage, percent) => {
-        await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage, percent, startedAt: Date.now() })).catch(() => {});
-      });
-      if (result.ok) {
-        await env.POSTS.delete(`genJob:${jobId}`);
-      } else {
-        await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: '실패', percent: 0, error: result.reason, failed: true, startedAt: Date.now() }));
-      }
-    } catch (e) {
-      await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() })).catch(() => {});
-    }
-  })();
-  if (ctx) ctx.waitUntil(runInBackground);
-  else await runInBackground; // ctx 없는 예외적 상황 대비 폴백
+  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: 'start', percent: 0, startedAt: Date.now() }));
 
   return new Response(null, { status: 302, headers: { Location: '/admin?genId=' + jobId + '&msg=' + encodeURIComponent(`생성 시작됨: ${topic} (진행률은 아래 목록에서 확인)`) } });
 }
