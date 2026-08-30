@@ -1,15 +1,19 @@
 /**
+ * 생성(마지막 작업): 2026-08-30 19:38 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
- * 이미지: Pixabay → Pexels → Unsplash(실사진 검색, 키워드 관련성 검사 통과해야 채택) → 다 실패하면 Workers AI(FLUX) 생성
- * 음성: Google Cloud TTS(Chirp3-HD 우선, 실패시 Wavenet 폴백, 그래도 실패시 Workers AI MeloTTS) — 이 전체 패스를
- *      3번까지 재시도(최대 21회 시도)해도 끝내 실패하면 무음으로 발행하지 않고 아예 발행을 중단함(이미지 정리 후 실패 처리).
+ * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(25~60자 짧은 문장, 특수기호 금지 등) 적용
+ * 미디어: 장면 20개 = 실사 클립 3개(Pixabay/Pexels 영상, 연관성 검사 통과분만) + 사진 17장
+ *        (사진: Pixabay → Pexels → Unsplash → 다 실패하면 Workers AI(FLUX) 생성)
+ * 음성: Google Cloud TTS(Chirp3-HD 우선, 실패시 Wavenet, 최후 Workers AI MeloTTS) — 목소리는 영상당 하나로 고정.
+ *      문장 몇 개씩 묶은 "세그먼트" 단위로 따로 합성해 relay.js가 실측 길이로 이어붙임(자막 싱크의 핵심).
+ *      세그먼트 하나라도 끝내 실패하면 무음으로 발행하지 않고 발행 자체를 중단(올린 조각/이미지 정리 후 실패 처리).
  *      mp4까지 다 만들었는데 최종 파일에 오디오 트랙이 없는 경우(relay.js가 ffprobe로 검증)도 글째로 삭제.
- * 자막: 문장을 줄 단위로 쪼개 이미지별 "비트"로 배정, 나레이션 실제 길이에 비례해 노출시간 계산.
- *      위치/폰트/색 전부 영상 하나당 하나씩 랜덤 고정(비트마다 안 바뀜, 웹·mp4 둘 다 동일 규칙)
- * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환효과(xfade)/컬러그레이딩/loudnorm/
- *            음성없을 때 자체 합성 배경음악까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
- * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(refresh_token → access_token → resumable upload),
+ * 자막: 문장을 줄 단위로 쪼개 이미지별 "비트"로 배정 + 비트마다 음성 세그먼트 번호(segIndex)를 실어 보내
+ *      relay.js가 세그먼트 실측 시각으로 타이밍을 맞춤(추정 없음). 위치/폰트/색은 영상당 하나씩 랜덤 고정.
+ * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환(xfade)/컬러그레이딩/loudnorm/
+ *            청크 분할 렌더링(5장씩)까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
+ * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(청크 업로드, 진행률 실시간 표시),
  *        privacyStatus public. 실패해도 글은 유지하고 youtubeError만 기록(음성과 달리 발행을 막지 않음)
  * 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피), 관리자 페이지가 열려있는 동안만 진행됨
  */
@@ -171,7 +175,7 @@ async function callAiChain(systemPrompt, userPrompt, env) {
           model: 'gpt-oss-120b',
           messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
           temperature: 0.7,
-          max_tokens: 2000,
+          max_tokens: 5000, // [2026-08-30 19:38] 4분 분량(1,700~2,000자) 글이 2000토큰에서 잘려 JSON 파싱 실패하던 문제 수정
         }),
         signal: AbortSignal.timeout(20000),
       });
@@ -209,7 +213,7 @@ async function callAiChain(systemPrompt, userPrompt, env) {
             model,
             messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
             temperature: 0.7,
-            max_tokens: 2000,
+            max_tokens: 5000, // [2026-08-30 19:38] 4분 분량(1,700~2,000자) 글이 2000토큰에서 잘려 JSON 파싱 실패하던 문제 수정
           }),
           signal: AbortSignal.timeout(20000),
         });
@@ -246,7 +250,7 @@ async function callAiChain(systemPrompt, userPrompt, env) {
     try {
       const response = await withTimeout(env.AI.run('@cf/zai-org/glm-4.7-flash', {
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-        max_tokens: 2000,
+        max_tokens: 5000, // [2026-08-30 19:38] 4분 분량(1,700~2,000자) 글이 2000토큰에서 잘려 JSON 파싱 실패하던 문제 수정
       }, { gateway: { id: CF_AI_GATEWAY } }), 20000, 'workers-ai 글 생성');
       let raw = response?.response;
       if (raw) {
@@ -549,7 +553,7 @@ async function getSceneImage(scene, topic, env) {
   return null;
 }
 
-// [2026-08-30 19:40] ---------- 영상 클립 검색 (장면 일부를 사진 대신 실사 클립으로) ----------
+// [2026-08-30 19:10] ---------- 영상 클립 검색 (장면 일부를 사진 대신 실사 클립으로) ----------
 // 영상당 클립 CLIP_TARGET개 + 나머지는 사진. 연관성(isRelevantMatch) 통과 못 하면 클립을 포기하고
 // 사진으로 폴백 — "아무 클립이나"보다 "관련 있는 사진"이 낫다는 방침. 클립 소스도 사진과 같은
 // Pixabay/Pexels 무료 스톡(같은 API 키), 다운로드가 커서 해상도 1280 이하 변형만 고름.
@@ -558,7 +562,7 @@ const CLIP_MAX_BYTES = 30 * 1024 * 1024; // 이 이상은 다운로드/렌더링
 const CLIP_MIN_BYTES = 100 * 1024; // 너무 작으면 썸네일급 저품질일 가능성
 const CLIP_DURATION_RANGE = [3, 60]; // 초 — 너무 짧으면 루프 티가 나고, 너무 길면 파일이 큼
 
-// [2026-08-30 19:40] Pixabay 영상 검색 — 사진 검색과 같은 키, hits[].videos에 해상도별 변형이 옴.
+// [2026-08-30 19:10] Pixabay 영상 검색 — 사진 검색과 같은 키, hits[].videos에 해상도별 변형이 옴.
 async function searchPixabayClip(query, env, attempt = 0) {
   if (!env.PIXABAY_API_KEY) return null;
   try {
@@ -596,7 +600,7 @@ async function searchPixabayClip(query, env, attempt = 0) {
   }
 }
 
-// [2026-08-30 19:40] Pexels 영상 검색 — 태그가 따로 없어서 영상 페이지 URL 슬러그(설명 단어 포함)로 연관성 판단.
+// [2026-08-30 19:10] Pexels 영상 검색 — 태그가 따로 없어서 영상 페이지 URL 슬러그(설명 단어 포함)로 연관성 판단.
 async function searchPexelsClip(query, env, attempt = 0) {
   if (!env.PEXELS_API_KEY) return null;
   try {
@@ -636,7 +640,7 @@ async function searchPexelsClip(query, env, attempt = 0) {
   }
 }
 
-// [2026-08-30 19:40] 장면 하나에 쓸 클립 찾기 — 장면 키워드 → 주제 순서로 검색, 연관성 통과 못 하면 null(사진 폴백).
+// [2026-08-30 19:10] 장면 하나에 쓸 클립 찾기 — 장면 키워드 → 주제 순서로 검색, 연관성 통과 못 하면 null(사진 폴백).
 async function getSceneClip(scene, topic, env) {
   let clip = await searchPixabayClip(scene.keyword, env);
   if (clip) return clip;
@@ -825,7 +829,7 @@ function splitIntoSentences(text) {
   return (text || '').split(/(?<=[.!?。！？])\s+/).filter(Boolean);
 }
 
-// [2026-08-30 19:55] 나레이션 텍스트 정규화 — 음성·자막 싱크에 유리한 형태로 다듬음.
+// [2026-08-30 19:25] 나레이션 텍스트 정규화 — 음성·자막 싱크에 유리한 형태로 다듬음.
 // TTS가 기호를 예상 밖 길이로 읽으면(예: '%'→"퍼센트", 이모지 무시) 글자수 기반 줄 배분이 어긋나므로,
 // 읽는 소리와 글자수가 일치하도록 기호를 한글로 바꾸거나 제거. 괄호는 기호만 벗기고 내용은 유지.
 // 나레이션과 자막이 같은 이 텍스트를 쓰기 때문에 여기서 뭘 바꿔도 둘은 항상 일치함(본문 HTML은 원문 유지).
@@ -842,7 +846,7 @@ function sanitizeNarrationText(text) {
     .trim();
 }
 
-// [2026-08-30 19:55] 긴 문장은 쉼표에서 쪼갬 — 문장 하나가 세그먼트 상한(90자)을 넘으면 그 안에서는
+// [2026-08-30 19:25] 긴 문장은 쉼표에서 쪼갬 — 문장 하나가 세그먼트 상한(90자)을 넘으면 그 안에서는
 // 글자수 추정 배분만 남아 싱크 이점이 줄어듦. 가운데에 가장 가까운 쉼표에서 갈라 두 문장처럼 취급
 // (자막·음성 둘 다 같은 조각을 쓰므로 어색함 없음). 쪼갠 뒤에도 길면 재귀적으로 계속.
 function splitLongSentence(sentence, maxChars = 100) {
@@ -858,7 +862,7 @@ function splitLongSentence(sentence, maxChars = 100) {
   return [...splitLongSentence(head, maxChars), ...splitLongSentence(tail, maxChars)];
 }
 
-// [2026-08-30 19:55] 나레이션 문장 배열 준비 — 정규화 → 문장 분리 → 긴 문장 쪼개기. 음성 합성과 자막이
+// [2026-08-30 19:25] 나레이션 문장 배열 준비 — 정규화 → 문장 분리 → 긴 문장 쪼개기. 음성 합성과 자막이
 // 모두 이 결과를 쓰는 단일 기준(같은 배열에서 세그먼트와 자막 비트가 나옴 → 싱크가 구조적으로 일치).
 function prepareNarrationSentences(text) {
   return splitIntoSentences(sanitizeNarrationText(text)).flatMap((s) => splitLongSentence(s)).filter(Boolean);
@@ -1546,7 +1550,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   if (env.MEDIA) {
     // 이미지 소스는 저작권이 명확한 것만 사용: FLUX 우선 생성 → 실패시 Pixabay → Pexels
     const scenes = await generateScenePrompts(topic, article.title, env);
-    // [2026-08-30 19:40] 이 경로는 병렬 수집이라 "못 찾으면 다음 장면에서 재시도" 같은 순차 슬롯이 안 됨 —
+    // [2026-08-30 19:10] 이 경로는 병렬 수집이라 "못 찾으면 다음 장면에서 재시도" 같은 순차 슬롯이 안 됨 —
     // 고정 슬롯(시작/중간/후반 장면)에서만 클립을 시도하고, 실패하면 그 장면은 사진으로 폴백.
     const clipSlotSet = new Set([0, Math.floor(scenes.length / 3), Math.floor((scenes.length * 2) / 3)].slice(0, CLIP_TARGET));
     let doneCount = 0;
@@ -1633,7 +1637,7 @@ function renderSlideshow(post) {
   const fixedFontChoice = CAPTION_FONT_CHOICES.find((f) => f.key === post.captionFontKey) || CAPTION_FONT_CHOICES[0];
   const fixedFontCss = fixedFontChoice.css;
   const fixedColorCss = post.captionColor || CAPTION_COLOR_CHOICES[0];
-  // [2026-08-30 19:40] mp4(실사 클립)는 video 태그로 — muted 자동재생/반복이라 사진과 똑같이 전환됨(.slide CSS 공용)
+  // [2026-08-30 19:10] mp4(실사 클립)는 video 태그로 — muted 자동재생/반복이라 사진과 똑같이 전환됨(.slide CSS 공용)
   const slides = post.images.map((key, i) => key.endsWith('.mp4')
     ? `<video class="slide${i === 0 ? ' active' : ''}" src="/media/${key}" muted loop playsinline autoplay></video>`
     : `<img class="slide${i === 0 ? ' active' : ''}" src="/media/${key}" alt="장면 ${i + 1}">`).join('');
@@ -1945,7 +1949,7 @@ async function renderAdminPage(env, requestUrl) {
   const genJobRows = genJobs.map((j) => {
     const isStale = !j.failed && (Date.now() - (j.startedAt || 0) > STALE_MS);
     const label = j.failed
-      ? `❌ 생성 실패: ${escapeHtml((j.error || '').slice(0, 80))}`
+      ? `❌ 생성 실패: ${escapeHtml((j.error || '').slice(0, 400))}` // [2026-08-30 19:38] 80자→400자: 폴백 단계별 실패 원인까지 보이게
       : isStale
         ? `⚠️ 응답 없음(멈춤) — ${escapeHtml(j.topic)} · 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (10분 지나면 자동으로 정리돼요)`
         : `${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
@@ -1957,7 +1961,7 @@ async function renderAdminPage(env, requestUrl) {
   }).join('');
 
   const rows = posts.map((p) => {
-    // [2026-08-30 19:40] 클립(mp4)이 섞이면 "🎞️N·🖼️M장"으로 구분 표시
+    // [2026-08-30 19:10] 클립(mp4)이 섞이면 "🎞️N·🖼️M장"으로 구분 표시
     const clipN = (p.images || []).filter((k) => k.endsWith('.mp4')).length;
     const photoN = (p.images || []).length - clipN;
     const mediaLabel = p.images?.length ? (clipN ? `🎞️ ${clipN}·🖼️ ${photoN}장` : `🖼️ ${photoN}장`) : '이미지 없음';
@@ -2121,7 +2125,7 @@ async function renderAdminPage(env, requestUrl) {
                 return;
               }
               if (data.status === 'failed') {
-                el.textContent = '❌ 생성 실패: ' + (data.error || '').slice(0, 80);
+                el.textContent = '❌ 생성 실패: ' + (data.error || '').slice(0, 400); // 80자→400자(서버 표시와 동일)
                 el.dataset.terminal = '1';
                 return;
               }
@@ -2218,7 +2222,7 @@ async function runGenerationStep(job, env) {
   }
 
   if (job.stage === 'images') {
-    // [2026-08-30 19:40] 장면 일부는 사진 대신 실사 클립(mp4) 사용 — CLIP_TARGET개를 영상 전체에 고르게 분산.
+    // [2026-08-30 19:10] 장면 일부는 사진 대신 실사 클립(mp4) 사용 — CLIP_TARGET개를 영상 전체에 고르게 분산.
     // 슬롯 규칙: k번째 클립은 sceneIndex ≥ k*(전체/CLIP_TARGET)부터 시도 — 해당 장면에서 연관 클립을 못
     // 찾으면 사진으로 넘어가고, 다음 장면들에서 계속 클립을 노림(찾을 때까지). 확장자(.mp4/.jpg)로 종류 구분.
     const scene = job.scenes[job.sceneIndex];
