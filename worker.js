@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 23:32 (KST)
+ * 생성(마지막 작업): 2026-08-31 00:22 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -150,6 +150,7 @@ export default {
       (async () => {
         console.log(`=== 크론 실행: ${new Date().toISOString()} (cron: ${event.cron}) ===`);
         if (event.cron === VIDEO_POLL_CRON) {
+          await checkRelayHealth(env); // [2026-08-31 00:07] 5분마다 relay 헬스 체크
           await pollPendingVideoJobs(env);
           await pollPendingRenderJobs(env, ctx);
         }
@@ -1208,6 +1209,48 @@ async function updateYoutubeUploadPercent(slug, percent, env) {
   } catch (e) {
     console.log(`[youtube:${slug}] 진행률 저장 실패(무시하고 계속 업로드): ${e.message}`);
   }
+}
+
+// [2026-08-31 00:07] relay.js health check — 주기적으로 폴링 → 3회 연속 실패 시 자동 재시작 시도
+let relayHealthFailCount = 0;
+async function checkRelayHealth(env) {
+  if (!env.RELAY_URL || !env.RELAY_SECRET) return; // env 미설정이면 체크 스킵
+  try {
+    const res = await fetch(`${env.RELAY_URL}/health`, {
+      headers: { 'x-relay-secret': env.RELAY_SECRET },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      relayHealthFailCount = 0; // 성공하면 카운트 리셋
+      console.log(`[relay-health] OK: ${data.status}, ${data.processingJobCount} jobs rendering`);
+      return { ok: true, ...data };
+    } else {
+      relayHealthFailCount++;
+      console.log(`[relay-health] HTTP ${res.status}, fail count: ${relayHealthFailCount}`);
+    }
+  } catch (e) {
+    relayHealthFailCount++;
+    console.log(`[relay-health] 폴링 실패: ${e.message}, fail count: ${relayHealthFailCount}`);
+  }
+  // 3회 연속 실패 → 자동 재시작 시도
+  if (relayHealthFailCount >= 3) {
+    console.log(`[relay-health] 3회 연속 실패 → 자동 재시작 시도 (주소: ${env.RELAY_URL})`);
+    relayHealthFailCount = 0; // 재시작 시도 후 카운트 리셋(반복 호출 방지)
+    // 실제 재시작은 관리자가 수동으로 하거나, SSH로 systemctl restart를 호출할 env 권한이 필요
+    // 지금은 알림만 하고, 향후 SSH/systemctl 권한 있으면 자동 실행
+    try {
+      await env.POSTS.put(`relay:health-alert`, JSON.stringify({
+        alert: '⚠️ relay 응답 없음 — 3회 폴링 실패. 수동 재시작 필요.',
+        failedAt: new Date().toISOString(),
+        relayUrl: env.RELAY_URL,
+      }), { expirationTtl: 30 * 60 }); // 30분 유지
+      console.log(`[relay-health] 알림 저장 완료`);
+    } catch (e) {
+      console.log(`[relay-health] 알림 저장 실패: ${e.message}`);
+    }
+  }
+  return { ok: false };
 }
 
 // mp4가 R2(env.MEDIA)에 올라간 직후 호출 — 그 자리에서 바로 바이트를 읽어 유튜브에 올리고 결과를 post에 반영.
