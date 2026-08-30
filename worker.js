@@ -1559,18 +1559,60 @@ async function renderPostPage(env, slug) {
   const sectionsHtml = (p.sections || []).map((s) => `<h2>${escapeHtml(s.heading)}</h2>${s.body_html}`).join('');
   // mp4가 완성된 글은 SVG/mp3가 이미 삭제된 상태라 슬라이드쇼를 그리면 깨진 이미지만 남음 — 영상 하나만 보여줌
   const slideshow = p.video ? '' : renderSlideshow(p);
-  // 유튜브는 렌더링 완료 직후 자동 업로드됨(백그라운드) — 성공하면 링크, 실패하면 사유, 아직이면 대기중 표시.
+  // 유튜브는 렌더링 완료 직후 자동 업로드됨(백그라운드) — 성공하면 링크, 실패하면 사유, 아직이면 업로드 중/진행률 표시.
+  // needsYoutubePoll: 아직 결과(링크도 실패도)가 없다는 뜻 — 이 페이지를 계속 보고 있어도 업로드가 끝나는 걸
+  // 알 방법이 없었던 게 문제였음("업로드 대기 중"에서 새로고침 전까진 영원히 안 바뀜) → 아래 스크립트로 폴링해서 자동 갱신.
+  const needsYoutubePoll = p.video && !p.youtubeUrl && !p.youtubeError;
   const youtubeStatusText = p.youtubeUrl
     ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>`
     : p.youtubeError
       ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 60))})`
-      : '· 유튜브 업로드 대기 중';
+      : `· 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}`;
   const veoVideoBlock = p.video
     ? `<div style="margin:20px 0;">
         <video controls preload="metadata" style="width:100%;border-radius:10px;background:#000;" src="/media/${p.video}"></video>
-        <p class="mono" style="font-size:12px;color:var(--muted);margin-top:8px;">🎬 실제 영상 파일(mp4) ${youtubeStatusText}</p>
+        <p class="mono" style="font-size:12px;color:var(--muted);margin-top:8px;">🎬 실제 영상 파일(mp4) <span id="yt-status" data-slug="${p.slug}">${youtubeStatusText}</span></p>
       </div>`
     : '';
+  // 관리자 페이지의 pollRender()와 같은 원리의 초경량 폴링 — 결과가 나올 때까지(또는 진행이 멈춰서 포기할 때까지)만 돎.
+  const youtubePollScript = needsYoutubePoll ? `<script>
+    (function(){
+      var el = document.getElementById('yt-status');
+      if (!el) return;
+      var slug = el.dataset.slug;
+      var lastPct = -1, stallTries = 0, timer = null;
+      function poll(){
+        fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
+          .then(function(r){ return r.json(); })
+          .then(function(data){
+            if (data.youtubeUrl) {
+              el.textContent = '· ';
+              var a = document.createElement('a'); a.href = data.youtubeUrl; a.target = '_blank'; a.rel = 'noopener'; a.textContent = '▶ 유튜브에서 보기';
+              el.appendChild(a);
+              if (timer) clearInterval(timer);
+              return;
+            }
+            if (data.youtubeError) {
+              el.textContent = '· ⚠️ 유튜브 업로드 실패(' + String(data.youtubeError).slice(0, 60) + ')';
+              if (timer) clearInterval(timer);
+              return;
+            }
+            var pct = (typeof data.youtubeUploadPercent === 'number') ? data.youtubeUploadPercent : null;
+            el.textContent = '· 유튜브 업로드 중' + (pct !== null ? ' ' + pct + '%' : '…');
+            var stalled = (pct !== null && pct === lastPct);
+            if (pct !== null) lastPct = pct;
+            stallTries = stalled ? stallTries + 1 : 0;
+            if (stallTries >= 20) { // 진행률이 약 1분간 그대로면 포기하고 새로고침 안내(업로드 자체는 서버에서 계속 진행됨)
+              el.textContent = '· 유튜브 업로드 확인은 새로고침 후 봐주세요';
+              if (timer) clearInterval(timer);
+            }
+          })
+          .catch(function(){});
+      }
+      poll();
+      timer = setInterval(poll, 3000);
+    })();
+  </script>` : '';
 
   const body = `${siteHeader()}
     <div class="wrap post-body">
@@ -1586,7 +1628,7 @@ async function renderPostPage(env, slug) {
         <p style="margin:0;font-size:14px;line-height:1.6;color:#7C2D12;">이 글과 이미지/음성은 AI가 자동 생성한 참고용 콘텐츠이며, 실제 사실과 다를 수 있습니다.${p.usedNews ? ' 실제 뉴스 검색 결과를 참고해 작성했지만, 원문과 대조 확인을 권장합니다.' : ' 실시간 뉴스 검색 없이 작성된 내용이니 최신성이 중요한 정보는 별도로 확인해주세요.'}</p>
       </div>
     </div>
-    <footer><div class="wrap">life.news</div></footer>`;
+    <footer><div class="wrap">life.news</div></footer>${youtubePollScript}`;
 
   return new Response(page(`${p.title} - life.news`, body, { description: makeExcerpt(p.intro, 150) }), {
     headers: { 'Content-Type': 'text/html; charset=utf-8' },
