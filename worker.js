@@ -1239,7 +1239,7 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
       console.log(`[youtube:${slug}] 업로드 실패: ${result.error}`);
     }
 
-    // [2026-08-30 23:37] 숏츠(도입/중간/결론 최대 3개)를 본편과 동시 업로드 — Promise.all로 병렬 처리, 개별 실패는 나머지에 영향 없음.
+    // [2026-08-30 23:56] 숏츠(도입/중간/결론 최대 3개)를 본편과 동시 업로드 — Promise.all로 병렬 처리, 개별 실패는 나머지에 영향 없음.
     // 유튜브 쿼터 참고: 업로드 1건당 1,600유닛이라 본편+숏츠3 = 6,400유닛(기본 일일 10,000 → 하루 1편 페이스).
     const shortsToUpload = Array.isArray(freshPost.videoShorts) && freshPost.videoShorts.length
       ? freshPost.videoShorts : (freshPost.videoShort ? [freshPost.videoShort] : []);
