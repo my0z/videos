@@ -2,8 +2,10 @@
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 이미지: Pixabay → Pexels → Unsplash(실사진 검색, 키워드 관련성 검사 통과해야 채택) → 다 실패하면 Workers AI(FLUX) 생성
- * 음성: Google Cloud TTS(Chirp3-HD 우선, 실패시 Wavenet 폴백) — 실패해도 발행은 계속 진행(글에 실패 사유 기록)
- * 자막: 문장을 줄 단위로 쪼개 이미지별 "비트"로 배정, 나레이션 실제 길이에 비례해 노출시간 계산
+ * 음성: Google Cloud TTS(Chirp3-HD 우선, 실패시 Wavenet 폴백, 그래도 실패시 Workers AI MeloTTS) — 이 전체 패스를
+ *      3번까지 재시도(최대 21회 시도) 후에도 실패하면 발행은 계속 진행(글에 실패 사유 기록)
+ * 자막: 문장을 줄 단위로 쪼개 이미지별 "비트"로 배정, 나레이션 실제 길이에 비례해 노출시간 계산.
+ *      위치는 비트마다 5종 순환, 폰트/색은 영상 하나당 하나씩 랜덤 고정(웹·mp4 둘 다 동일 규칙)
  * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환효과(xfade)/컬러그레이딩/loudnorm/
  *            음성없을 때 자체 합성 배경음악까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
  * 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피), 관리자 페이지가 열려있는 동안만 진행됨
@@ -16,7 +18,21 @@ const VIDEO_POLL_CRON = '*/5 * * * *'; // 이 크론이 실행되면 콘텐츠 �
 const CF_AI_GATEWAY = 'yzusb';
 const VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
 const SCENE_COUNT = 10; // 슬라이드쇼에 쓸 장면 이미지 개수 — 유료 플랜 전환(서브요청 10,000개)으로 다시 10장
-const CAPTION_STYLE_COUNT = 5; // 자막 위치/색/크기 스타일 종류 — 웹(CSS)과 mp4(relay.js drawtext) 둘 다 같은 인덱스 규칙을 씀
+const CAPTION_STYLE_COUNT = 5; // 자막 "위치" 스타일 종류(비트마다 순환) — 웹(CSS)과 mp4(relay.js drawtext) 둘 다 같은 인덱스 규칙을 씀
+// 자막 폰트/색은 이제 위치와 분리 — 영상 하나당 하나씩만 랜덤 고정(비트마다 안 바뀜, 너무 산만해서 변경).
+// font key는 relay.js가 실제로 서버에 설치해둔 폰트 파일과 매칭되는 키만 사용(웹/mp4 폰트 일치 보장).
+const CAPTION_FONT_CHOICES = [
+  { key: 'gowun', css: "'Gowun Dodum','Noto Sans KR',sans-serif" },
+  { key: 'dohyeon', css: "'Do Hyeon','Noto Sans KR',sans-serif" },
+  { key: 'blackhan', css: "'Black Han Sans','Noto Sans KR',sans-serif" },
+  { key: 'nanumpen', css: "'Nanum Pen Script','Gowun Dodum',cursive" },
+];
+const CAPTION_COLOR_CHOICES = ['#ffffff', '#FFD93D', '#FF6FA5', '#4FC3F7', '#6EE7B7', '#FFA94D', '#B197FC', '#FF8787'];
+function pickCaptionFontAndColor() {
+  const font = CAPTION_FONT_CHOICES[Math.floor(Math.random() * CAPTION_FONT_CHOICES.length)];
+  const color = CAPTION_COLOR_CHOICES[Math.floor(Math.random() * CAPTION_COLOR_CHOICES.length)];
+  return { captionFontKey: font.key, captionColor: color };
+}
 
 const STYLE = `
   :root{
@@ -75,7 +91,7 @@ const STYLE = `
   .slideshow .caption-box:empty{ display:none; }
 `;
 
-const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&family=Nanum+Pen+Script&display=swap" rel="stylesheet">`;
+const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&family=Nanum+Pen+Script&family=Do+Hyeon&family=Black+Han+Sans&display=swap" rel="stylesheet">`;
 
 export default {
   async fetch(request, env, ctx) {
@@ -586,7 +602,7 @@ async function generateNarrationAudio(text, env) {
   try {
     // 각 목소리군마다 최대 2번씩 시도(사이에 잠깐 대기) — 일시적인 오류(타임아웃, 순간 과부하 등)면
     // 재시도로 넘어갈 수 있는데, 예전엔 한 번 실패하면 바로 포기해서 음성 없이 발행되는 경우가 잦았음.
-    const RETRIES_PER_TIER = 2;
+    const RETRIES_PER_TIER = 3;
     const attemptErrors = [];
     let voiceName = null;
     let attempt = null;
@@ -650,6 +666,25 @@ async function generateNarrationAudio(text, env) {
   }
 }
 
+// generateNarrationAudio 하나가 이미 Chirp3-HD 3회 + Wavenet 3회 + MeloTTS 1회(7번)를 시도하지만,
+// 그래도 다 실패하면 예전엔 그냥 무음으로 발행돼버렸음. 여기서 그 전체 패스를 한 번 더 감싸서
+// 총 3패스(최대 21번 시도)까지 기다렸다가 포기하도록 함 — 순간적인 429/5xx/게이트웨이 hiccup 정도는
+// 이 정도면 거의 다 흡수됨. API 키 자체가 없는 경우는 각 패스가 즉시 실패라 금방 끝남.
+async function generateNarrationAudioWithRetry(text, env, maxAttempts = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await generateNarrationAudio(text, env);
+    if (result.buffer) {
+      if (attempt > 1) console.log(`음성합성 ${attempt}차 시도에서 성공`);
+      return result;
+    }
+    lastError = result.error;
+    console.log(`음성합성 ${attempt}차 전체 실패: ${result.error}`);
+    if (attempt < maxAttempts) await sleep(2000);
+  }
+  return { buffer: null, error: `음성합성 ${maxAttempts}차 전량 실패 — ${lastError}` };
+}
+
 async function buildVeoPrompt(topic, articleTitle, env) {
   const systemPrompt = '너는 짧은 AI 생성 영상을 위한 크리에이티브 디렉터다. 주어진 주제와 글 제목을 참고해서 Google Veo에 넣을 영상 생성 프롬프트를 하나 작성한다. 장면 묘사, 카메라 움직임, 조명을 구체적으로 포함하고 5~8초 분량의 장면 하나로 압축한다. 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"prompt": "Veo에 넣을 프롬프트 문장"}';
   const userPrompt = `주제: ${topic}\n글 제목: ${articleTitle}`;
@@ -694,7 +729,7 @@ const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
 // 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
-async function startRelayRender(imageKeys, audioKey, outputKey, weights, captionBeats, env) {
+async function startRelayRender(imageKeys, audioKey, outputKey, weights, captionBeats, captionFontKey, captionColor, env) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
   if (!imageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
@@ -707,7 +742,8 @@ async function startRelayRender(imageKeys, audioKey, outputKey, weights, caption
       headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
       // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
       // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림)
-      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights, captionBeats }),
+      // captionFontKey/captionColor: 이 영상 전체에 고정으로 쓸 폰트 키/색 하나(위치만 비트마다 순환, 폰트·색은 영상당 하나)
+      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights, captionBeats, captionFontKey, captionColor }),
       signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) {
@@ -964,7 +1000,7 @@ function splitTextIntoNChunks(text, n) {
 // 화면엔 항상 한 줄만 보이고 그 줄이 순서대로 갈아끼워짐(긴 문장이 여러 줄 한꺼번에 뜨지 않음).
 // 각 줄의 노출시간은 글자수 비례, 문장이 끝나는 마지막 줄에만 정지시간(가상 글자수)을 더해줌.
 // startIndex: 영상 전체를 통틀어 몇 번째 비트인지(이미지 경계 넘어서도 계속 이어지는 카운터) — 이걸로
-// 자막마다 위치/색/크기가 아기자기하게 순환되도록 함(CAPTION_STYLES 참고).
+// 자막마다 "위치"가 순환되도록 함(POSITION_STYLES 참고, renderSlideshow 안). 폰트/색은 영상당 하나로 고정이라 여기선 관여 안 함.
 function buildCaptionBeats(sentences, startIndex) {
   if (!sentences.length) return [];
   const PAUSE_EQUIVALENT_CHARS = 6;
@@ -1039,7 +1075,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   let audioKey = null;
   let audioError = null;
   if (env.MEDIA) {
-    const { buffer: audioBuffer, error } = await generateNarrationAudio(narrationText, env);
+    const { buffer: audioBuffer, error } = await generateNarrationAudioWithRetry(narrationText, env);
     if (audioBuffer) {
       audioKey = `${slug}-narration.mp3`;
       await env.MEDIA.put(audioKey, audioBuffer, { httpMetadata: { contentType: 'audio/mpeg' } });
@@ -1085,10 +1121,12 @@ async function generateAndSavePost(topic, env, onProgress) {
   }
 
   report('글 저장 중', 80);
+  // 자막 폰트/색은 영상 하나당 하나로 고정 선택 — 위치(styleIndex)만 비트마다 순환(그대로 유지).
+  const { captionFontKey, captionColor } = pickCaptionFontAndColor();
   const post = {
     slug, topic, title: article.title, createdAt: new Date().toISOString(),
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
-    images, audio: audioKey, audioError, usedNews, captionWeights, captionBeats,
+    images, audio: audioKey, audioError, usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
   };
   await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
   const idxRaw = await env.POSTS.get('index');
@@ -1100,7 +1138,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
   if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && images.length) {
     const outputKey = `${slug}.mp4`;
-    const render = await startRelayRender(images, audioKey, outputKey, captionWeights, captionBeats, env);
+    const render = await startRelayRender(images, audioKey, outputKey, captionWeights, captionBeats, captionFontKey, captionColor, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
         jobId: render.jobId, slug, r2Key: outputKey, imageKeys: images, startedAt: Date.now(),
@@ -1124,6 +1162,10 @@ async function generateAndSavePost(topic, env, onProgress) {
 
 function renderSlideshow(post) {
   if (!post.images?.length) return '';
+  // 폰트/색은 이 영상에 고정으로 뽑아둔 값 사용(없는 옛날 글은 첫번째 폰트/흰색으로 자동 대체 — 마이그레이션 불필요)
+  const fixedFontChoice = CAPTION_FONT_CHOICES.find((f) => f.key === post.captionFontKey) || CAPTION_FONT_CHOICES[0];
+  const fixedFontCss = fixedFontChoice.css;
+  const fixedColorCss = post.captionColor || CAPTION_COLOR_CHOICES[0];
   const slides = post.images.map((key, i) => `<img class="slide${i === 0 ? ' active' : ''}" src="/media/${key}" alt="장면 ${i + 1}">`).join('');
   const hasAudio = !!post.audio;
   const audioTag = hasAudio ? `<audio id="narration-${post.slug}" src="/media/${post.audio}" preload="auto"></audio>` : '';
@@ -1144,19 +1186,21 @@ function renderSlideshow(post) {
       var DEFAULT_MS = 6000;
       function show(i){ slides.forEach(function(s,idx){ s.classList.toggle('active', idx===i); }); }
 
-      // 자막 스타일 5종을 순환 — 위치/색/폰트/크기가 비트마다 조금씩 바뀌어서 아기자기한 느낌을 줌.
-      // relay.js(mp4)에도 같은 인덱스 규칙으로 맞춰둔 스타일 표가 있음(색/위치는 최대한 맞춤).
-      var CAPTION_STYLES = [
-        { pos:'bottom', color:'#ffffff', font:"'Gowun Dodum','Noto Sans KR',sans-serif", size:35 },
-        { pos:'top',    color:'#FFD93D', font:"'Gowun Dodum','Noto Sans KR',sans-serif", size:33 },
-        { pos:'bl',     color:'#FF6FA5', font:"'Nanum Pen Script','Gowun Dodum',cursive", size:44 },
-        { pos:'br',     color:'#4FC3F7', font:"'Gowun Dodum','Noto Sans KR',sans-serif", size:40 },
-        { pos:'middle', color:'#6EE7B7', font:"'Nanum Pen Script','Gowun Dodum',cursive", size:42 }
+      // 위치는 비트마다 5종 순환(그대로 유지). 폰트/색은 영상 하나당 하나로 고정(서버가 미리 뽑아서 내려줌) —
+      // relay.js(mp4)에도 같은 위치표 + 고정 폰트/색 규칙이 있음(POSITION_STYLES 인덱스 규칙 일치).
+      var POSITION_STYLES = [
+        { pos:'bottom', size:35 },
+        { pos:'top',    size:33 },
+        { pos:'bl',     size:44 },
+        { pos:'br',     size:40 },
+        { pos:'middle', size:42 }
       ];
+      var FIXED_FONT = ${JSON.stringify(fixedFontCss)};
+      var FIXED_COLOR = ${JSON.stringify(fixedColorCss)};
       function applyCaptionStyle(idx){
-        var st = CAPTION_STYLES[idx % CAPTION_STYLES.length];
-        captionEl.style.color = st.color;
-        captionEl.style.fontFamily = st.font;
+        var st = POSITION_STYLES[idx % POSITION_STYLES.length];
+        captionEl.style.color = FIXED_COLOR;
+        captionEl.style.fontFamily = FIXED_FONT;
         captionEl.style.fontSize = st.size + 'px';
         captionEl.style.top = captionEl.style.bottom = captionEl.style.left = captionEl.style.right = 'auto';
         captionEl.style.textAlign = 'center';
@@ -1576,7 +1620,7 @@ async function runGenerationStep(job, env) {
     let audioKey = null;
     let audioError = null;
     if (env.MEDIA) {
-      const { buffer: audioBuffer, error } = await generateNarrationAudio(job.narrationText, env);
+      const { buffer: audioBuffer, error } = await generateNarrationAudioWithRetry(job.narrationText, env);
       if (audioBuffer) {
         audioKey = `${job.slug}-narration.mp3`;
         await env.MEDIA.put(audioKey, audioBuffer, { httpMetadata: { contentType: 'audio/mpeg' } });
@@ -1620,23 +1664,25 @@ async function runGenerationStep(job, env) {
       globalBeatIndex += beats.length;
       captionBeats.push(beats);
     }
+    // 자막 폰트/색은 영상 하나당 하나로 고정 선택 — 위치(styleIndex)만 비트마다 순환(그대로 유지).
+    const { captionFontKey, captionColor } = pickCaptionFontAndColor();
     const post = {
       slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
       intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
-      images: job.images, audio: job.audioKey, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats,
+      images: job.images, audio: job.audioKey, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
     };
     await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
     const idxRaw = await env.POSTS.get('index');
     const idx = idxRaw ? JSON.parse(idxRaw) : [];
     idx.unshift(job.slug);
     await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
-    return { ...job, captionWeights, captionBeats, stage: 'render', percent: 90 };
+    return { ...job, captionWeights, captionBeats, captionFontKey, captionColor, stage: 'render', percent: 90 };
   }
 
   if (job.stage === 'render') {
     if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && job.images.length) {
       const outputKey = `${job.slug}.mp4`;
-      const render = await startRelayRender(job.images, job.audioKey, outputKey, job.captionWeights, job.captionBeats, env);
+      const render = await startRelayRender(job.images, job.audioKey, outputKey, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env);
       if (render.ok) {
         await env.POSTS.put(`renderJob:${job.slug}`, JSON.stringify({
           jobId: render.jobId, slug: job.slug, r2Key: outputKey, startedAt: Date.now(),
