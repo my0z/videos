@@ -1,12 +1,12 @@
 /**
- * 생성(마지막 작업): 2026-08-30 21:17 (KST)
+ * 생성(마지막 작업): 2026-08-30 21:51 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
  * 미디어: 장면 20개 = 실사 클립 3개(Pixabay/Pexels 영상, 연관성 검사 통과분만) + 사진 17장
  *        (사진: Pixabay → Pexels → Unsplash → 다 실패하면 Workers AI(FLUX) 생성)
  * 음성: Google Cloud TTS(Chirp3-HD 우선, 실패시 Wavenet, 최후 Workers AI MeloTTS) — 목소리는 영상당 하나로 고정.
- *      문장 몇 개씩 묶은 "세그먼트" 단위로 따로 합성해 relay.js가 실측 길이로 이어붙임(자막 싱크의 핵심).
+ *      문장 하나하나를 따로 합성해 relay.js가 실측 길이로 이어붙임 — 모든 문장 시작이 실측 리셋 지점(자막 싱크의 핵심).
  *      세그먼트 하나라도 끝내 실패하면 무음으로 발행하지 않고 발행 자체를 중단(올린 조각/이미지 정리 후 실패 처리).
  *      mp4까지 다 만들었는데 최종 파일에 오디오 트랙이 없는 경우(relay.js가 ffprobe로 검증)도 글째로 삭제.
  * 자막: 문장을 줄 단위로 쪼개 이미지별 "비트"로 배정 + 비트마다 음성 세그먼트 번호(segIndex)를 실어 보내
@@ -1515,7 +1515,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   let audioSegmentKeys = [];
   let segSentencesList = [];
   if (env.MEDIA) {
-    const segments = planAudioSegments(prepareNarrationSentences(narrationText), 220);
+    const segments = planAudioSegments(prepareNarrationSentences(narrationText), 110); // [2026-08-30 21:51] 220→110자: 이 경로는 한 호출로 전부 합성해야 해서 문장 2~3개 묶음까지만
     const voices = pickTtsVoices(); // 목소리는 영상 전체에 하나로 고정(세그먼트마다 바뀌면 안 됨)
     const buffers = [];
     for (let i = 0; i < segments.length; i++) {
@@ -2202,7 +2202,7 @@ async function runGenerationStep(job, env) {
     const narrationText = trimNarrationToSentence([stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' '), NARRATION_MAX_CHARS);
     // 음성은 문장 몇 개씩 묶은 "세그먼트" 단위로 따로 합성(자막-음성 싱크를 실측으로 맞추기 위함).
     // 목소리는 여기서 한 번 뽑아 영상 전체에 고정 — 세그먼트마다 목소리가 바뀌면 안 되니까.
-    const segments = planAudioSegments(prepareNarrationSentences(narrationText), 70); // [2026-08-30 20:51] 90→70자: 문장이 짧아진 만큼 측정 단위도 촘촘하게(사실상 문장 1~2개당 실측 1회)
+    const segments = planAudioSegments(prepareNarrationSentences(narrationText), 1); // [2026-08-30 21:51] 문장 하나 = 조각 하나: 모든 문장 시작마다 타이밍이 실측값으로 리셋돼 싱크가 엉킬 수 없음(사용자 제안)
     return {
       ...job, slug, article, usedNews: newsResults.length > 0, narrationText,
       segTexts: segments.map((s) => s.text), segSentences: segments.map((s) => s.sentences),
