@@ -310,11 +310,11 @@ async function generateArticle(topic, newsResults, env) {
     const referenceText = newsResults
       .map((n, i) => `[참고자료 ${i + 1}] ${n.title}\n${n.description}`)
       .join('\n\n');
-    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 25~60자로 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
     userPrompt = `주제: ${topic}\n\n${referenceText}`;
   } else {
     console.log('네이버 뉴스검색 결과 없음(또는 키 미설정), 참고자료 없이 작성');
-    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 25~60자로 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
     userPrompt = `주제: ${topic}`;
   }
 
@@ -549,6 +549,108 @@ async function getSceneImage(scene, topic, env) {
   return null;
 }
 
+// [2026-08-30 19:40] ---------- 영상 클립 검색 (장면 일부를 사진 대신 실사 클립으로) ----------
+// 영상당 클립 CLIP_TARGET개 + 나머지는 사진. 연관성(isRelevantMatch) 통과 못 하면 클립을 포기하고
+// 사진으로 폴백 — "아무 클립이나"보다 "관련 있는 사진"이 낫다는 방침. 클립 소스도 사진과 같은
+// Pixabay/Pexels 무료 스톡(같은 API 키), 다운로드가 커서 해상도 1280 이하 변형만 고름.
+const CLIP_TARGET = 3; // 영상 하나당 목표 클립 수
+const CLIP_MAX_BYTES = 30 * 1024 * 1024; // 이 이상은 다운로드/렌더링 부담이 커서 스킵
+const CLIP_MIN_BYTES = 100 * 1024; // 너무 작으면 썸네일급 저품질일 가능성
+const CLIP_DURATION_RANGE = [3, 60]; // 초 — 너무 짧으면 루프 티가 나고, 너무 길면 파일이 큼
+
+// [2026-08-30 19:40] Pixabay 영상 검색 — 사진 검색과 같은 키, hits[].videos에 해상도별 변형이 옴.
+async function searchPixabayClip(query, env, attempt = 0) {
+  if (!env.PIXABAY_API_KEY) return null;
+  try {
+    const res = await fetch(`https://pixabay.com/api/videos/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&per_page=3&safesearch=true`, { signal: AbortSignal.timeout(10000) });
+    if (res.status === 429 && attempt < 2) {
+      await res.text().catch(() => {});
+      await sleep(800 * (attempt + 1));
+      return searchPixabayClip(query, env, attempt + 1);
+    }
+    if (!res.ok) {
+      await res.text().catch(() => {});
+      console.log(`Pixabay 클립 검색 실패("${query}"): HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    for (const hit of data?.hits || []) {
+      if (!isRelevantMatch(query, hit.tags)) continue; // 연관성 없으면 다음 후보
+      if (hit.duration < CLIP_DURATION_RANGE[0] || hit.duration > CLIP_DURATION_RANGE[1]) continue;
+      // 1280 이하 변형 중 가장 큰 것(보통 medium=1280, small=960)
+      const variants = Object.values(hit.videos || {}).filter((v) => v?.url && v.width && v.width <= 1280);
+      variants.sort((a, b) => b.width - a.width);
+      const v = variants[0];
+      if (!v || (v.size && v.size > CLIP_MAX_BYTES)) continue;
+      const clipRes = await fetch(v.url, { signal: AbortSignal.timeout(20000) });
+      if (!clipRes.ok) { await clipRes.text().catch(() => {}); continue; }
+      const buffer = await clipRes.arrayBuffer();
+      if (buffer.byteLength < CLIP_MIN_BYTES || buffer.byteLength > CLIP_MAX_BYTES) continue;
+      console.log(`Pixabay 클립 사용("${query}"): ${hit.duration}s, ${v.width}px, ${Math.round(buffer.byteLength / 1024)}KB`);
+      return buffer;
+    }
+    return null;
+  } catch (e) {
+    console.log(`Pixabay 클립 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
+    return null;
+  }
+}
+
+// [2026-08-30 19:40] Pexels 영상 검색 — 태그가 따로 없어서 영상 페이지 URL 슬러그(설명 단어 포함)로 연관성 판단.
+async function searchPexelsClip(query, env, attempt = 0) {
+  if (!env.PEXELS_API_KEY) return null;
+  try {
+    const res = await fetch(`https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=3&orientation=landscape`, {
+      headers: { Authorization: env.PEXELS_API_KEY },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.status === 429 && attempt < 2) {
+      await res.text().catch(() => {});
+      await sleep(800 * (attempt + 1));
+      return searchPexelsClip(query, env, attempt + 1);
+    }
+    if (!res.ok) {
+      await res.text().catch(() => {});
+      console.log(`Pexels 클립 검색 실패("${query}"): HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    for (const video of data?.videos || []) {
+      if (!isRelevantMatch(query, video.url)) continue; // URL 슬러그에 설명 단어가 들어있음
+      if (video.duration < CLIP_DURATION_RANGE[0] || video.duration > CLIP_DURATION_RANGE[1]) continue;
+      const files = (video.video_files || []).filter((f) => f?.link && f.file_type === 'video/mp4' && f.width && f.width <= 1280);
+      files.sort((a, b) => b.width - a.width);
+      const f = files[0];
+      if (!f) continue;
+      const clipRes = await fetch(f.link, { signal: AbortSignal.timeout(20000) });
+      if (!clipRes.ok) { await clipRes.text().catch(() => {}); continue; }
+      const buffer = await clipRes.arrayBuffer();
+      if (buffer.byteLength < CLIP_MIN_BYTES || buffer.byteLength > CLIP_MAX_BYTES) continue;
+      console.log(`Pexels 클립 사용("${query}"): ${video.duration}s, ${f.width}px, ${Math.round(buffer.byteLength / 1024)}KB`);
+      return buffer;
+    }
+    return null;
+  } catch (e) {
+    console.log(`Pexels 클립 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
+    return null;
+  }
+}
+
+// [2026-08-30 19:40] 장면 하나에 쓸 클립 찾기 — 장면 키워드 → 주제 순서로 검색, 연관성 통과 못 하면 null(사진 폴백).
+async function getSceneClip(scene, topic, env) {
+  let clip = await searchPixabayClip(scene.keyword, env);
+  if (clip) return clip;
+  clip = await searchPexelsClip(scene.keyword, env);
+  if (clip) return clip;
+  if (scene.keyword !== topic) {
+    clip = await searchPixabayClip(topic, env);
+    if (clip) return clip;
+    clip = await searchPexelsClip(topic, env);
+    if (clip) return clip;
+  }
+  return null;
+}
+
 async function generateSceneImage(prompt, env) {
   if (!env.AI) return null;
   try {
@@ -721,6 +823,45 @@ async function generateNarrationAudioWithRetry(text, env, maxAttempts = 3, voice
 
 function splitIntoSentences(text) {
   return (text || '').split(/(?<=[.!?。！？])\s+/).filter(Boolean);
+}
+
+// [2026-08-30 19:55] 나레이션 텍스트 정규화 — 음성·자막 싱크에 유리한 형태로 다듬음.
+// TTS가 기호를 예상 밖 길이로 읽으면(예: '%'→"퍼센트", 이모지 무시) 글자수 기반 줄 배분이 어긋나므로,
+// 읽는 소리와 글자수가 일치하도록 기호를 한글로 바꾸거나 제거. 괄호는 기호만 벗기고 내용은 유지.
+// 나레이션과 자막이 같은 이 텍스트를 쓰기 때문에 여기서 뭘 바꿔도 둘은 항상 일치함(본문 HTML은 원문 유지).
+function sanitizeNarrationText(text) {
+  return (text || '')
+    .replace(/[…]+|\.{3,}/g, '.') // 말줄임표 → 마침표(TTS가 길게 끌지 않게)
+    .replace(/[%％]/g, '퍼센트')
+    .replace(/[℃]/g, '도')
+    .replace(/[·•]/g, ', ') // 나열 기호 → 쉼표(TTS가 통째로 건너뛰는 걸 방지)
+    .replace(/[()\[\]{}「」『』<>《》〈〉"'‘’“”]/g, ' ') // 괄호/따옴표 기호 제거(내용은 유지)
+    .replace(/[^가-힣ᄀ-ᇿ0-9a-zA-Z.,!?~\s]/g, ' ') // 이모지 등 나머지 특수문자 제거
+    .replace(/\s+([.,!?])/g, '$1') // 기호 제거로 생긴 "텍스트 ." 꼴 정리
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// [2026-08-30 19:55] 긴 문장은 쉼표에서 쪼갬 — 문장 하나가 세그먼트 상한(90자)을 넘으면 그 안에서는
+// 글자수 추정 배분만 남아 싱크 이점이 줄어듦. 가운데에 가장 가까운 쉼표에서 갈라 두 문장처럼 취급
+// (자막·음성 둘 다 같은 조각을 쓰므로 어색함 없음). 쪼갠 뒤에도 길면 재귀적으로 계속.
+function splitLongSentence(sentence, maxChars = 100) {
+  if (sentence.length <= maxChars) return [sentence];
+  const mid = sentence.length / 2;
+  let best = -1;
+  for (let i = 0; i < sentence.length; i++) {
+    if (sentence[i] === ',' && (best === -1 || Math.abs(i - mid) < Math.abs(best - mid))) best = i;
+  }
+  if (best <= 0 || best >= sentence.length - 1) return [sentence]; // 쉼표가 없으면 그대로 둠
+  const head = sentence.slice(0, best + 1).trim();
+  const tail = sentence.slice(best + 1).trim();
+  return [...splitLongSentence(head, maxChars), ...splitLongSentence(tail, maxChars)];
+}
+
+// [2026-08-30 19:55] 나레이션 문장 배열 준비 — 정규화 → 문장 분리 → 긴 문장 쪼개기. 음성 합성과 자막이
+// 모두 이 결과를 쓰는 단일 기준(같은 배열에서 세그먼트와 자막 비트가 나옴 → 싱크가 구조적으로 일치).
+function prepareNarrationSentences(text) {
+  return splitIntoSentences(sanitizeNarrationText(text)).flatMap((s) => splitLongSentence(s)).filter(Boolean);
 }
 
 // 나레이션이 상한을 넘으면 "문장이 끝나는 지점"에서 자름 — 예전처럼 글자수로 뚝 자르면
@@ -1366,7 +1507,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   let audioSegmentKeys = [];
   let segSentencesList = [];
   if (env.MEDIA) {
-    const segments = planAudioSegments(splitIntoSentences(narrationText), 220);
+    const segments = planAudioSegments(prepareNarrationSentences(narrationText), 220);
     const voices = pickTtsVoices(); // 목소리는 영상 전체에 하나로 고정(세그먼트마다 바뀌면 안 됨)
     const buffers = [];
     for (let i = 0; i < segments.length; i++) {
@@ -1405,14 +1546,23 @@ async function generateAndSavePost(topic, env, onProgress) {
   if (env.MEDIA) {
     // 이미지 소스는 저작권이 명확한 것만 사용: FLUX 우선 생성 → 실패시 Pixabay → Pexels
     const scenes = await generateScenePrompts(topic, article.title, env);
+    // [2026-08-30 19:40] 이 경로는 병렬 수집이라 "못 찾으면 다음 장면에서 재시도" 같은 순차 슬롯이 안 됨 —
+    // 고정 슬롯(시작/중간/후반 장면)에서만 클립을 시도하고, 실패하면 그 장면은 사진으로 폴백.
+    const clipSlotSet = new Set([0, Math.floor(scenes.length / 3), Math.floor((scenes.length * 2) / 3)].slice(0, CLIP_TARGET));
     let doneCount = 0;
-    const rawImages = (await mapWithConcurrency(scenes, 3, async (s) => {
-      const img = await getSceneImage(s, topic, env);
+    const rawImages = (await mapWithConcurrency(scenes, 3, async (s, si) => {
+      let media = null;
+      let isClip = false;
+      if (clipSlotSet.has(si)) {
+        media = await getSceneClip(s, topic, env);
+        isClip = !!media;
+      }
+      if (!media) media = await getSceneImage(s, topic, env);
       doneCount++;
       report(`이미지 수집 중 (${doneCount}/${scenes.length})`, 40 + Math.round((doneCount / scenes.length) * 35)); // 40~75%
-      return img;
+      return media ? { buffer: media, isClip } : null;
     })).filter(Boolean);
-    console.log(`장면 원본 이미지 ${rawImages.length}/${scenes.length}개 확보`);
+    console.log(`장면 원본 미디어 ${rawImages.length}/${scenes.length}개 확보(클립 ${rawImages.filter((m) => m.isClip).length}개)`);
 
     // 내레이션 텍스트를 확보된 이미지 개수만큼 나눠서 각 이미지에 배정 — 자막은 이미지에 직접 굽지 않고
     // 웹/mp4 둘 다 "그 이미지가 떠 있는 동안 문장을 순서대로 갈아끼우는" 방식으로 오버레이함
@@ -1420,8 +1570,8 @@ async function generateAndSavePost(topic, env, onProgress) {
     const perImageChunks = splitTextIntoNChunks(buildSentenceInfos(segSentencesList), rawImages.length || 1);
     for (let i = 0; i < rawImages.length; i++) {
       const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (rawImages.length || 1) };
-      const key = `${slug}-scene-${i}.jpg`;
-      await env.MEDIA.put(key, rawImages[i], { httpMetadata: { contentType: 'image/jpeg' } });
+      const key = `${slug}-scene-${i}.${rawImages[i].isClip ? 'mp4' : 'jpg'}`;
+      await env.MEDIA.put(key, rawImages[i].buffer, { httpMetadata: { contentType: rawImages[i].isClip ? 'video/mp4' : 'image/jpeg' } });
       images.push(key);
       captionWeights.push(chunk.weight);
       const beats = buildCaptionBeats(chunk.sentences, captionPositionIndex);
@@ -1483,7 +1633,10 @@ function renderSlideshow(post) {
   const fixedFontChoice = CAPTION_FONT_CHOICES.find((f) => f.key === post.captionFontKey) || CAPTION_FONT_CHOICES[0];
   const fixedFontCss = fixedFontChoice.css;
   const fixedColorCss = post.captionColor || CAPTION_COLOR_CHOICES[0];
-  const slides = post.images.map((key, i) => `<img class="slide${i === 0 ? ' active' : ''}" src="/media/${key}" alt="장면 ${i + 1}">`).join('');
+  // [2026-08-30 19:40] mp4(실사 클립)는 video 태그로 — muted 자동재생/반복이라 사진과 똑같이 전환됨(.slide CSS 공용)
+  const slides = post.images.map((key, i) => key.endsWith('.mp4')
+    ? `<video class="slide${i === 0 ? ' active' : ''}" src="/media/${key}" muted loop playsinline autoplay></video>`
+    : `<img class="slide${i === 0 ? ' active' : ''}" src="/media/${key}" alt="장면 ${i + 1}">`).join('');
   const hasAudio = !!post.audio;
   const audioTag = hasAudio ? `<audio id="narration-${post.slug}" src="/media/${post.audio}" preload="auto"></audio>` : '';
   // 자동재생 없음 — 항상 이 버튼을 눌러야 슬라이드쇼(+음성)가 시작됨
@@ -1804,9 +1957,13 @@ async function renderAdminPage(env, requestUrl) {
   }).join('');
 
   const rows = posts.map((p) => {
+    // [2026-08-30 19:40] 클립(mp4)이 섞이면 "🎞️N·🖼️M장"으로 구분 표시
+    const clipN = (p.images || []).filter((k) => k.endsWith('.mp4')).length;
+    const photoN = (p.images || []).length - clipN;
+    const mediaLabel = p.images?.length ? (clipN ? `🎞️ ${clipN}·🖼️ ${photoN}장` : `🖼️ ${photoN}장`) : '이미지 없음';
     const mediaStatus = p.video
       ? `✅ 이미지·음성 사용 완료(mp4로 통합됨)${p.usedNews ? ' · 📰 뉴스참고' : ''}`
-      : `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패(${escapeHtml(p.audioError.slice(0, 40))})` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
+      : `${mediaLabel}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패(${escapeHtml(p.audioError.slice(0, 40))})` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
     const isRendering = pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug);
     // mp4는 끝났는데 유튜브 업로드 결과(성공 링크/실패)가 아직 없으면 — 백그라운드 업로드가 진행 중이라는 뜻이므로
     // render-progress와 같은 폴링 span으로 띄워서, 새로고침 없이도 진행률이 실시간으로 갱신되게 함.
@@ -2010,7 +2167,7 @@ async function runGenerationStep(job, env) {
     const narrationText = trimNarrationToSentence([stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' '), NARRATION_MAX_CHARS);
     // 음성은 문장 몇 개씩 묶은 "세그먼트" 단위로 따로 합성(자막-음성 싱크를 실측으로 맞추기 위함).
     // 목소리는 여기서 한 번 뽑아 영상 전체에 고정 — 세그먼트마다 목소리가 바뀌면 안 되니까.
-    const segments = planAudioSegments(splitIntoSentences(narrationText), 90);
+    const segments = planAudioSegments(prepareNarrationSentences(narrationText), 90);
     return {
       ...job, slug, article, usedNews: newsResults.length > 0, narrationText,
       segTexts: segments.map((s) => s.text), segSentences: segments.map((s) => s.sentences),
@@ -2061,20 +2218,39 @@ async function runGenerationStep(job, env) {
   }
 
   if (job.stage === 'images') {
+    // [2026-08-30 19:40] 장면 일부는 사진 대신 실사 클립(mp4) 사용 — CLIP_TARGET개를 영상 전체에 고르게 분산.
+    // 슬롯 규칙: k번째 클립은 sceneIndex ≥ k*(전체/CLIP_TARGET)부터 시도 — 해당 장면에서 연관 클립을 못
+    // 찾으면 사진으로 넘어가고, 다음 장면들에서 계속 클립을 노림(찾을 때까지). 확장자(.mp4/.jpg)로 종류 구분.
     const scene = job.scenes[job.sceneIndex];
     const images = job.images.slice();
+    let clipCount = job.clipCount || 0;
     if (scene) {
-      const img = await getSceneImage(scene, topic, env);
-      if (img) {
-        const key = `${job.slug}-scene-${images.length}.jpg`;
-        await env.MEDIA.put(key, img, { httpMetadata: { contentType: 'image/jpeg' } });
-        images.push(key);
+      const slotStart = clipCount * Math.max(1, Math.floor(job.scenes.length / CLIP_TARGET));
+      const wantClip = clipCount < CLIP_TARGET && job.sceneIndex >= slotStart;
+      let stored = false;
+      if (wantClip) {
+        const clip = await getSceneClip(scene, topic, env);
+        if (clip) {
+          const key = `${job.slug}-scene-${images.length}.mp4`;
+          await env.MEDIA.put(key, clip, { httpMetadata: { contentType: 'video/mp4' } });
+          images.push(key);
+          clipCount++;
+          stored = true;
+        }
+      }
+      if (!stored) {
+        const img = await getSceneImage(scene, topic, env);
+        if (img) {
+          const key = `${job.slug}-scene-${images.length}.jpg`;
+          await env.MEDIA.put(key, img, { httpMetadata: { contentType: 'image/jpeg' } });
+          images.push(key);
+        }
       }
     }
     const nextIndex = job.sceneIndex + 1;
     const done = nextIndex >= job.scenes.length;
     return {
-      ...job, images, sceneIndex: nextIndex,
+      ...job, images, clipCount, sceneIndex: nextIndex,
       stage: done ? 'finalize' : 'images',
       percent: 30 + Math.round((nextIndex / job.scenes.length) * 45), // 30~75%
     };
