@@ -825,9 +825,11 @@ async function getYoutubeAccessToken(env) {
   return data.access_token;
 }
 
-// YouTube Data API v3 resumable upload — 세션을 먼저 열고(POST) 실제 영상 바이트를 그 URL로 PUT함.
-// 짧은 슬라이드쇼 영상(몇 MB 수준)이라 청크 분할 없이 한 번에 PUT해도 충분함.
-async function uploadVideoToYoutube(post, videoBuffer, env) {
+// YouTube Data API v3 resumable upload — 세션을 먼저 열고(POST) 실제 영상 바이트를 청크 단위로 PUT함.
+// 예전엔 한 번에 통째로 PUT했지만, 그러면 업로드 도중 진행률을 전혀 알 수 없어서(관리자 화면이 "업로드 중"에서
+// 멈춰있음) 8MiB씩 나눠 순차 PUT하고, 청크가 성공할 때마다 onProgress(percent)로 진행률을 알려줌.
+const YOUTUBE_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024; // YouTube 리줌 업로드 규격상 256KiB의 배수여야 함 — 8MiB는 배수
+async function uploadVideoToYoutube(post, videoBuffer, env, onProgress) {
   if (!env.YOUTUBE_CLIENT_ID || !env.YOUTUBE_CLIENT_SECRET || !env.YOUTUBE_REFRESH_TOKEN) {
     return { ok: false, error: 'YOUTUBE_CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN 환경변수 미설정' };
   }
@@ -861,21 +863,58 @@ async function uploadVideoToYoutube(post, videoBuffer, env) {
     const uploadUrl = initRes.headers.get('Location');
     if (!uploadUrl) return { ok: false, error: '업로드 세션 응답에 Location 헤더 없음' };
 
-    const putRes = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'video/mp4', 'Content-Length': String(videoBuffer.byteLength) },
-      body: videoBuffer,
-      signal: AbortSignal.timeout(120000), // 업로드 자체는 시간이 걸릴 수 있어서 넉넉히 잡음
-    });
-    if (!putRes.ok) {
-      const bodyText = await putRes.text();
-      return { ok: false, error: `영상 업로드 실패: HTTP ${putRes.status} — ${bodyText.slice(0, 300)}` };
+    const total = videoBuffer.byteLength;
+    let uploaded = 0;
+    let finalData = null;
+    if (onProgress) await onProgress(0);
+    while (uploaded < total) {
+      const end = Math.min(uploaded + YOUTUBE_UPLOAD_CHUNK_SIZE, total);
+      const chunk = videoBuffer.slice(uploaded, end);
+      const chunkRes = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'video/mp4',
+          'Content-Length': String(chunk.byteLength),
+          'Content-Range': `bytes ${uploaded}-${end - 1}/${total}`,
+        },
+        body: chunk,
+        signal: AbortSignal.timeout(60000), // 청크 하나(최대 8MiB)당 타임아웃 — 전체를 한 번에 기다리지 않아도 됨
+      });
+      if (chunkRes.status === 200 || chunkRes.status === 201) {
+        // 마지막 청크까지 다 받으면 여기서 완성된 video 리소스(JSON)를 돌려줌
+        finalData = await chunkRes.json();
+        uploaded = end;
+        if (onProgress) await onProgress(100);
+        break;
+      }
+      if (chunkRes.status === 308) {
+        // 중간 청크 정상 접수 — Range 헤더로 서버가 실제 받은 바이트 수를 알려주면 그걸 신뢰, 없으면 방금 보낸 만큼으로 간주
+        const rangeHeader = chunkRes.headers.get('Range'); // 형식: "bytes=0-8388607"
+        const match = rangeHeader && /bytes=0-(\d+)/.exec(rangeHeader);
+        uploaded = match ? parseInt(match[1], 10) + 1 : end;
+        if (onProgress) await onProgress(Math.floor((uploaded / total) * 100));
+        continue;
+      }
+      const bodyText = await chunkRes.text().catch(() => '');
+      return { ok: false, error: `영상 업로드 실패: HTTP ${chunkRes.status} — ${bodyText.slice(0, 300)}` };
     }
-    const data = await putRes.json();
-    if (!data.id) return { ok: false, error: `업로드 응답에 video id 없음: ${JSON.stringify(data).slice(0, 300)}` };
-    return { ok: true, youtubeId: data.id, youtubeUrl: `https://youtu.be/${data.id}` };
+    if (!finalData || !finalData.id) return { ok: false, error: `업로드 응답에 video id 없음: ${JSON.stringify(finalData || {}).slice(0, 300)}` };
+    return { ok: true, youtubeId: finalData.id, youtubeUrl: `https://youtu.be/${finalData.id}` };
   } catch (e) {
     return { ok: false, error: `유튜브 업로드 오류: ${e.message}` };
+  }
+}
+
+// KV에 저장된 post의 유튜브 업로드 진행률만 갱신 — 관리자 화면 폴링이 이 값을 읽어 "업로드 중 N%"로 표시함.
+async function updateYoutubeUploadPercent(slug, percent, env) {
+  try {
+    const raw = await env.POSTS.get(`post:${slug}`);
+    if (!raw) return;
+    const p = JSON.parse(raw);
+    p.youtubeUploadPercent = percent;
+    await env.POSTS.put(`post:${slug}`, JSON.stringify(p));
+  } catch (e) {
+    console.log(`[youtube:${slug}] 진행률 저장 실패(무시하고 계속 업로드): ${e.message}`);
   }
 }
 
@@ -891,10 +930,11 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
     const postRaw = await env.POSTS.get(`post:${slug}`);
     if (!postRaw) return;
     const post = JSON.parse(postRaw);
-    const result = await uploadVideoToYoutube(post, videoBuffer, env);
+    const result = await uploadVideoToYoutube(post, videoBuffer, env, (percent) => updateYoutubeUploadPercent(slug, percent, env));
     const freshRaw = await env.POSTS.get(`post:${slug}`); // 업로드 도중 post가 또 바뀌었을 수 있으니 최신본에 병합
     if (!freshRaw) return;
     const freshPost = JSON.parse(freshRaw);
+    freshPost.youtubeUploadPercent = null; // 끝났으니 진행률 표시는 지우고 youtubeUrl/youtubeError로 결과만 남김
     if (result.ok) {
       freshPost.youtubeId = result.youtubeId;
       freshPost.youtubeUrl = result.youtubeUrl;
@@ -1614,8 +1654,13 @@ async function renderAdminPage(env, requestUrl) {
       ? `✅ 이미지·음성 사용 완료(mp4로 통합됨)${p.usedNews ? ' · 📰 뉴스참고' : ''}`
       : `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패(${escapeHtml(p.audioError.slice(0, 40))})` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
     const isRendering = pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug);
+    // mp4는 끝났는데 유튜브 업로드 결과(성공 링크/실패)가 아직 없으면 — 백그라운드 업로드가 진행 중이라는 뜻이므로
+    // render-progress와 같은 폴링 span으로 띄워서, 새로고침 없이도 진행률이 실시간으로 갱신되게 함.
+    const needsYoutubePoll = p.video && !p.youtubeUrl && !p.youtubeError;
     const videoStatus = p.video
-      ? `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>` : p.youtubeError ? ' · ⚠️ 유튜브실패' : ' · 유튜브 대기'}`
+      ? (needsYoutubePoll
+          ? `<span class="render-progress" data-slug="${p.slug}">🎬 mp4 완료 · 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}</span>`
+          : `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>` : ' · ⚠️ 유튜브실패'}`)
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
         : p.videoError
@@ -1632,7 +1677,7 @@ async function renderAdminPage(env, requestUrl) {
     </tr>`;
   }).join('');
 
-  const hasPending = posts.some((p) => !p.video && (pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug)));
+  const hasPending = posts.some((p) => (!p.video && (pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug))) || (p.video && !p.youtubeUrl && !p.youtubeError));
   const hasGenPending = genJobs.some((j) => !j.failed);
   const progressScript = (hasPending || hasGenPending) ? `<script>
     (function(){
@@ -1698,10 +1743,16 @@ async function renderAdminPage(env, requestUrl) {
                   el.textContent = '🎬 mp4 완료 · ⚠️ 유튜브실패(' + String(data.youtubeError).slice(0, 40) + ')';
                   el.dataset.terminal = '1';
                 } else {
-                  el.textContent = '🎬 mp4 완료 · 유튜브 업로드 중…';
-                  var tries = parseInt(el.dataset.ytTries || '0', 10) + 1;
-                  el.dataset.ytTries = String(tries);
-                  if (tries >= 20) { // 3초 간격 * 20회 ≈ 1분 — 그래도 안 끝나면 폴링 그만하고 새로고침으로 확인하게 안내
+                  var pct = (typeof data.youtubeUploadPercent === 'number') ? data.youtubeUploadPercent : null;
+                  el.textContent = '🎬 mp4 완료 · 유튜브 업로드 중' + (pct !== null ? ' ' + pct + '%' : '…');
+                  // 진행률이 실제로 움직이는 동안엔(대용량 영상이라 오래 걸려도) 절대 포기하지 않고,
+                  // 값이 이전 폴링과 똑같이 멈춰있을 때만 "멈춤" 횟수를 세서 일정 시간 뒤 포기함.
+                  var lastPct = el.dataset.ytLastPct !== undefined ? parseInt(el.dataset.ytLastPct, 10) : -1;
+                  var stalled = (pct !== null && pct === lastPct);
+                  el.dataset.ytLastPct = pct === null ? '-1' : String(pct);
+                  var stallTries = stalled ? (parseInt(el.dataset.ytStallTries || '0', 10) + 1) : 0;
+                  el.dataset.ytStallTries = String(stallTries);
+                  if (stallTries >= 20) { // 3초 간격 * 20회 ≈ 1분간 진행률이 그대로면 포기하고 새로고침 안내
                     el.textContent = '🎬 mp4 완료 · 유튜브 업로드 확인은 새로고침 후 봐주세요';
                     el.dataset.terminal = '1';
                   }
@@ -1962,6 +2013,7 @@ async function handleRenderProgress(request, env, ctx) {
       percent: post?.video ? 100 : 0,
       youtubeUrl: post?.youtubeUrl || null,
       youtubeError: post?.youtubeError || null,
+      youtubeUploadPercent: post?.youtubeUploadPercent ?? null,
     }), { headers: { 'Content-Type': 'application/json' } });
   }
   const job = JSON.parse(jobRaw);
@@ -1981,6 +2033,7 @@ async function handleRenderProgress(request, env, ctx) {
     // 릴레이가 done/failed라고 하면 여기서 바로 post에 반영 — 5분 크론까지 기다리게 하지 않음
     let youtubeUrl = null;
     let youtubeError = null;
+    let youtubeUploadPercent = null;
     if (data.status === 'done') {
       await finalizeRenderDone(job, `renderJob:${slug}`, env, ctx);
       // finalizeRenderDone 안의 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행돼서 이 시점엔 보통 아직 안 끝남 —
@@ -1989,10 +2042,11 @@ async function handleRenderProgress(request, env, ctx) {
       const freshPost = freshPostRaw ? JSON.parse(freshPostRaw) : null;
       youtubeUrl = freshPost?.youtubeUrl || null;
       youtubeError = freshPost?.youtubeError || null;
+      youtubeUploadPercent = freshPost?.youtubeUploadPercent ?? null;
     } else if (data.status === 'failed') {
       await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
     }
-    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, youtubeUrl, youtubeError }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, youtubeUrl, youtubeError, youtubeUploadPercent }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
   }
