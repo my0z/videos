@@ -5,7 +5,7 @@
  * 음성: Google Cloud TTS(Chirp3-HD 우선, 실패시 Wavenet 폴백, 그래도 실패시 Workers AI MeloTTS) — 이 전체 패스를
  *      3번까지 재시도(최대 21회 시도) 후에도 실패하면 발행은 계속 진행(글에 실패 사유 기록)
  * 자막: 문장을 줄 단위로 쪼개 이미지별 "비트"로 배정, 나레이션 실제 길이에 비례해 노출시간 계산.
- *      위치는 비트마다 5종 순환, 폰트/색은 영상 하나당 하나씩 랜덤 고정(웹·mp4 둘 다 동일 규칙)
+ *      위치/폰트/색 전부 영상 하나당 하나씩 랜덤 고정(비트마다 안 바뀜, 웹·mp4 둘 다 동일 규칙)
  * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환효과(xfade)/컬러그레이딩/loudnorm/
  *            음성없을 때 자체 합성 배경음악까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
  * 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피), 관리자 페이지가 열려있는 동안만 진행됨
@@ -18,8 +18,8 @@ const VIDEO_POLL_CRON = '*/5 * * * *'; // 이 크론이 실행되면 콘텐츠 �
 const CF_AI_GATEWAY = 'yzusb';
 const VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
 const SCENE_COUNT = 10; // 슬라이드쇼에 쓸 장면 이미지 개수 — 유료 플랜 전환(서브요청 10,000개)으로 다시 10장
-const CAPTION_STYLE_COUNT = 5; // 자막 "위치" 스타일 종류(비트마다 순환) — 웹(CSS)과 mp4(relay.js drawtext) 둘 다 같은 인덱스 규칙을 씀
-// 자막 폰트/색은 이제 위치와 분리 — 영상 하나당 하나씩만 랜덤 고정(비트마다 안 바뀜, 너무 산만해서 변경).
+const CAPTION_STYLE_COUNT = 5; // 자막 "위치" 종류 개수 — 웹(CSS)과 mp4(relay.js drawtext) 둘 다 같은 인덱스 규칙을 씀
+// 자막 위치/폰트/색 전부 영상 하나당 하나씩만 랜덤 고정(비트마다 안 바뀜 — 계속 바뀌면 산만해서 전부 고정으로 변경).
 // font key는 relay.js가 실제로 서버에 설치해둔 폰트 파일과 매칭되는 키만 사용(웹/mp4 폰트 일치 보장).
 const CAPTION_FONT_CHOICES = [
   { key: 'gowun', css: "'Gowun Dodum','Noto Sans KR',sans-serif" },
@@ -28,10 +28,11 @@ const CAPTION_FONT_CHOICES = [
   { key: 'nanumpen', css: "'Nanum Pen Script','Gowun Dodum',cursive" },
 ];
 const CAPTION_COLOR_CHOICES = ['#ffffff', '#FFD93D', '#FF6FA5', '#4FC3F7', '#6EE7B7', '#FFA94D', '#B197FC', '#FF8787'];
-function pickCaptionFontAndColor() {
+function pickCaptionStyle() {
   const font = CAPTION_FONT_CHOICES[Math.floor(Math.random() * CAPTION_FONT_CHOICES.length)];
   const color = CAPTION_COLOR_CHOICES[Math.floor(Math.random() * CAPTION_COLOR_CHOICES.length)];
-  return { captionFontKey: font.key, captionColor: color };
+  const positionIndex = Math.floor(Math.random() * CAPTION_STYLE_COUNT);
+  return { captionFontKey: font.key, captionColor: color, captionPositionIndex: positionIndex };
 }
 
 const STYLE = `
@@ -742,7 +743,7 @@ async function startRelayRender(imageKeys, audioKey, outputKey, weights, caption
       headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
       // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
       // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림)
-      // captionFontKey/captionColor: 이 영상 전체에 고정으로 쓸 폰트 키/색 하나(위치만 비트마다 순환, 폰트·색은 영상당 하나)
+      // captionFontKey/captionColor: 이 영상 전체에 고정으로 쓸 폰트 키/색 하나(위치도 영상당 하나로 고정 — captionBeats의 styleIndex가 이미 전부 동일한 값으로 옴)
       body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights, captionBeats, captionFontKey, captionColor }),
       signal: AbortSignal.timeout(25000),
     });
@@ -999,9 +1000,9 @@ function splitTextIntoNChunks(text, n) {
 // 한 이미지에 배정된 문장들을 "자막 비트"로 쪼갬 — 이번엔 문장 단위가 아니라 "줄" 단위로 쪼개서,
 // 화면엔 항상 한 줄만 보이고 그 줄이 순서대로 갈아끼워짐(긴 문장이 여러 줄 한꺼번에 뜨지 않음).
 // 각 줄의 노출시간은 글자수 비례, 문장이 끝나는 마지막 줄에만 정지시간(가상 글자수)을 더해줌.
-// startIndex: 영상 전체를 통틀어 몇 번째 비트인지(이미지 경계 넘어서도 계속 이어지는 카운터) — 이걸로
-// 자막마다 "위치"가 순환되도록 함(POSITION_STYLES 참고, renderSlideshow 안). 폰트/색은 영상당 하나로 고정이라 여기선 관여 안 함.
-function buildCaptionBeats(sentences, startIndex) {
+// positionIndex: 이 영상 전체에 고정으로 쓸 위치 하나(POSITION_STYLES 참고, renderSlideshow 안) — 예전엔 비트마다
+// 순환했는데 너무 산만하다는 피드백으로 위치/폰트/색 다 영상 하나당 하나로 고정.
+function buildCaptionBeats(sentences, positionIndex) {
   if (!sentences.length) return [];
   const PAUSE_EQUIVALENT_CHARS = 6;
   const beats = [];
@@ -1014,7 +1015,7 @@ function buildCaptionBeats(sentences, startIndex) {
     });
   }
   const sumWeights = beats.reduce((a, b) => a + b.weight, 0) || 1;
-  return beats.map((b, i) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: (startIndex + i) % CAPTION_STYLE_COUNT }));
+  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: positionIndex }));
 }
 
 function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
@@ -1087,6 +1088,8 @@ async function generateAndSavePost(topic, env, onProgress) {
   }
 
   report('이미지 준비 중', 40);
+  // 자막 위치/폰트/색은 이 영상 하나에 쓸 값을 미리 하나씩 고정 선택 — 비트마다 안 바뀌고 영상 전체 동일.
+  const { captionFontKey, captionColor, captionPositionIndex } = pickCaptionStyle();
   let images = [];
   let captionWeights = [];
   let captionBeats = []; // 이미지별 자막 "비트" 배열 — 한 이미지에 문장 여러 개면 순서대로 갈아끼울 목록
@@ -1106,23 +1109,19 @@ async function generateAndSavePost(topic, env, onProgress) {
     // 웹/mp4 둘 다 "그 이미지가 떠 있는 동안 문장을 순서대로 갈아끼우는" 방식으로 오버레이함
     // (한 이미지에 문장이 여러 개 몰려도 잘려나가지 않고 전부 노출됨).
     const perImageChunks = splitTextIntoNChunks(narrationText, rawImages.length || 1);
-    let globalBeatIndex = 0;
     for (let i = 0; i < rawImages.length; i++) {
       const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (rawImages.length || 1) };
       const key = `${slug}-scene-${i}.jpg`;
       await env.MEDIA.put(key, rawImages[i], { httpMetadata: { contentType: 'image/jpeg' } });
       images.push(key);
       captionWeights.push(chunk.weight);
-      const beats = buildCaptionBeats(chunk.sentences, globalBeatIndex);
-      globalBeatIndex += beats.length;
+      const beats = buildCaptionBeats(chunk.sentences, captionPositionIndex);
       captionBeats.push(beats);
     }
     console.log(`장면 이미지 ${images.length}개 저장 완료`);
   }
 
   report('글 저장 중', 80);
-  // 자막 폰트/색은 영상 하나당 하나로 고정 선택 — 위치(styleIndex)만 비트마다 순환(그대로 유지).
-  const { captionFontKey, captionColor } = pickCaptionFontAndColor();
   const post = {
     slug, topic, title: article.title, createdAt: new Date().toISOString(),
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
@@ -1186,8 +1185,9 @@ function renderSlideshow(post) {
       var DEFAULT_MS = 6000;
       function show(i){ slides.forEach(function(s,idx){ s.classList.toggle('active', idx===i); }); }
 
-      // 위치는 비트마다 5종 순환(그대로 유지). 폰트/색은 영상 하나당 하나로 고정(서버가 미리 뽑아서 내려줌) —
-      // relay.js(mp4)에도 같은 위치표 + 고정 폰트/색 규칙이 있음(POSITION_STYLES 인덱스 규칙 일치).
+      // 위치/폰트/색 전부 영상 하나당 하나로 고정(서버가 미리 뽑아서 내려줌, 비트마다 안 바뀜) — 위치는
+      // captionBeats의 모든 styleIndex가 이미 같은 값으로 와서 자연히 고정됨. 폰트/색은 아래 FIXED_FONT/FIXED_COLOR로 고정.
+      // relay.js(mp4)에도 같은 위치표 + 고정 폰트/색 규칙이 있음(POSITION_STYLES 인덱스 규칙 일치, styleIndex 그대로 재사용).
       var POSITION_STYLES = [
         { pos:'bottom', size:35 },
         { pos:'top',    size:33 },
@@ -1653,19 +1653,17 @@ async function runGenerationStep(job, env) {
   }
 
   if (job.stage === 'finalize') {
+    // 자막 위치/폰트/색은 이 영상 하나에 쓸 값을 미리 하나씩 고정 선택 — 비트마다 안 바뀌고 영상 전체 동일.
+    const { captionFontKey, captionColor, captionPositionIndex } = pickCaptionStyle();
     const perImageChunks = splitTextIntoNChunks(job.narrationText, job.images.length || 1);
     const captionWeights = [];
     const captionBeats = [];
-    let globalBeatIndex = 0;
     for (let i = 0; i < job.images.length; i++) {
       const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (job.images.length || 1) };
       captionWeights.push(chunk.weight);
-      const beats = buildCaptionBeats(chunk.sentences, globalBeatIndex);
-      globalBeatIndex += beats.length;
+      const beats = buildCaptionBeats(chunk.sentences, captionPositionIndex);
       captionBeats.push(beats);
     }
-    // 자막 폰트/색은 영상 하나당 하나로 고정 선택 — 위치(styleIndex)만 비트마다 순환(그대로 유지).
-    const { captionFontKey, captionColor } = pickCaptionFontAndColor();
     const post = {
       slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
       intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
