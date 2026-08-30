@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 22:58 (KST)
+ * 생성(마지막 작업): 2026-08-30 23:32 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -45,6 +45,12 @@ const CAPTION_FONT_CHOICES = [
   { key: 'gamjaflower', css: "'Gamja Flower',cursive" },
   { key: 'singleday', css: "'Single Day',cursive" },
   { key: 'cutefont', css: "'Cute Font',cursive" },
+  // [2026-08-30 23:31] 예쁜 폰트 5종 추가(사용자 요청, 두꺼운 폰트 제외) — 전부 구글폰트 무료(OFL), relay 키와 일치
+  { key: 'stylish', css: "'Stylish',sans-serif" },
+  { key: 'yeonsung', css: "'Yeon Sung',cursive" },
+  { key: 'gugi', css: "'Gugi',cursive" },
+  { key: 'nanumbrush', css: "'Nanum Brush Script',cursive" },
+  { key: 'sunflower', css: "'Sunflower',sans-serif" }, // Light(300) 웨이트만 로드 — 얇고 깔끔
 ];
 const CAPTION_COLOR_CHOICES = ['#ffffff', '#FFD93D', '#FF6FA5', '#4FC3F7', '#6EE7B7', '#FFA94D', '#B197FC', '#FF8787'];
 function pickCaptionStyle() {
@@ -111,7 +117,7 @@ const STYLE = `
   .slideshow .caption-box:empty{ display:none; }
 `;
 
-const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&family=Nanum+Pen+Script&family=Gowun+Batang&family=Song+Myung&family=Gaegu&family=Hi+Melody&family=Poor+Story&family=Gamja+Flower&family=Single+Day&family=Cute+Font&display=swap" rel="stylesheet">`;
+const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&family=Nanum+Pen+Script&family=Gowun+Batang&family=Song+Myung&family=Gaegu&family=Hi+Melody&family=Poor+Story&family=Gamja+Flower&family=Single+Day&family=Cute+Font&family=Stylish&family=Yeon+Sung&family=Gugi&family=Nanum+Brush+Script&family=Sunflower:wght@300&display=swap" rel="stylesheet">`;
 
 export default {
   async fetch(request, env, ctx) {
@@ -351,11 +357,11 @@ async function generateArticle(topic, newsResults, env) {
     const referenceText = newsResults
       .map((n, i) => `[참고자료 ${i + 1}] ${n.title}\n${n.description}`)
       .join('\n\n');
-    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보용 짧은 글 — 호기심을 끄는 첫 문장 + 핵심 요약, 공백 포함 250자 이내, 끝에 해시태그 2~3개, 링크는 넣지 않는다"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
     userPrompt = `주제: ${topic}\n\n${referenceText}`;
   } else {
     console.log('네이버 뉴스검색 결과 없음(또는 키 미설정), 참고자료 없이 작성');
-    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보용 짧은 글 — 호기심을 끄는 첫 문장 + 핵심 요약, 공백 포함 250자 이내, 끝에 해시태그 2~3개, 링크는 넣지 않는다"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
     userPrompt = `주제: ${topic}`;
   }
 
@@ -988,6 +994,23 @@ async function fetchVeoVideoBytes(videoUri, videoBase64, env) {
 }
 
 const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서 접근할 이미지/음성 URL의 기준 도메인
+
+// [2026-08-30 23:31] 스레드 공유 캡션 — 훅 / 요약 / 해시태그 / 링크를 빈 줄로 나눠 보기 좋게 구성.
+// AI가 줄바꿈 없이 한 덩어리로 준 경우에도 첫 문장(훅)과 해시태그를 분리해 자동으로 재구성함.
+function buildThreadsCaption(p) {
+  const raw = (p.threadsText || '').trim();
+  let bodyText = raw;
+  if (raw && !raw.includes('\n')) {
+    const tags = (raw.match(/#[^\s#]+/g) || []).join(' ');
+    const rest = raw.replace(/#[^\s#]+/g, '').replace(/\s+/g, ' ').trim();
+    const m = rest.match(/^(.+?[.!?])\s*(.*)$/);
+    bodyText = m && m[2] ? `${m[1]}\n\n${m[2]}` : rest;
+    if (tags) bodyText += `\n\n${tags}`;
+  }
+  if (!bodyText) bodyText = `${p.title || ''}\n${p.topic || ''}`.trim();
+  const link = p.youtubeUrl || `${SITE_ORIGIN}/${p.slug}`;
+  return `${bodyText}\n\n🎬 영상 보기 👉 ${link}`;
+}
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
 // 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
@@ -1933,7 +1956,7 @@ async function renderPostPage(env, slug) {
   // 알 방법이 없었던 게 문제였음("업로드 대기 중"에서 새로고침 전까진 영원히 안 바뀜) → 아래 스크립트로 폴링해서 자동 갱신.
   const needsYoutubePoll = p.video && !p.youtubeUrl && !p.youtubeError;
   // [2026-08-30 22:20] 스레드 공유 링크 — 홍보문+글 링크가 미리 채워진 스레드 작성창을 엶
-  const threadsShareHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(`${p.threadsText || p.title}\n${SITE_ORIGIN}/${p.slug}`)}`;
+  const threadsShareHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(buildThreadsCaption(p))}`; // [2026-08-30 23:31] 예쁜 형식 공용 빌더 사용
   const youtubeStatusText = p.youtubeUrl
     ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>${(p.youtubeShortsUrls && p.youtubeShortsUrls.length) ? p.youtubeShortsUrls.map((u, si) => ` · <a href="${escapeHtml(u)}" target="_blank" rel="noopener">🩳${si + 1}</a>`).join('') : p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank" rel="noopener">🩳 숏츠</a>` : ''} · <a href="${escapeHtml(threadsShareHref)}" target="_blank" rel="noopener">🧵 스레드 공유</a>`
     : p.youtubeError
@@ -2100,7 +2123,7 @@ async function renderAdminPage(env, requestUrl) {
           : (() => {
             // [2026-08-30 22:20] SNS 공유 도구 — 스레드는 웹 공유창(intent)으로 바로, 인스타는 자동 업로드가
             // Meta 앱 심사를 요구해서 릴스 규격(세로 숏츠) 영상 다운로드 + 캡션 복사 방식으로 제공.
-            const shareCaption = `${p.threadsText || `${p.title} — ${p.topic}`}\n${SITE_ORIGIN}/${p.slug}`;
+            const shareCaption = buildThreadsCaption(p); // [2026-08-30 23:31] 예쁜 형식(훅/요약/태그/링크 구분)
             const threadsHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(shareCaption)}`;
             const shareBits = [
               `<a href="${escapeHtml(threadsHref)}" target="_blank">🧵 스레드</a>`,
