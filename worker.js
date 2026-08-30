@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 22:44 (KST)
+ * 생성(마지막 작업): 2026-08-30 22:58 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -13,7 +13,7 @@
  *      relay.js가 세그먼트 실측 시각으로 타이밍을 맞춤(추정 없음). 위치/폰트/색은 영상당 하나씩 랜덤 고정.
  * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환(xfade)/컬러그레이딩/loudnorm/
  *            청크 분할 렌더링(5장씩)까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
- * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(청크 업로드, 진행률 실시간 표시) + 숏츠(세로 9:16, 첫 문장들 ~57초, #Shorts)도 이어서 업로드,
+ * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(청크 업로드, 진행률 실시간 표시) + 숏츠 3개(도입/중간/결론, 세로 9:16, 각 ~57초, #Shorts)도 이어서 업로드,
  *        privacyStatus public. 실패해도 글은 유지하고 youtubeError만 기록(음성과 달리 발행을 막지 않음)
  * 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피), 관리자 페이지가 열려있는 동안만 진행됨
  */
@@ -991,7 +991,7 @@ const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
 // 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
-async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey, shortOutputKey, weights, captionBeats, captionFontKey, captionColor, env) {
+async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, env) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
   if (!imageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
@@ -1009,7 +1009,7 @@ async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey
       // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
       // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림; 비트마다 segIndex로 음성 세그먼트 매핑)
       // captionFontKey/captionColor: 이 영상 전체에 고정으로 쓸 폰트 키/색 하나(위치도 영상당 하나로 고정 — captionBeats의 styleIndex가 이미 전부 동일한 값으로 옴)
-      body: JSON.stringify({ images: imageUrls, audioUrl, audioSegments, outputKey, shortOutputKey, weights, captionBeats, captionFontKey, captionColor }), // [2026-08-30 22:12] shortOutputKey: 숏츠(세로) 동시 렌더링
+      body: JSON.stringify({ images: imageUrls, audioUrl, audioSegments, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor }), // [2026-08-30 22:55] 숏츠 3개(도입/중간/결론) 동시 렌더링
       signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) {
@@ -1033,9 +1033,15 @@ async function finalizeRenderDone(job, renderJobKeyName, env, ctx) {
     const post = JSON.parse(postRaw);
     post.video = job.r2Key;
     // [2026-08-30 22:14] 숏츠가 실제로 R2에 있는지 확인해 기록(릴레이가 조건에 따라 건너뛸 수 있어 head로 검증)
-    if (job.shortKey) {
-      const shortHead = await env.MEDIA.head(job.shortKey).catch(() => null);
-      if (shortHead) post.videoShort = job.shortKey;
+    const shortKeyList = Array.isArray(job.shortKeys) ? job.shortKeys : (job.shortKey ? [job.shortKey] : []); // [2026-08-30 22:55] 숏츠 3개 지원
+    const existingShorts = [];
+    for (const sk of shortKeyList) {
+      const head = await env.MEDIA.head(sk).catch(() => null);
+      if (head) existingShorts.push(sk);
+    }
+    if (existingShorts.length) {
+      post.videoShorts = existingShorts;
+      post.videoShort = existingShorts[0]; // 하위호환(기존 표시/다운로드 코드)
     }
 
     // mp4가 완성되면 이미지·mp3(세그먼트 포함)는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
@@ -1095,7 +1101,7 @@ async function uploadVideoToYoutube(post, videoBuffer, env, onProgress, opts = {
   try {
     const accessToken = await getYoutubeAccessToken(env);
     const description = `${stripHtml(post.intro).slice(0, 400)}\n\n원문: ${SITE_ORIGIN}/${post.slug}`;
-    const shortsSuffix = opts.shorts ? ' #Shorts' : '';
+    const shortsSuffix = opts.shorts ? `${opts.partTotal > 1 ? ` (${opts.partNo}/${opts.partTotal})` : ''} #Shorts` : ''; // [2026-08-30 22:55] 숏츠 여러 개면 (1/3) 식으로 제목 구분
     const metadata = {
       snippet: {
         title: (post.title || post.topic || 'life.news').slice(0, 100 - shortsSuffix.length) + shortsSuffix,
@@ -1207,26 +1213,30 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
       console.log(`[youtube:${slug}] 업로드 실패: ${result.error}`);
     }
 
-    // [2026-08-30 22:13] 숏츠(세로판)가 있으면 본편에 이어서 업로드 — 실패해도 본편 결과엔 영향 없음
-    if (freshPost.videoShort) {
-      try {
-        const shortObj = await env.MEDIA.get(freshPost.videoShort);
-        if (shortObj) {
+    // [2026-08-30 22:55] 숏츠(도입/중간/결론 최대 3개)를 본편에 이어 순차 업로드 — 개별 실패는 나머지에 영향 없음.
+    // 유튜브 쿼터 참고: 업로드 1건당 1,600유닛이라 본편+숏츠3 = 6,400유닛(기본 일일 10,000 → 하루 1편 페이스).
+    const shortsToUpload = Array.isArray(freshPost.videoShorts) && freshPost.videoShorts.length
+      ? freshPost.videoShorts : (freshPost.videoShort ? [freshPost.videoShort] : []);
+    if (shortsToUpload.length) {
+      freshPost.youtubeShortsUrls = [];
+      for (let si = 0; si < shortsToUpload.length; si++) {
+        try {
+          const shortObj = await env.MEDIA.get(shortsToUpload[si]);
+          if (!shortObj) continue;
           const shortBuffer = await shortObj.arrayBuffer();
-          const shortResult = await uploadVideoToYoutube(freshPost, shortBuffer, env, null, { shorts: true });
+          const shortResult = await uploadVideoToYoutube(freshPost, shortBuffer, env, null, { shorts: true, partNo: si + 1, partTotal: shortsToUpload.length });
           if (shortResult.ok) {
-            freshPost.youtubeShortsId = shortResult.youtubeId;
-            freshPost.youtubeShortsUrl = shortResult.youtubeUrl;
-            freshPost.youtubeShortsError = null;
-            console.log(`[youtube:${slug}] 숏츠 업로드 성공: ${shortResult.youtubeUrl}`);
+            freshPost.youtubeShortsUrls.push(shortResult.youtubeUrl);
+            if (si === 0) { freshPost.youtubeShortsId = shortResult.youtubeId; freshPost.youtubeShortsUrl = shortResult.youtubeUrl; freshPost.youtubeShortsError = null; }
+            console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 성공: ${shortResult.youtubeUrl}`);
           } else {
-            freshPost.youtubeShortsError = shortResult.error;
-            console.log(`[youtube:${slug}] 숏츠 업로드 실패: ${shortResult.error}`);
+            if (si === 0) freshPost.youtubeShortsError = shortResult.error;
+            console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 실패: ${shortResult.error}`);
           }
+        } catch (e) {
+          if (si === 0) freshPost.youtubeShortsError = e.message;
+          console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 예외: ${e.message}`);
         }
-      } catch (e) {
-        freshPost.youtubeShortsError = e.message;
-        console.log(`[youtube:${slug}] 숏츠 업로드 예외: ${e.message}`);
       }
     }
     await env.POSTS.put(`post:${slug}`, JSON.stringify(freshPost));
@@ -1281,6 +1291,7 @@ async function deletePostCompletely(slug, env) {
     if (post.audio) toDelete.push(post.audio);
     if (post.video) toDelete.push(post.video);
     if (post.videoShort) toDelete.push(post.videoShort); // [2026-08-30 22:14] 숏츠도 함께 정리
+    (post.videoShorts || []).forEach((k) => { if (!toDelete.includes(k)) toDelete.push(k); }); // [2026-08-30 22:55] 숏츠 3개 전부
     if (toDelete.length) {
       await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
     }
@@ -1696,11 +1707,11 @@ async function generateAndSavePost(topic, env, onProgress) {
   // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
   if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && images.length) {
     const outputKey = `${slug}.mp4`;
-    const shortKey = `${slug}-short.mp4`; // [2026-08-30 22:12] 숏츠도 같이
-    const render = await startRelayRender(images, audioKey, audioSegmentKeys, outputKey, shortKey, captionWeights, captionBeats, captionFontKey, captionColor, env);
+    const shortKeys = [`${slug}-short.mp4`, `${slug}-short2.mp4`, `${slug}-short3.mp4`]; // [2026-08-30 22:55] 숏츠 3개
+    const render = await startRelayRender(images, audioKey, audioSegmentKeys, outputKey, shortKeys, captionWeights, captionBeats, captionFontKey, captionColor, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
-        jobId: render.jobId, slug, r2Key: outputKey, shortKey, imageKeys: images, startedAt: Date.now(),
+        jobId: render.jobId, slug, r2Key: outputKey, shortKeys, imageKeys: images, startedAt: Date.now(),
       }));
       console.log(`릴레이 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
     } else {
@@ -1924,7 +1935,7 @@ async function renderPostPage(env, slug) {
   // [2026-08-30 22:20] 스레드 공유 링크 — 홍보문+글 링크가 미리 채워진 스레드 작성창을 엶
   const threadsShareHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(`${p.threadsText || p.title}\n${SITE_ORIGIN}/${p.slug}`)}`;
   const youtubeStatusText = p.youtubeUrl
-    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>${p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank" rel="noopener">🩳 숏츠</a>` : ''} · <a href="${escapeHtml(threadsShareHref)}" target="_blank" rel="noopener">🧵 스레드 공유</a>`
+    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>${(p.youtubeShortsUrls && p.youtubeShortsUrls.length) ? p.youtubeShortsUrls.map((u, si) => ` · <a href="${escapeHtml(u)}" target="_blank" rel="noopener">🩳${si + 1}</a>`).join('') : p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank" rel="noopener">🩳 숏츠</a>` : ''} · <a href="${escapeHtml(threadsShareHref)}" target="_blank" rel="noopener">🧵 스레드 공유</a>`
     : p.youtubeError
       ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 200))})`
       : `· 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}`;
@@ -2093,10 +2104,10 @@ async function renderAdminPage(env, requestUrl) {
             const threadsHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(shareCaption)}`;
             const shareBits = [
               `<a href="${escapeHtml(threadsHref)}" target="_blank">🧵 스레드</a>`,
-              p.videoShort ? `<a href="/media/${escapeHtml(p.videoShort)}" download>⬇️ 인스타영상</a>` : '',
+              ...((p.videoShorts && p.videoShorts.length ? p.videoShorts : (p.videoShort ? [p.videoShort] : [])).map((k, si) => `<a href="/media/${escapeHtml(k)}" download>⬇️ 인스타${si + 1}</a>`)),
               `<button type="button" class="copy-cap" data-cap="${escapeHtml(shareCaption)}" style="font-size:11px;padding:2px 8px;">📋 캡션</button>`,
             ].filter(Boolean).join(' · ');
-            return `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>${p.youtubeUploadSec ? ` (업로드 ${fmtDurSec(p.youtubeUploadSec)})` : ''}` : ` · ⚠️ 유튜브실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`}${p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank">🩳 숏츠</a>` : p.youtubeShortsError ? ' · ⚠️ 숏츠실패' : ''}<br>${shareBits}`;
+            return `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>${p.youtubeUploadSec ? ` (업로드 ${fmtDurSec(p.youtubeUploadSec)})` : ''}` : ` · ⚠️ 유튜브실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`}${(p.youtubeShortsUrls && p.youtubeShortsUrls.length) ? p.youtubeShortsUrls.map((u, si) => ` · <a href="${escapeHtml(u)}" target="_blank">🩳${si + 1}</a>`).join('') : p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank">🩳 숏츠</a>` : p.youtubeShortsError ? ' · ⚠️ 숏츠실패' : ''}<br>${shareBits}`;
           })())
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
@@ -2179,11 +2190,12 @@ async function renderAdminPage(env, requestUrl) {
                     var us = data.youtubeUploadSec;
                     el.appendChild(document.createTextNode(' (업로드 ' + (us >= 60 ? Math.floor(us / 60) + '분 ' + (us % 60) + '초' : us + '초') + ')'));
                   }
-                  if (data.youtubeShortsUrl) { // [2026-08-30 22:14] 숏츠 링크
+                  var shortsUrls = data.youtubeShortsUrls || (data.youtubeShortsUrl ? [data.youtubeShortsUrl] : []); // [2026-08-30 22:55] 숏츠 여러 개
+                  shortsUrls.forEach(function(u, si){
                     el.appendChild(document.createTextNode(' · '));
-                    var sa = document.createElement('a'); sa.href = data.youtubeShortsUrl; sa.target = '_blank'; sa.textContent = '🩳 숏츠';
+                    var sa = document.createElement('a'); sa.href = u; sa.target = '_blank'; sa.textContent = '🩳' + (si + 1);
                     el.appendChild(sa);
-                  }
+                  });
                   el.dataset.terminal = '1';
                 } else if (data.youtubeError) {
                   el.textContent = '🎬 mp4 완료 · ⚠️ 유튜브실패(' + String(data.youtubeError).slice(0, 150) + ')';
@@ -2446,11 +2458,12 @@ async function runGenerationStep(job, env) {
   if (job.stage === 'render') {
     if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && job.images.length) {
       const outputKey = `${job.slug}.mp4`;
-      const shortKey = `${job.slug}-short.mp4`; // [2026-08-30 22:12] 숏츠(세로 9:16)도 같이 렌더링
-      const render = await startRelayRender(job.images, job.audioKey, job.audioSegmentKeys, outputKey, shortKey, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env);
+      // [2026-08-30 22:55] 숏츠 3개(도입/중간/결론) — 노출 시도 3배(본편이 짧으면 릴레이가 겹치는 구간은 알아서 줄임)
+      const shortKeys = [`${job.slug}-short.mp4`, `${job.slug}-short2.mp4`, `${job.slug}-short3.mp4`];
+      const render = await startRelayRender(job.images, job.audioKey, job.audioSegmentKeys, outputKey, shortKeys, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env);
       if (render.ok) {
         await env.POSTS.put(`renderJob:${job.slug}`, JSON.stringify({
-          jobId: render.jobId, slug: job.slug, r2Key: outputKey, shortKey, startedAt: Date.now(),
+          jobId: render.jobId, slug: job.slug, r2Key: outputKey, shortKeys, startedAt: Date.now(),
         }));
       } else {
         const postRaw = await env.POSTS.get(`post:${job.slug}`);
@@ -2541,6 +2554,7 @@ async function handleRenderProgress(request, env, ctx) {
       youtubeUploadPercent: post?.youtubeUploadPercent ?? null,
       youtubeUploadSec: post?.youtubeUploadSec ?? null,
       youtubeShortsUrl: post?.youtubeShortsUrl || null,
+      youtubeShortsUrls: post?.youtubeShortsUrls || null,
     }), { headers: { 'Content-Type': 'application/json' } });
   }
   const job = JSON.parse(jobRaw);
@@ -2563,6 +2577,7 @@ async function handleRenderProgress(request, env, ctx) {
     let youtubeUploadPercent = null;
     let youtubeUploadSec = null;
     let youtubeShortsUrl = null;
+    let youtubeShortsUrls = null;
     if (data.status === 'done') {
       await finalizeRenderDone(job, `renderJob:${slug}`, env, ctx);
       // finalizeRenderDone 안의 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행돼서 이 시점엔 보통 아직 안 끝남 —
@@ -2574,10 +2589,11 @@ async function handleRenderProgress(request, env, ctx) {
       youtubeUploadPercent = freshPost?.youtubeUploadPercent ?? null;
       youtubeUploadSec = freshPost?.youtubeUploadSec ?? null;
       youtubeShortsUrl = freshPost?.youtubeShortsUrl || null;
+      youtubeShortsUrls = freshPost?.youtubeShortsUrls || null;
     } else if (data.status === 'failed') {
       await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
     }
-    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, youtubeUrl, youtubeError, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, youtubeUrl, youtubeError, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl, youtubeShortsUrls }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
   }
