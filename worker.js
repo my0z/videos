@@ -3,11 +3,14 @@
  *
  * 이미지: Pixabay → Pexels → Unsplash(실사진 검색, 키워드 관련성 검사 통과해야 채택) → 다 실패하면 Workers AI(FLUX) 생성
  * 음성: Google Cloud TTS(Chirp3-HD 우선, 실패시 Wavenet 폴백, 그래도 실패시 Workers AI MeloTTS) — 이 전체 패스를
- *      3번까지 재시도(최대 21회 시도) 후에도 실패하면 발행은 계속 진행(글에 실패 사유 기록)
+ *      3번까지 재시도(최대 21회 시도)해도 끝내 실패하면 무음으로 발행하지 않고 아예 발행을 중단함(이미지 정리 후 실패 처리).
+ *      mp4까지 다 만들었는데 최종 파일에 오디오 트랙이 없는 경우(relay.js가 ffprobe로 검증)도 글째로 삭제.
  * 자막: 문장을 줄 단위로 쪼개 이미지별 "비트"로 배정, 나레이션 실제 길이에 비례해 노출시간 계산.
  *      위치/폰트/색 전부 영상 하나당 하나씩 랜덤 고정(비트마다 안 바뀜, 웹·mp4 둘 다 동일 규칙)
  * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환효과(xfade)/컬러그레이딩/loudnorm/
  *            음성없을 때 자체 합성 배경음악까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
+ * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(refresh_token → access_token → resumable upload),
+ *        privacyStatus public. 실패해도 글은 유지하고 youtubeError만 기록(음성과 달리 발행을 막지 않음)
  * 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피), 관리자 페이지가 열려있는 동안만 진행됨
  */
 
@@ -104,7 +107,7 @@ export default {
       if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env);
       if (path === '/api/generate' && request.method === 'POST') return await handleApiGenerate(request, env);
       if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
-      if (path === '/admin/render-progress') return await handleRenderProgress(request, env);
+      if (path === '/admin/render-progress') return await handleRenderProgress(request, env, ctx);
       if (path === '/admin/generate-step' && request.method === 'POST') return await handleGenerateStep(request, env);
       if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
       const rootSlugMatch = path.match(/^\/([^\/]+)$/);
@@ -120,7 +123,7 @@ export default {
         console.log(`=== 크론 실행: ${new Date().toISOString()} (cron: ${event.cron}) ===`);
         if (event.cron === VIDEO_POLL_CRON) {
           await pollPendingVideoJobs(env);
-          await pollPendingRenderJobs(env);
+          await pollPendingRenderJobs(env, ctx);
         }
       })()
     );
@@ -772,7 +775,7 @@ async function startRelayRender(imageKeys, audioKey, outputKey, weights, caption
 // 렌더링 완료/실패 처리를 공통 함수로 분리 — 5분 크론뿐 아니라 admin 페이지가 실시간으로 상태를
 // 물어볼 때도(handleRenderProgress) 그 자리에서 바로 반영시켜서, "완료라고 뜨는데 실제로는 최대 5분
 // 기다려야 반영되는" 시차를 없앰.
-async function finalizeRenderDone(job, renderJobKeyName, env) {
+async function finalizeRenderDone(job, renderJobKeyName, env, ctx) {
   const postRaw = await env.POSTS.get(`post:${job.slug}`);
   if (postRaw) {
     const post = JSON.parse(postRaw);
@@ -788,9 +791,123 @@ async function finalizeRenderDone(job, renderJobKeyName, env) {
     post.audio = null;
 
     await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
+
+    // 유튜브 자동 업로드 — 응답/크론을 안 붙잡고 백그라운드로 돌림(ctx.waitUntil). 실패해도 글은 그대로 살려두고
+    // youtubeError만 남김(음성처럼 삭제하진 않음 — 유튜브는 부가 기능이라 실패가 발행 자체를 막을 이유는 없음).
+    const uploadPromise = triggerYoutubeUpload(job.slug, job.r2Key, env);
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(uploadPromise);
+    else await uploadPromise;
   }
   await env.POSTS.delete(renderJobKeyName);
   console.log(`[${renderJobKeyName}] 릴레이 렌더링 완료 및 저장: ${job.r2Key}`);
+}
+
+// ---------- 유튜브 자동 업로드 ----------
+// refresh_token으로 access_token을 매번 새로 발급받음(access_token은 수명이 짧아서 캐싱 안 하고 그때그때 발급).
+async function getYoutubeAccessToken(env) {
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: env.YOUTUBE_CLIENT_ID,
+      client_secret: env.YOUTUBE_CLIENT_SECRET,
+      refresh_token: env.YOUTUBE_REFRESH_TOKEN,
+      grant_type: 'refresh_token',
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    const bodyText = await res.text();
+    throw new Error(`access_token 발급 실패: HTTP ${res.status} — ${bodyText.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  if (!data.access_token) throw new Error(`access_token 응답에 값 없음: ${JSON.stringify(data).slice(0, 300)}`);
+  return data.access_token;
+}
+
+// YouTube Data API v3 resumable upload — 세션을 먼저 열고(POST) 실제 영상 바이트를 그 URL로 PUT함.
+// 짧은 슬라이드쇼 영상(몇 MB 수준)이라 청크 분할 없이 한 번에 PUT해도 충분함.
+async function uploadVideoToYoutube(post, videoBuffer, env) {
+  if (!env.YOUTUBE_CLIENT_ID || !env.YOUTUBE_CLIENT_SECRET || !env.YOUTUBE_REFRESH_TOKEN) {
+    return { ok: false, error: 'YOUTUBE_CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN 환경변수 미설정' };
+  }
+  try {
+    const accessToken = await getYoutubeAccessToken(env);
+    const description = `${stripHtml(post.intro).slice(0, 400)}\n\n원문: ${SITE_ORIGIN}/${post.slug}`;
+    const metadata = {
+      snippet: {
+        title: (post.title || post.topic || 'life.news').slice(0, 100),
+        description: description.slice(0, 4900),
+        tags: [post.topic].filter(Boolean).slice(0, 10),
+        categoryId: '25', // News & Politics — 생활뉴스 성격에 맞춤
+      },
+      status: { privacyStatus: 'public', selfDeclaredMadeForKids: false },
+    };
+    const initRes = await fetch('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': 'video/mp4',
+        'X-Upload-Content-Length': String(videoBuffer.byteLength),
+      },
+      body: JSON.stringify(metadata),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!initRes.ok) {
+      const bodyText = await initRes.text();
+      return { ok: false, error: `업로드 세션 생성 실패: HTTP ${initRes.status} — ${bodyText.slice(0, 300)}` };
+    }
+    const uploadUrl = initRes.headers.get('Location');
+    if (!uploadUrl) return { ok: false, error: '업로드 세션 응답에 Location 헤더 없음' };
+
+    const putRes = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'video/mp4', 'Content-Length': String(videoBuffer.byteLength) },
+      body: videoBuffer,
+      signal: AbortSignal.timeout(120000), // 업로드 자체는 시간이 걸릴 수 있어서 넉넉히 잡음
+    });
+    if (!putRes.ok) {
+      const bodyText = await putRes.text();
+      return { ok: false, error: `영상 업로드 실패: HTTP ${putRes.status} — ${bodyText.slice(0, 300)}` };
+    }
+    const data = await putRes.json();
+    if (!data.id) return { ok: false, error: `업로드 응답에 video id 없음: ${JSON.stringify(data).slice(0, 300)}` };
+    return { ok: true, youtubeId: data.id, youtubeUrl: `https://youtu.be/${data.id}` };
+  } catch (e) {
+    return { ok: false, error: `유튜브 업로드 오류: ${e.message}` };
+  }
+}
+
+// mp4가 R2(env.MEDIA)에 올라간 직후 호출 — 그 자리에서 바로 바이트를 읽어 유튜브에 올리고 결과를 post에 반영.
+async function triggerYoutubeUpload(slug, r2Key, env) {
+  try {
+    const videoObj = await env.MEDIA.get(r2Key);
+    if (!videoObj) {
+      console.log(`[youtube:${slug}] mp4를 MEDIA에서 못 찾음(${r2Key}) — 업로드 스킵`);
+      return;
+    }
+    const videoBuffer = await videoObj.arrayBuffer();
+    const postRaw = await env.POSTS.get(`post:${slug}`);
+    if (!postRaw) return;
+    const post = JSON.parse(postRaw);
+    const result = await uploadVideoToYoutube(post, videoBuffer, env);
+    const freshRaw = await env.POSTS.get(`post:${slug}`); // 업로드 도중 post가 또 바뀌었을 수 있으니 최신본에 병합
+    if (!freshRaw) return;
+    const freshPost = JSON.parse(freshRaw);
+    if (result.ok) {
+      freshPost.youtubeId = result.youtubeId;
+      freshPost.youtubeUrl = result.youtubeUrl;
+      freshPost.youtubeError = null;
+      console.log(`[youtube:${slug}] 업로드 성공: ${result.youtubeUrl}`);
+    } else {
+      freshPost.youtubeError = result.error;
+      console.log(`[youtube:${slug}] 업로드 실패: ${result.error}`);
+    }
+    await env.POSTS.put(`post:${slug}`, JSON.stringify(freshPost));
+  } catch (e) {
+    console.log(`[youtube:${slug}] 업로드 처리 중 예외: ${e.message}`);
+  }
 }
 
 async function finalizeRenderFailed(job, renderJobKeyName, errMsg, env) {
@@ -834,7 +951,7 @@ async function deletePostCompletely(slug, env) {
   }
 }
 
-async function pollPendingRenderJobs(env) {
+async function pollPendingRenderJobs(env, ctx) {
   const list = await env.POSTS.list({ prefix: 'renderJob:' });
   if (!list.keys.length) {
     console.log('대기 중인 릴레이 렌더링 작업 없음.');
@@ -883,7 +1000,7 @@ async function pollPendingRenderJobs(env) {
       continue;
     }
 
-    await finalizeRenderDone(job, keyInfo.name, env);
+    await finalizeRenderDone(job, keyInfo.name, env, ctx);
   }
 }
 
@@ -1402,10 +1519,16 @@ async function renderPostPage(env, slug) {
   const sectionsHtml = (p.sections || []).map((s) => `<h2>${escapeHtml(s.heading)}</h2>${s.body_html}`).join('');
   // mp4가 완성된 글은 SVG/mp3가 이미 삭제된 상태라 슬라이드쇼를 그리면 깨진 이미지만 남음 — 영상 하나만 보여줌
   const slideshow = p.video ? '' : renderSlideshow(p);
+  // 유튜브는 렌더링 완료 직후 자동 업로드됨(백그라운드) — 성공하면 링크, 실패하면 사유, 아직이면 대기중 표시.
+  const youtubeStatusText = p.youtubeUrl
+    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>`
+    : p.youtubeError
+      ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 60))})`
+      : '· 유튜브 업로드 대기 중';
   const veoVideoBlock = p.video
     ? `<div style="margin:20px 0;">
         <video controls preload="metadata" style="width:100%;border-radius:10px;background:#000;" src="/media/${p.video}"></video>
-        <p class="mono" style="font-size:12px;color:var(--muted);margin-top:8px;">🎬 실제 영상 파일(mp4) — 다운로드해서 유튜브 등에 업로드할 수 있어요. (우클릭 → 다른 이름으로 저장)</p>
+        <p class="mono" style="font-size:12px;color:var(--muted);margin-top:8px;">🎬 실제 영상 파일(mp4) ${youtubeStatusText}</p>
       </div>`
     : '';
 
@@ -1492,7 +1615,7 @@ async function renderAdminPage(env, requestUrl) {
       : `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패(${escapeHtml(p.audioError.slice(0, 40))})` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
     const isRendering = pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug);
     const videoStatus = p.video
-      ? '🎬 mp4 완료'
+      ? `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>` : p.youtubeError ? ' · ⚠️ 유튜브실패' : ' · 유튜브 대기'}`
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
         : p.videoError
@@ -1804,7 +1927,7 @@ async function handleGenerateStep(request, env) {
   }
 }
 
-async function handleRenderProgress(request, env) {
+async function handleRenderProgress(request, env, ctx) {
   const url = new URL(request.url);
   const slug = url.searchParams.get('slug');
   if (!slug) return new Response(JSON.stringify({ error: 'slug 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -1832,7 +1955,7 @@ async function handleRenderProgress(request, env) {
     const data = await res.json();
     // 릴레이가 done/failed라고 하면 여기서 바로 post에 반영 — 5분 크론까지 기다리게 하지 않음
     if (data.status === 'done') {
-      await finalizeRenderDone(job, `renderJob:${slug}`, env);
+      await finalizeRenderDone(job, `renderJob:${slug}`, env, ctx);
     } else if (data.status === 'failed') {
       await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
     }
