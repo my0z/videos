@@ -1566,7 +1566,7 @@ async function renderPostPage(env, slug) {
   const youtubeStatusText = p.youtubeUrl
     ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>`
     : p.youtubeError
-      ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 60))})`
+      ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 200))})`
       : `· 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}`;
   const veoVideoBlock = p.video
     ? `<div style="margin:20px 0;">
@@ -1593,7 +1593,7 @@ async function renderPostPage(env, slug) {
               return;
             }
             if (data.youtubeError) {
-              el.textContent = '· ⚠️ 유튜브 업로드 실패(' + String(data.youtubeError).slice(0, 60) + ')';
+              el.textContent = '· ⚠️ 유튜브 업로드 실패(' + String(data.youtubeError).slice(0, 200) + ')';
               if (timer) clearInterval(timer);
               return;
             }
@@ -1702,7 +1702,7 @@ async function renderAdminPage(env, requestUrl) {
     const videoStatus = p.video
       ? (needsYoutubePoll
           ? `<span class="render-progress" data-slug="${p.slug}">🎬 mp4 완료 · 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}</span>`
-          : `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>` : ' · ⚠️ 유튜브실패'}`)
+          : `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>` : ` · ⚠️ 유튜브실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`}`)
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
         : p.videoError
@@ -1782,7 +1782,7 @@ async function renderAdminPage(env, requestUrl) {
                   el.appendChild(a);
                   el.dataset.terminal = '1';
                 } else if (data.youtubeError) {
-                  el.textContent = '🎬 mp4 완료 · ⚠️ 유튜브실패(' + String(data.youtubeError).slice(0, 40) + ')';
+                  el.textContent = '🎬 mp4 완료 · ⚠️ 유튜브실패(' + String(data.youtubeError).slice(0, 150) + ')';
                   el.dataset.terminal = '1';
                 } else {
                   var pct = (typeof data.youtubeUploadPercent === 'number') ? data.youtubeUploadPercent : null;
