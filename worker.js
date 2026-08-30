@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 20:51 (KST)
+ * 생성(마지막 작업): 2026-08-30 21:08 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -179,7 +179,10 @@ async function callAiChain(systemPrompt, userPrompt, env) {
   const attemptErrors = [];
 
   if (env.GROQ_API_KEY) {
-    for (const model of ['llama-3.1-8b-instant', 'openai/gpt-oss-120b']) {
+    // [2026-08-30 21:08] 모델 현행화: llama-3.1-8b-instant가 2026-08-16 Groq에서 퇴역(404) → gpt-oss-20b(빠름) →
+    // gpt-oss-120b(품질) → qwen3.6-27b 순. gpt-oss 계열은 추론(리즈닝) 모델이라 생각 토큰이 한도를 다 먹으면
+    // content가 비어버림 → reasoning_effort를 low로 낮추고 max_tokens도 8000으로 넉넉히.
+    for (const model of ['openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'qwen/qwen3.6-27b']) {
       try {
         const res = await fetch(`https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/groq/openai/v1/chat/completions`, {
           method: 'POST',
@@ -188,9 +191,10 @@ async function callAiChain(systemPrompt, userPrompt, env) {
             model,
             messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
             temperature: 0.7,
-            max_tokens: 5000, // [2026-08-30 19:38] 4분 분량(1,700~2,000자) 글이 2000토큰에서 잘려 JSON 파싱 실패하던 문제 수정
+            max_tokens: 8000,
+            ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
           }),
-          signal: AbortSignal.timeout(20000),
+          signal: AbortSignal.timeout(45000), // 4분 분량 생성이라 넉넉히(스텝 방식이라 오래 기다려도 됨)
         });
         if (res.ok) {
           const data = await res.json();
@@ -204,7 +208,7 @@ async function callAiChain(systemPrompt, userPrompt, env) {
               continue;
             }
           } else {
-            attemptErrors.push(`[${model}] 응답에 content 없음`);
+            attemptErrors.push(`[${model}] 응답에 content 없음(finish: ${data?.choices?.[0]?.finish_reason || '?'})`);
             continue;
           }
         } else {
@@ -226,7 +230,7 @@ async function callAiChain(systemPrompt, userPrompt, env) {
       const response = await withTimeout(env.AI.run('@cf/zai-org/glm-4.7-flash', {
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
         max_tokens: 5000, // [2026-08-30 19:38] 4분 분량(1,700~2,000자) 글이 2000토큰에서 잘려 JSON 파싱 실패하던 문제 수정
-      }, { gateway: { id: CF_AI_GATEWAY } }), 20000, 'workers-ai 글 생성');
+      }, { gateway: { id: CF_AI_GATEWAY } }), 55000, 'workers-ai 글 생성'); // [2026-08-30 21:08] 20초→55초(4분 분량엔 부족했음)
       let raw = response?.response;
       if (raw) {
         raw = raw.trim().replace(/^```json\s*|\s*```$/gm, '').trim();
