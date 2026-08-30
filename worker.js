@@ -16,6 +16,7 @@ const VIDEO_POLL_CRON = '*/5 * * * *'; // 이 크론이 실행되면 콘텐츠 �
 const CF_AI_GATEWAY = 'yzusb';
 const VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
 const SCENE_COUNT = 10; // 슬라이드쇼에 쓸 장면 이미지 개수 — 유료 플랜 전환(서브요청 10,000개)으로 다시 10장
+const CAPTION_STYLE_COUNT = 5; // 자막 위치/색/크기 스타일 종류 — 웹(CSS)과 mp4(relay.js drawtext) 둘 다 같은 인덱스 규칙을 씀
 
 const STYLE = `
   :root{
@@ -66,7 +67,7 @@ const STYLE = `
   .slideshow .slide.active{ opacity:1; }
   .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:1px solid rgba(255,255,255,0.4); padding:8px 16px; border-radius:20px; font-size:13px; font-weight:600; cursor:pointer; backdrop-filter:blur(4px); }
   .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
-  .slideshow .caption-box{ position:absolute; left:24px; right:24px; bottom:80px; z-index:4; min-height:0; background:transparent; color:#fff; padding:0 12px; font-family:'Gowun Dodum','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:35px; line-height:1.3; white-space:pre-line; text-align:center;
+  .slideshow .caption-box{ position:absolute; z-index:4; min-height:0; background:transparent; padding:0 12px; white-space:pre-line; transition:top 0.3s ease, bottom 0.3s ease, left 0.3s ease, right 0.3s ease;
     -webkit-text-stroke:7px #000;
     paint-order:stroke fill;
     text-shadow:-6px -6px 0 #000, 6px -6px 0 #000, -6px 6px 0 #000, 6px 6px 0 #000, 0 -6px 0 #000, 0 6px 0 #000, -6px 0 0 #000, 6px 0 0 #000;
@@ -74,7 +75,7 @@ const STYLE = `
   .slideshow .caption-box:empty{ display:none; }
 `;
 
-const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&display=swap" rel="stylesheet">`;
+const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&family=Nanum+Pen+Script&display=swap" rel="stylesheet">`;
 
 export default {
   async fetch(request, env, ctx) {
@@ -610,6 +611,27 @@ async function generateNarrationAudio(text, env) {
       }
     }
 
+    // Google TTS 두 계열 다 실패하면, Workers AI 자체 TTS(MeloTTS)도 마지막으로 한 번 시도 —
+    // 별도 API 키 필요 없이 이미 쓰고 있는 AI 바인딩 그대로라 부담 없이 끼워넣을 수 있는 마지막 카드.
+    if (!attempt.ok && env.AI) {
+      try {
+        const meloResponse = await withTimeout(
+          env.AI.run('@cf/myshell-ai/melotts', { prompt: trimmed, lang: 'ko' }, { gateway: { id: CF_AI_GATEWAY } }),
+          20000, 'MeloTTS 음성합성'
+        );
+        if (meloResponse?.audio) {
+          const binary = atob(meloResponse.audio);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          console.log('음성합성 성공 (Workers AI MeloTTS, 마지막 폴백)');
+          return { buffer: bytes.buffer, error: null };
+        }
+        attemptErrors.push('MeloTTS 실패: 응답에 audio 없음');
+      } catch (e) {
+        attemptErrors.push(`MeloTTS 실패: ${e.message}`);
+      }
+    }
+
     if (!attempt.ok) {
       return { buffer: null, error: attemptErrors.join(' / ') };
     }
@@ -941,7 +963,9 @@ function splitTextIntoNChunks(text, n) {
 // 한 이미지에 배정된 문장들을 "자막 비트"로 쪼갬 — 이번엔 문장 단위가 아니라 "줄" 단위로 쪼개서,
 // 화면엔 항상 한 줄만 보이고 그 줄이 순서대로 갈아끼워짐(긴 문장이 여러 줄 한꺼번에 뜨지 않음).
 // 각 줄의 노출시간은 글자수 비례, 문장이 끝나는 마지막 줄에만 정지시간(가상 글자수)을 더해줌.
-function buildCaptionBeats(sentences) {
+// startIndex: 영상 전체를 통틀어 몇 번째 비트인지(이미지 경계 넘어서도 계속 이어지는 카운터) — 이걸로
+// 자막마다 위치/색/크기가 아기자기하게 순환되도록 함(CAPTION_STYLES 참고).
+function buildCaptionBeats(sentences, startIndex) {
   if (!sentences.length) return [];
   const PAUSE_EQUIVALENT_CHARS = 6;
   const beats = [];
@@ -954,7 +978,7 @@ function buildCaptionBeats(sentences) {
     });
   }
   const sumWeights = beats.reduce((a, b) => a + b.weight, 0) || 1;
-  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights }));
+  return beats.map((b, i) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: (startIndex + i) % CAPTION_STYLE_COUNT }));
 }
 
 function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
@@ -1046,13 +1070,16 @@ async function generateAndSavePost(topic, env, onProgress) {
     // 웹/mp4 둘 다 "그 이미지가 떠 있는 동안 문장을 순서대로 갈아끼우는" 방식으로 오버레이함
     // (한 이미지에 문장이 여러 개 몰려도 잘려나가지 않고 전부 노출됨).
     const perImageChunks = splitTextIntoNChunks(narrationText, rawImages.length || 1);
+    let globalBeatIndex = 0;
     for (let i = 0; i < rawImages.length; i++) {
       const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (rawImages.length || 1) };
       const key = `${slug}-scene-${i}.jpg`;
       await env.MEDIA.put(key, rawImages[i], { httpMetadata: { contentType: 'image/jpeg' } });
       images.push(key);
       captionWeights.push(chunk.weight);
-      captionBeats.push(buildCaptionBeats(chunk.sentences));
+      const beats = buildCaptionBeats(chunk.sentences, globalBeatIndex);
+      globalBeatIndex += beats.length;
+      captionBeats.push(beats);
     }
     console.log(`장면 이미지 ${images.length}개 저장 완료`);
   }
@@ -1117,6 +1144,30 @@ function renderSlideshow(post) {
       var DEFAULT_MS = 6000;
       function show(i){ slides.forEach(function(s,idx){ s.classList.toggle('active', idx===i); }); }
 
+      // 자막 스타일 5종을 순환 — 위치/색/폰트/크기가 비트마다 조금씩 바뀌어서 아기자기한 느낌을 줌.
+      // relay.js(mp4)에도 같은 인덱스 규칙으로 맞춰둔 스타일 표가 있음(색/위치는 최대한 맞춤).
+      var CAPTION_STYLES = [
+        { pos:'bottom', color:'#ffffff', font:"'Gowun Dodum','Noto Sans KR',sans-serif", size:35 },
+        { pos:'top',    color:'#FFD93D', font:"'Gowun Dodum','Noto Sans KR',sans-serif", size:33 },
+        { pos:'bl',     color:'#FF6FA5', font:"'Nanum Pen Script','Gowun Dodum',cursive", size:44 },
+        { pos:'br',     color:'#4FC3F7', font:"'Gowun Dodum','Noto Sans KR',sans-serif", size:40 },
+        { pos:'middle', color:'#6EE7B7', font:"'Nanum Pen Script','Gowun Dodum',cursive", size:42 }
+      ];
+      function applyCaptionStyle(idx){
+        var st = CAPTION_STYLES[idx % CAPTION_STYLES.length];
+        captionEl.style.color = st.color;
+        captionEl.style.fontFamily = st.font;
+        captionEl.style.fontSize = st.size + 'px';
+        captionEl.style.top = captionEl.style.bottom = captionEl.style.left = captionEl.style.right = 'auto';
+        captionEl.style.textAlign = 'center';
+        captionEl.style.transform = 'none';
+        if (st.pos === 'bottom') { captionEl.style.bottom = '80px'; captionEl.style.left = '24px'; captionEl.style.right = '24px'; }
+        else if (st.pos === 'top') { captionEl.style.top = '60px'; captionEl.style.left = '24px'; captionEl.style.right = '24px'; }
+        else if (st.pos === 'bl') { captionEl.style.bottom = '90px'; captionEl.style.left = '20px'; captionEl.style.right = '45%'; captionEl.style.textAlign = 'left'; }
+        else if (st.pos === 'br') { captionEl.style.bottom = '90px'; captionEl.style.right = '20px'; captionEl.style.left = '45%'; captionEl.style.textAlign = 'right'; }
+        else if (st.pos === 'middle') { captionEl.style.top = '42%'; captionEl.style.left = '24px'; captionEl.style.right = '24px'; }
+      }
+
       // 이미지별 노출시간(가중치 비율대로) — 웹/mp4 공통 로직과 동일
       function durationsFor(totalMs){
         if (weights.length === slides.length && slides.length) {
@@ -1144,7 +1195,7 @@ function renderSlideshow(post) {
             var t = slideStart;
             for (var j = 0; j < beats.length; j++) {
               var d = Math.max(800, (beats[j].weight / sum) * slideDur);
-              list.push({ start: t, end: t + d, slideIdx: i, text: beats[j].text || '' });
+              list.push({ start: t, end: t + d, slideIdx: i, text: beats[j].text || '', styleIndex: beats[j].styleIndex || 0 });
               t += d;
             }
           } else {
@@ -1170,7 +1221,11 @@ function renderSlideshow(post) {
         var seg = schedule[cursorIdx];
         if (seg) {
           if (seg.slideIdx !== lastSlideIdx) { show(seg.slideIdx); lastSlideIdx = seg.slideIdx; }
-          if (seg.text !== lastText) { captionEl.textContent = seg.text; lastText = seg.text; }
+          if (seg.text !== lastText) {
+            captionEl.textContent = seg.text;
+            lastText = seg.text;
+            applyCaptionStyle(typeof seg.styleIndex === 'number' ? seg.styleIndex : 0);
+          }
         }
         ${hasAudio ? '' : `
         if (elapsedMs >= totalScheduleMs) { pause(); resetCursor(); show(0); captionEl.textContent=''; return; }
@@ -1557,10 +1612,13 @@ async function runGenerationStep(job, env) {
     const perImageChunks = splitTextIntoNChunks(job.narrationText, job.images.length || 1);
     const captionWeights = [];
     const captionBeats = [];
+    let globalBeatIndex = 0;
     for (let i = 0; i < job.images.length; i++) {
       const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (job.images.length || 1) };
       captionWeights.push(chunk.weight);
-      captionBeats.push(buildCaptionBeats(chunk.sentences));
+      const beats = buildCaptionBeats(chunk.sentences, globalBeatIndex);
+      globalBeatIndex += beats.length;
+      captionBeats.push(beats);
     }
     const post = {
       slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
