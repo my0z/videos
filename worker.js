@@ -579,25 +579,35 @@ async function generateNarrationAudio(text, env) {
   }
   const trimmed = text.slice(0, 3000); // Google Cloud TTS는 요청당 5000바이트 제한이라 여유있게 자름
 
+  // 버그였던 지점: fetch()가 타임아웃(AbortSignal)이나 네트워크 오류로 "실패 응답"이 아니라 "예외"를
+  // 던지면, 이 함수에 try/catch가 없어서 그 예외가 그대로 generateNarrationAudio 바깥 catch까지
+  // 뚫고 나가버렸음 — 그러면 Chirp3-HD 2번째 시도는커녕 Wavenet/MeloTTS 폴백까지 전부 건너뛰고
+  // "1번 타임아웃 = 그 패스 전체 포기"가 돼버림(RETRIES_PER_TIER를 아무리 올려도 소용없었던 이유).
+  // 실제 로그("3차 전량 실패 — 오류: The operation was aborted due to timeout")가 이 패턴과 정확히 일치.
+  // 여기서 잡아서 { ok:false } 로 정상 반환해야 재시도/폴백 루프가 원래 설계대로 다음 시도로 넘어감.
   const tryVoice = async (voiceName, useNaturalConfig) => {
     const audioConfig = useNaturalConfig
       ? { audioEncoding: 'MP3' } // Chirp3-HD는 속도/피치 파라미터 자체를 거부함
       : { audioEncoding: 'MP3', speakingRate: 0.9 };
-    const res = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${env.GOOGLE_TTS_API_KEY}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        input: { text: trimmed },
-        voice: { languageCode: 'ko-KR', name: voiceName },
-        audioConfig,
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
-    if (!res.ok) {
-      const bodyText = await res.text();
-      return { ok: false, error: `HTTP ${res.status} — ${bodyText.slice(0, 300)}` };
+    try {
+      const res = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${env.GOOGLE_TTS_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          input: { text: trimmed },
+          voice: { languageCode: 'ko-KR', name: voiceName },
+          audioConfig,
+        }),
+        signal: AbortSignal.timeout(30000), // Chirp3-HD가 긴 텍스트에선 20초를 넘기는 경우가 있어서 여유를 둠
+      });
+      if (!res.ok) {
+        const bodyText = await res.text();
+        return { ok: false, error: `HTTP ${res.status} — ${bodyText.slice(0, 300)}` };
+      }
+      return { ok: true, data: await res.json() };
+    } catch (e) {
+      return { ok: false, error: `요청 실패(타임아웃/네트워크): ${e.message}` };
     }
-    return { ok: true, data: await res.json() };
   };
 
   try {
