@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 22:02 (KST)
+ * 생성(마지막 작업): 2026-08-30 22:20 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -13,7 +13,7 @@
  *      relay.js가 세그먼트 실측 시각으로 타이밍을 맞춤(추정 없음). 위치/폰트/색은 영상당 하나씩 랜덤 고정.
  * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환(xfade)/컬러그레이딩/loudnorm/
  *            청크 분할 렌더링(5장씩)까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
- * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(청크 업로드, 진행률 실시간 표시),
+ * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(청크 업로드, 진행률 실시간 표시) + 숏츠(세로 9:16, 첫 문장들 ~57초, #Shorts)도 이어서 업로드,
  *        privacyStatus public. 실패해도 글은 유지하고 youtubeError만 기록(음성과 달리 발행을 막지 않음)
  * 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피), 관리자 페이지가 열려있는 동안만 진행됨
  */
@@ -304,11 +304,11 @@ async function generateArticle(topic, newsResults, env) {
     const referenceText = newsResults
       .map((n, i) => `[참고자료 ${i + 1}] ${n.title}\n${n.description}`)
       .join('\n\n');
-    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보용 짧은 글 — 호기심을 끄는 첫 문장 + 핵심 요약, 공백 포함 250자 이내, 끝에 해시태그 2~3개, 링크는 넣지 않는다"}';
     userPrompt = `주제: ${topic}\n\n${referenceText}`;
   } else {
     console.log('네이버 뉴스검색 결과 없음(또는 키 미설정), 참고자료 없이 작성');
-    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보용 짧은 글 — 호기심을 끄는 첫 문장 + 핵심 요약, 공백 포함 250자 이내, 끝에 해시태그 2~3개, 링크는 넣지 않는다"}';
     userPrompt = `주제: ${topic}`;
   }
 
@@ -944,7 +944,7 @@ const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
 // 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
-async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey, weights, captionBeats, captionFontKey, captionColor, env) {
+async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey, shortOutputKey, weights, captionBeats, captionFontKey, captionColor, env) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
   if (!imageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
@@ -962,7 +962,7 @@ async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey
       // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
       // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림; 비트마다 segIndex로 음성 세그먼트 매핑)
       // captionFontKey/captionColor: 이 영상 전체에 고정으로 쓸 폰트 키/색 하나(위치도 영상당 하나로 고정 — captionBeats의 styleIndex가 이미 전부 동일한 값으로 옴)
-      body: JSON.stringify({ images: imageUrls, audioUrl, audioSegments, outputKey, weights, captionBeats, captionFontKey, captionColor }),
+      body: JSON.stringify({ images: imageUrls, audioUrl, audioSegments, outputKey, shortOutputKey, weights, captionBeats, captionFontKey, captionColor }), // [2026-08-30 22:12] shortOutputKey: 숏츠(세로) 동시 렌더링
       signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) {
@@ -985,6 +985,11 @@ async function finalizeRenderDone(job, renderJobKeyName, env, ctx) {
   if (postRaw) {
     const post = JSON.parse(postRaw);
     post.video = job.r2Key;
+    // [2026-08-30 22:14] 숏츠가 실제로 R2에 있는지 확인해 기록(릴레이가 조건에 따라 건너뛸 수 있어 head로 검증)
+    if (job.shortKey) {
+      const shortHead = await env.MEDIA.head(job.shortKey).catch(() => null);
+      if (shortHead) post.videoShort = job.shortKey;
+    }
 
     // mp4가 완성되면 이미지·mp3(세그먼트 포함)는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
     const toDelete = [...(post.images || []), ...(post.audioSegments || [])];
@@ -1035,16 +1040,18 @@ async function getYoutubeAccessToken(env) {
 // 예전엔 한 번에 통째로 PUT했지만, 그러면 업로드 도중 진행률을 전혀 알 수 없어서(관리자 화면이 "업로드 중"에서
 // 멈춰있음) 8MiB씩 나눠 순차 PUT하고, 청크가 성공할 때마다 onProgress(percent)로 진행률을 알려줌.
 const YOUTUBE_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024; // YouTube 리줌 업로드 규격상 256KiB의 배수여야 함 — 8MiB는 배수
-async function uploadVideoToYoutube(post, videoBuffer, env, onProgress) {
+// [2026-08-30 22:13] opts.shorts: 숏츠 업로드 모드 — 제목에 #Shorts 추가(세로 + 60초 이내라 유튜브가 자동으로 숏츠 분류)
+async function uploadVideoToYoutube(post, videoBuffer, env, onProgress, opts = {}) {
   if (!env.YOUTUBE_CLIENT_ID || !env.YOUTUBE_CLIENT_SECRET || !env.YOUTUBE_REFRESH_TOKEN) {
     return { ok: false, error: 'YOUTUBE_CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN 환경변수 미설정' };
   }
   try {
     const accessToken = await getYoutubeAccessToken(env);
     const description = `${stripHtml(post.intro).slice(0, 400)}\n\n원문: ${SITE_ORIGIN}/${post.slug}`;
+    const shortsSuffix = opts.shorts ? ' #Shorts' : '';
     const metadata = {
       snippet: {
-        title: (post.title || post.topic || 'life.news').slice(0, 100),
+        title: (post.title || post.topic || 'life.news').slice(0, 100 - shortsSuffix.length) + shortsSuffix,
         description: description.slice(0, 4900),
         tags: [post.topic].filter(Boolean).slice(0, 10),
         categoryId: '25', // News & Politics — 생활뉴스 성격에 맞춤
@@ -1152,6 +1159,29 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
       freshPost.youtubeError = result.error;
       console.log(`[youtube:${slug}] 업로드 실패: ${result.error}`);
     }
+
+    // [2026-08-30 22:13] 숏츠(세로판)가 있으면 본편에 이어서 업로드 — 실패해도 본편 결과엔 영향 없음
+    if (freshPost.videoShort) {
+      try {
+        const shortObj = await env.MEDIA.get(freshPost.videoShort);
+        if (shortObj) {
+          const shortBuffer = await shortObj.arrayBuffer();
+          const shortResult = await uploadVideoToYoutube(freshPost, shortBuffer, env, null, { shorts: true });
+          if (shortResult.ok) {
+            freshPost.youtubeShortsId = shortResult.youtubeId;
+            freshPost.youtubeShortsUrl = shortResult.youtubeUrl;
+            freshPost.youtubeShortsError = null;
+            console.log(`[youtube:${slug}] 숏츠 업로드 성공: ${shortResult.youtubeUrl}`);
+          } else {
+            freshPost.youtubeShortsError = shortResult.error;
+            console.log(`[youtube:${slug}] 숏츠 업로드 실패: ${shortResult.error}`);
+          }
+        }
+      } catch (e) {
+        freshPost.youtubeShortsError = e.message;
+        console.log(`[youtube:${slug}] 숏츠 업로드 예외: ${e.message}`);
+      }
+    }
     await env.POSTS.put(`post:${slug}`, JSON.stringify(freshPost));
   } catch (e) {
     console.log(`[youtube:${slug}] 업로드 처리 중 예외: ${e.message}`);
@@ -1203,6 +1233,7 @@ async function deletePostCompletely(slug, env) {
     const toDelete = [...(post.images || []), ...(post.audioSegments || [])];
     if (post.audio) toDelete.push(post.audio);
     if (post.video) toDelete.push(post.video);
+    if (post.videoShort) toDelete.push(post.videoShort); // [2026-08-30 22:14] 숏츠도 함께 정리
     if (toDelete.length) {
       await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
     }
@@ -1606,6 +1637,7 @@ async function generateAndSavePost(topic, env, onProgress) {
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
     images, audio: audioKey, audioSegments: audioSegmentKeys, audioError, usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
     generationSec: Math.round((Date.now() - genStartMs) / 1000), // [2026-08-30 19:45] 생성 소요시간(관리자 표시용)
+    threadsText: (article.threads_text || '').toString().slice(0, 450), // [2026-08-30 22:20] 스레드 공유용 홍보문
   };
   await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
   const idxRaw = await env.POSTS.get('index');
@@ -1617,10 +1649,11 @@ async function generateAndSavePost(topic, env, onProgress) {
   // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
   if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && images.length) {
     const outputKey = `${slug}.mp4`;
-    const render = await startRelayRender(images, audioKey, audioSegmentKeys, outputKey, captionWeights, captionBeats, captionFontKey, captionColor, env);
+    const shortKey = `${slug}-short.mp4`; // [2026-08-30 22:12] 숏츠도 같이
+    const render = await startRelayRender(images, audioKey, audioSegmentKeys, outputKey, shortKey, captionWeights, captionBeats, captionFontKey, captionColor, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
-        jobId: render.jobId, slug, r2Key: outputKey, imageKeys: images, startedAt: Date.now(),
+        jobId: render.jobId, slug, r2Key: outputKey, shortKey, imageKeys: images, startedAt: Date.now(),
       }));
       console.log(`릴레이 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
     } else {
@@ -1841,8 +1874,10 @@ async function renderPostPage(env, slug) {
   // needsYoutubePoll: 아직 결과(링크도 실패도)가 없다는 뜻 — 이 페이지를 계속 보고 있어도 업로드가 끝나는 걸
   // 알 방법이 없었던 게 문제였음("업로드 대기 중"에서 새로고침 전까진 영원히 안 바뀜) → 아래 스크립트로 폴링해서 자동 갱신.
   const needsYoutubePoll = p.video && !p.youtubeUrl && !p.youtubeError;
+  // [2026-08-30 22:20] 스레드 공유 링크 — 홍보문+글 링크가 미리 채워진 스레드 작성창을 엶
+  const threadsShareHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(`${p.threadsText || p.title}\n${SITE_ORIGIN}/${p.slug}`)}`;
   const youtubeStatusText = p.youtubeUrl
-    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>`
+    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>${p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank" rel="noopener">🩳 숏츠</a>` : ''} · <a href="${escapeHtml(threadsShareHref)}" target="_blank" rel="noopener">🧵 스레드 공유</a>`
     : p.youtubeError
       ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 200))})`
       : `· 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}`;
@@ -2004,7 +2039,18 @@ async function renderAdminPage(env, requestUrl) {
     const videoStatus = p.video
       ? (needsYoutubePoll
           ? `<span class="render-progress" data-slug="${p.slug}">🎬 mp4 완료 · 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}</span>`
-          : `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>${p.youtubeUploadSec ? ` (업로드 ${fmtDurSec(p.youtubeUploadSec)})` : ''}` : ` · ⚠️ 유튜브실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`}`)
+          : (() => {
+            // [2026-08-30 22:20] SNS 공유 도구 — 스레드는 웹 공유창(intent)으로 바로, 인스타는 자동 업로드가
+            // Meta 앱 심사를 요구해서 릴스 규격(세로 숏츠) 영상 다운로드 + 캡션 복사 방식으로 제공.
+            const shareCaption = `${p.threadsText || `${p.title} — ${p.topic}`}\n${SITE_ORIGIN}/${p.slug}`;
+            const threadsHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(shareCaption)}`;
+            const shareBits = [
+              `<a href="${escapeHtml(threadsHref)}" target="_blank">🧵 스레드</a>`,
+              p.videoShort ? `<a href="/media/${escapeHtml(p.videoShort)}" download>⬇️ 인스타영상</a>` : '',
+              `<button type="button" class="copy-cap" data-cap="${escapeHtml(shareCaption)}" style="font-size:11px;padding:2px 8px;">📋 캡션</button>`,
+            ].filter(Boolean).join(' · ');
+            return `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>${p.youtubeUploadSec ? ` (업로드 ${fmtDurSec(p.youtubeUploadSec)})` : ''}` : ` · ⚠️ 유튜브실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`}${p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank">🩳 숏츠</a>` : p.youtubeShortsError ? ' · ⚠️ 숏츠실패' : ''}<br>${shareBits}`;
+          })())
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
         : p.videoError
@@ -2085,6 +2131,11 @@ async function renderAdminPage(env, requestUrl) {
                   if (typeof data.youtubeUploadSec === 'number') { // [2026-08-30 19:45] 업로드 소요시간 표시
                     var us = data.youtubeUploadSec;
                     el.appendChild(document.createTextNode(' (업로드 ' + (us >= 60 ? Math.floor(us / 60) + '분 ' + (us % 60) + '초' : us + '초') + ')'));
+                  }
+                  if (data.youtubeShortsUrl) { // [2026-08-30 22:14] 숏츠 링크
+                    el.appendChild(document.createTextNode(' · '));
+                    var sa = document.createElement('a'); sa.href = data.youtubeShortsUrl; sa.target = '_blank'; sa.textContent = '🩳 숏츠';
+                    el.appendChild(sa);
                   }
                   el.dataset.terminal = '1';
                 } else if (data.youtubeError) {
@@ -2187,7 +2238,18 @@ async function renderAdminPage(env, requestUrl) {
     </form>
     <div class="table-scroll"><table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>작성일</th><th></th><th></th></tr></thead>
     <tbody>${renderFailRows}${genJobRows}<tr id="posts-anchor" style="display:none;"><td colspan="7"></td></tr>${rows || '<tr id="empty-row"><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table></div>
-  </div>${progressScript}`;
+  </div><script>
+    // [2026-08-30 22:20] 캡션 복사 버튼 — 클립보드에 스레드/인스타 공유문을 복사(성공하면 잠깐 ✅ 표시)
+    document.addEventListener('click', function(e){
+      var btn = e.target.closest('.copy-cap');
+      if (!btn) return;
+      navigator.clipboard.writeText(btn.dataset.cap || '').then(function(){
+        var orig = btn.textContent;
+        btn.textContent = '✅ 복사됨';
+        setTimeout(function(){ btn.textContent = orig; }, 1500);
+      });
+    });
+  </script>${progressScript}`;
 
   return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
@@ -2324,6 +2386,7 @@ async function runGenerationStep(job, env) {
       intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
       images: job.images, audio: job.audioKey, audioSegments: job.audioSegmentKeys, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
       generationSec: job.createdAt ? Math.round((Date.now() - job.createdAt) / 1000) : null, // [2026-08-30 19:45] 생성 버튼 → 글 저장까지 걸린 시간(관리자 표시용)
+      threadsText: (job.article.threads_text || '').toString().slice(0, 450), // [2026-08-30 22:20] 스레드 공유용 홍보문(글 생성 때 같이 만들어짐)
     };
     await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
     const idxRaw = await env.POSTS.get('index');
@@ -2336,10 +2399,11 @@ async function runGenerationStep(job, env) {
   if (job.stage === 'render') {
     if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && job.images.length) {
       const outputKey = `${job.slug}.mp4`;
-      const render = await startRelayRender(job.images, job.audioKey, job.audioSegmentKeys, outputKey, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env);
+      const shortKey = `${job.slug}-short.mp4`; // [2026-08-30 22:12] 숏츠(세로 9:16)도 같이 렌더링
+      const render = await startRelayRender(job.images, job.audioKey, job.audioSegmentKeys, outputKey, shortKey, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env);
       if (render.ok) {
         await env.POSTS.put(`renderJob:${job.slug}`, JSON.stringify({
-          jobId: render.jobId, slug: job.slug, r2Key: outputKey, startedAt: Date.now(),
+          jobId: render.jobId, slug: job.slug, r2Key: outputKey, shortKey, startedAt: Date.now(),
         }));
       } else {
         const postRaw = await env.POSTS.get(`post:${job.slug}`);
@@ -2429,6 +2493,7 @@ async function handleRenderProgress(request, env, ctx) {
       youtubeError: post?.youtubeError || null,
       youtubeUploadPercent: post?.youtubeUploadPercent ?? null,
       youtubeUploadSec: post?.youtubeUploadSec ?? null,
+      youtubeShortsUrl: post?.youtubeShortsUrl || null,
     }), { headers: { 'Content-Type': 'application/json' } });
   }
   const job = JSON.parse(jobRaw);
@@ -2450,6 +2515,7 @@ async function handleRenderProgress(request, env, ctx) {
     let youtubeError = null;
     let youtubeUploadPercent = null;
     let youtubeUploadSec = null;
+    let youtubeShortsUrl = null;
     if (data.status === 'done') {
       await finalizeRenderDone(job, `renderJob:${slug}`, env, ctx);
       // finalizeRenderDone 안의 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행돼서 이 시점엔 보통 아직 안 끝남 —
@@ -2460,10 +2526,11 @@ async function handleRenderProgress(request, env, ctx) {
       youtubeError = freshPost?.youtubeError || null;
       youtubeUploadPercent = freshPost?.youtubeUploadPercent ?? null;
       youtubeUploadSec = freshPost?.youtubeUploadSec ?? null;
+      youtubeShortsUrl = freshPost?.youtubeShortsUrl || null;
     } else if (data.status === 'failed') {
       await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
     }
-    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, youtubeUrl, youtubeError, youtubeUploadPercent, youtubeUploadSec }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, youtubeUrl, youtubeError, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
   }
