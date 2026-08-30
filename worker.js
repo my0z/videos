@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 21:55 (KST)
+ * 생성(마지막 작업): 2026-08-30 22:02 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -40,6 +40,11 @@ const CAPTION_FONT_CHOICES = [
   { key: 'songmyung', css: "'Song Myung',serif" },
   { key: 'gaegu', css: "'Gaegu',cursive" },
   { key: 'himelody', css: "'Hi Melody',cursive" },
+  // [2026-08-30 22:02] 아기자기한 폰트 4종 추가(사용자 요청) — 전부 구글폰트 무료(OFL), relay 키와 일치
+  { key: 'poorstory', css: "'Poor Story',cursive" },
+  { key: 'gamjaflower', css: "'Gamja Flower',cursive" },
+  { key: 'singleday', css: "'Single Day',cursive" },
+  { key: 'cutefont', css: "'Cute Font',cursive" },
 ];
 const CAPTION_COLOR_CHOICES = ['#ffffff', '#FFD93D', '#FF6FA5', '#4FC3F7', '#6EE7B7', '#FFA94D', '#B197FC', '#FF8787'];
 function pickCaptionStyle() {
@@ -106,7 +111,7 @@ const STYLE = `
   .slideshow .caption-box:empty{ display:none; }
 `;
 
-const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&family=Nanum+Pen+Script&family=Gowun+Batang&family=Song+Myung&family=Gaegu&family=Hi+Melody&display=swap" rel="stylesheet">`;
+const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&family=Nanum+Pen+Script&family=Gowun+Batang&family=Song+Myung&family=Gaegu&family=Hi+Melody&family=Poor+Story&family=Gamja+Flower&family=Single+Day&family=Cute+Font&display=swap" rel="stylesheet">`;
 
 export default {
   async fetch(request, env, ctx) {
