@@ -20,7 +20,10 @@ const VIDEO_JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30분 넘게 안 끝나면 포�
 const VIDEO_POLL_CRON = '*/5 * * * *'; // 이 크론이 실행되면 콘텐츠 발행 대신 영상 작업 폴링만 함
 const CF_AI_GATEWAY = 'yzusb';
 const VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
-const SCENE_COUNT = 10; // 슬라이드쇼에 쓸 장면 이미지 개수 — 유료 플랜 전환(서브요청 10,000개)으로 다시 10장
+const SCENE_COUNT = 20; // 슬라이드쇼에 쓸 장면 이미지 개수 — 4분 분량 영상 기준 20장(장당 평균 12초 내외)
+// 나레이션 길이 안전 상한(공백 포함) — 글 생성 프롬프트가 "낭독 약 4분(1,700~2,000자)"을 목표로 쓰지만,
+// 모델이 초과해서 쓸 경우를 대비해 문장 경계에서 잘라 최대 5분대 중반을 넘지 않게 함(한국어 TTS ≈ 분당 400자).
+const NARRATION_MAX_CHARS = 2400;
 const CAPTION_STYLE_COUNT = 5; // 자막 "위치" 종류 개수 — 웹(CSS)과 mp4(relay.js drawtext) 둘 다 같은 인덱스 규칙을 씀
 // 자막 위치/폰트/색 전부 영상 하나당 하나씩만 랜덤 고정(비트마다 안 바뀜 — 계속 바뀌면 산만해서 전부 고정으로 변경).
 // font key는 relay.js가 실제로 서버에 설치해둔 폰트 파일과 매칭되는 키만 사용(웹/mp4 폰트 일치 보장).
@@ -307,11 +310,11 @@ async function generateArticle(topic, newsResults, env) {
     const referenceText = newsResults
       .map((n, i) => `[참고자료 ${i + 1}] ${n.title}\n${n.description}`)
       .join('\n\n');
-    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
     userPrompt = `주제: ${topic}\n\n${referenceText}`;
   } else {
     console.log('네이버 뉴스검색 결과 없음(또는 키 미설정), 참고자료 없이 작성');
-    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>"}';
     userPrompt = `주제: ${topic}`;
   }
 
@@ -718,6 +721,15 @@ async function generateNarrationAudioWithRetry(text, env, maxAttempts = 3, voice
 
 function splitIntoSentences(text) {
   return (text || '').split(/(?<=[.!?。！？])\s+/).filter(Boolean);
+}
+
+// 나레이션이 상한을 넘으면 "문장이 끝나는 지점"에서 자름 — 예전처럼 글자수로 뚝 자르면
+// 마지막 문장이 중간에 끊긴 채 읽히고 자막도 어색하게 끝났음.
+function trimNarrationToSentence(text, maxChars) {
+  if ((text || '').length <= maxChars) return text;
+  const cut = text.slice(0, maxChars);
+  const m = cut.match(/[\s\S]*[.!?。！？]/);
+  return m ? m[0] : cut;
 }
 
 // 인접 문장을 maxChars 이내로 묶어 세그먼트 목록을 만듦 — 너무 잘게 나누면 TTS 호출이 많아지고
@@ -1343,7 +1355,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   const slug = String(Date.now());
 
   // 내레이션 텍스트(음성+자막 공용) — 실제 음성으로 변환되는 길이(3000자)로 맞춤
-  const narrationText = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ').slice(0, 3000);
+  const narrationText = trimNarrationToSentence([stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' '), NARRATION_MAX_CHARS);
 
   report('음성 생성 중', 30);
   // 문장 몇 개씩 묶은 세그먼트 단위로 따로 합성 — 릴레이가 각 조각의 실제 길이를 재서 자막을 실측으로 맞춤.
@@ -1995,7 +2007,7 @@ async function runGenerationStep(job, env) {
     const newsResults = await searchNaverNews(topic, env);
     const { article, error: articleError } = await generateArticle(topic, newsResults, env);
     if (!article) throw new Error(`글 생성 실패 — ${articleError || '알 수 없는 오류'}`);
-    const narrationText = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ').slice(0, 3000);
+    const narrationText = trimNarrationToSentence([stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' '), NARRATION_MAX_CHARS);
     // 음성은 문장 몇 개씩 묶은 "세그먼트" 단위로 따로 합성(자막-음성 싱크를 실측으로 맞추기 위함).
     // 목소리는 여기서 한 번 뽑아 영상 전체에 고정 — 세그먼트마다 목소리가 바뀌면 안 되니까.
     const segments = planAudioSegments(splitIntoSentences(narrationText), 90);
