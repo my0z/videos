@@ -19,7 +19,7 @@ bucket_name = "usbkr-videos"
 binding = "AI"
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["* * * * *"]
 
 [observability]
 enabled = false
