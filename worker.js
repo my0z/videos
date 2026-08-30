@@ -1199,6 +1199,11 @@ function splitTextIntoNChunks(text, n) {
 // 각 줄의 노출시간은 글자수 비례, 문장이 끝나는 마지막 줄에만 정지시간(가상 글자수)을 더해줌.
 // positionIndex: 이 영상 전체에 고정으로 쓸 위치 하나(POSITION_STYLES 참고, renderSlideshow 안) — 예전엔 비트마다
 // 순환했는데 너무 산만하다는 피드백으로 위치/폰트/색 다 영상 하나당 하나로 고정.
+// isSentenceEnd: 문장의 마지막 줄에만 true — relay.js가 실제 음성 파일에서 문장 사이 무음 구간을 찾아서
+// (silencedetect) 이 지점들에 정확히 맞춰 자막 타이밍을 다시 계산할 때, "문장 경계가 몇 개여야 하는지"
+// 알기 위한 표시. 글자수 비율 추정만으로는 문장이 쌓일수록 오차가 누적돼서 자막이 점점 밀리는 문제가 있었음
+// ("일정 시간 후 자막이 안 맞음") — 무음 구간 개수가 이 표시 개수랑 정확히 맞아떨어지면 실제 무음 위치를
+// 기준으로 삼고, 안 맞으면(TTS가 무음을 안 두는 등) 지금처럼 글자수 비율 추정으로 안전하게 되돌아감.
 function buildCaptionBeats(sentences, positionIndex) {
   if (!sentences.length) return [];
   const PAUSE_EQUIVALENT_CHARS = 6;
@@ -1208,11 +1213,11 @@ function buildCaptionBeats(sentences, positionIndex) {
     lines.forEach((line, li) => {
       const isLastLineOfSentence = li === lines.length - 1;
       const weight = Math.max(line.length + (isLastLineOfSentence ? PAUSE_EQUIVALENT_CHARS : 0), 4);
-      beats.push({ text: line, weight });
+      beats.push({ text: line, weight, isSentenceEnd: isLastLineOfSentence });
     });
   }
   const sumWeights = beats.reduce((a, b) => a + b.weight, 0) || 1;
-  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: positionIndex }));
+  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: positionIndex, isSentenceEnd: !!b.isSentenceEnd }));
 }
 
 function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
