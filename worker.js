@@ -1684,10 +1684,28 @@ async function renderAdminPage(env, requestUrl) {
             .then(function(r){ return r.json(); })
             .then(function(data){
               if (data.status === 'done') {
-                el.textContent = '🎬 mp4 완료';
-                el.dataset.terminal = '1';
                 var mediaCell = el.closest('tr') ? el.closest('tr').children[2] : null;
                 if (mediaCell) mediaCell.textContent = '✅ 이미지·음성 사용 완료(mp4로 통합됨)';
+                // mp4는 끝났지만, 유튜브 업로드는 서버에서 백그라운드로 진행돼서 이 시점엔 아직 결과가 없을 수 있음 —
+                // 링크나 실패가 뜰 때까지(또는 일정 횟수까지) 계속 폴링해서, 새로고침 없이 업로드 결과를 보여줌.
+                if (data.youtubeUrl) {
+                  el.textContent = '';
+                  el.appendChild(document.createTextNode('🎬 mp4 완료 · '));
+                  var a = document.createElement('a'); a.href = data.youtubeUrl; a.target = '_blank'; a.textContent = '▶ 유튜브';
+                  el.appendChild(a);
+                  el.dataset.terminal = '1';
+                } else if (data.youtubeError) {
+                  el.textContent = '🎬 mp4 완료 · ⚠️ 유튜브실패(' + String(data.youtubeError).slice(0, 40) + ')';
+                  el.dataset.terminal = '1';
+                } else {
+                  el.textContent = '🎬 mp4 완료 · 유튜브 업로드 중…';
+                  var tries = parseInt(el.dataset.ytTries || '0', 10) + 1;
+                  el.dataset.ytTries = String(tries);
+                  if (tries >= 20) { // 3초 간격 * 20회 ≈ 1분 — 그래도 안 끝나면 폴링 그만하고 새로고침으로 확인하게 안내
+                    el.textContent = '🎬 mp4 완료 · 유튜브 업로드 확인은 새로고침 후 봐주세요';
+                    el.dataset.terminal = '1';
+                  }
+                }
                 return;
               }
               if (data.status === 'failed') {
@@ -1934,10 +1952,17 @@ async function handleRenderProgress(request, env, ctx) {
 
   const jobRaw = await env.POSTS.get(`renderJob:${slug}`);
   if (!jobRaw) {
-    // renderJob이 이미 없어졌다는 건 크론이 처리 완료(또는 정리)했다는 뜻 — post.video 유무로 결과 판단
+    // renderJob이 이미 없어졌다는 건 크론이 처리 완료(또는 정리)했다는 뜻 — post.video 유무로 결과 판단.
+    // 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행되므로, 여기서도 최신 post의 youtubeUrl/youtubeError를 같이 내려줘야
+    // 관리자 화면이 "mp4 완료"에서 멈추지 않고 업로드 결과(링크/실패)까지 이어서 보여줄 수 있음.
     const postRaw = await env.POSTS.get(`post:${slug}`);
     const post = postRaw ? JSON.parse(postRaw) : null;
-    return new Response(JSON.stringify({ status: post?.video ? 'done' : 'failed', percent: post?.video ? 100 : 0 }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({
+      status: post?.video ? 'done' : 'failed',
+      percent: post?.video ? 100 : 0,
+      youtubeUrl: post?.youtubeUrl || null,
+      youtubeError: post?.youtubeError || null,
+    }), { headers: { 'Content-Type': 'application/json' } });
   }
   const job = JSON.parse(jobRaw);
   if (!env.RELAY_URL || !env.RELAY_SECRET) {
@@ -1954,12 +1979,20 @@ async function handleRenderProgress(request, env, ctx) {
     }
     const data = await res.json();
     // 릴레이가 done/failed라고 하면 여기서 바로 post에 반영 — 5분 크론까지 기다리게 하지 않음
+    let youtubeUrl = null;
+    let youtubeError = null;
     if (data.status === 'done') {
       await finalizeRenderDone(job, `renderJob:${slug}`, env, ctx);
+      // finalizeRenderDone 안의 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행돼서 이 시점엔 보통 아직 안 끝남 —
+      // 그래도 혹시 바로 끝났으면 즉시 링크를 내려주고, 아니면 클라이언트가 계속 폴링하며 기다림.
+      const freshPostRaw = await env.POSTS.get(`post:${slug}`);
+      const freshPost = freshPostRaw ? JSON.parse(freshPostRaw) : null;
+      youtubeUrl = freshPost?.youtubeUrl || null;
+      youtubeError = freshPost?.youtubeError || null;
     } else if (data.status === 'failed') {
       await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
     }
-    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, youtubeUrl, youtubeError }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
   }
