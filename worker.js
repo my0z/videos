@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 22:20 (KST)
+ * 생성(마지막 작업): 2026-08-30 22:44 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -188,6 +188,53 @@ function siteHeader() {
 // CEREBRAS_API_KEY 환경변수는 더 이상 안 읽으므로 그대로 둬도 무해함(지워도 됨).
 async function callAiChain(systemPrompt, userPrompt, env) {
   const attemptErrors = [];
+
+  // [2026-08-30 22:44] SambaNova Cloud 1순위 연결(사용자 요청) — OpenAI 호환 API, 무료 티어.
+  // DeepSeek-V3.1(다국어 강함) → Llama-3.3-70B 순. 실패하면 아래 Groq → Workers AI로 폴백.
+  // Cloudflare에 SAMBANOVA_API_KEY 시크릿 등록 필요(없으면 이 단계는 건너뜀).
+  if (env.SAMBANOVA_API_KEY) {
+    for (const model of ['DeepSeek-V3.1', 'Meta-Llama-3.3-70B-Instruct']) {
+      try {
+        const res = await fetch('https://api.sambanova.ai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.SAMBANOVA_API_KEY}` },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+            temperature: 0.7,
+            max_tokens: 4000,
+          }),
+          signal: AbortSignal.timeout(45000),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          let raw = data?.choices?.[0]?.message?.content;
+          if (raw) {
+            // DeepSeek 계열이 <think>...</think>를 앞에 붙이는 경우 제거 후 JSON 파싱
+            raw = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim().replace(/^```json\s*|\s*```$/gm, '').trim();
+            try {
+              return { result: JSON.parse(raw), error: null, modelUsed: `sambanova:${model}` };
+            } catch (e) {
+              attemptErrors.push(`[sambanova:${model}] JSON 파싱 실패: ${e.message}`);
+              continue;
+            }
+          } else {
+            attemptErrors.push(`[sambanova:${model}] 응답에 content 없음(finish: ${data?.choices?.[0]?.finish_reason || '?'})`);
+            continue;
+          }
+        } else {
+          const bodyText = await res.text();
+          attemptErrors.push(`[sambanova:${model}] HTTP ${res.status}: ${bodyText.slice(0, 150)}`);
+          continue;
+        }
+      } catch (e) {
+        attemptErrors.push(`[sambanova:${model}] 네트워크 오류: ${e.message}`);
+        continue;
+      }
+    }
+  } else {
+    attemptErrors.push('[sambanova] SAMBANOVA_API_KEY 미설정');
+  }
 
   if (env.GROQ_API_KEY) {
     // [2026-08-30 21:08] 모델 현행화: llama-3.1-8b-instant가 2026-08-16 Groq에서 퇴역(404) → gpt-oss-20b(빠름) →
