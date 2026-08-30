@@ -1125,11 +1125,14 @@ async function uploadVideoToYoutube(post, videoBuffer, env, onProgress, opts = {
     const accessToken = await getYoutubeAccessToken(env);
     const description = `${stripHtml(post.intro).slice(0, 400)}\n\n원문: ${SITE_ORIGIN}/${post.slug}`;
     const shortsSuffix = opts.shorts ? `${opts.partTotal > 1 ? ` (${opts.partNo}/${opts.partTotal})` : ''} #Shorts` : ''; // [2026-08-30 22:55] 숏츠 여러 개면 (1/3) 식으로 제목 구분
+    // 유튜브 tags 정제: 빈 문자열/null 제거, 개수 제한(≤10), 각 태그 50자 이하
+    const sanitizeTag = (t) => (typeof t === 'string' ? t.trim().replace(/[<>"{}|\\^`\[\]]/g, '').slice(0, 50) : '');
+    const tags = [post.topic, ...(post.tags || [])].map(sanitizeTag).filter((t) => t.length > 0).slice(0, 10);
     const metadata = {
       snippet: {
         title: (post.title || post.topic || 'life.news').slice(0, 100 - shortsSuffix.length) + shortsSuffix,
         description: description.slice(0, 4900),
-        tags: [post.topic].filter(Boolean).slice(0, 10),
+        tags: tags.length > 0 ? tags : undefined, // 유튜브: tags 배열이 비면 필드 자체 제거
         categoryId: '25', // News & Politics — 생활뉴스 성격에 맞춤
       },
       status: { privacyStatus: 'public', selfDeclaredMadeForKids: false },
