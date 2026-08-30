@@ -576,7 +576,17 @@ const KOREAN_TTS_VOICES_NATURAL = [
 // Chirp3-HD가 실패할 경우(지역/쿼터 이슈 등) 대비한 예전 세대 폴백
 const KOREAN_TTS_VOICES_FALLBACK = ['ko-KR-Wavenet-A', 'ko-KR-Wavenet-B', 'ko-KR-Wavenet-C', 'ko-KR-Wavenet-D'];
 
-async function generateNarrationAudio(text, env) {
+// 영상 하나에서 쓸 목소리를 한 번만 뽑아 고정 — 문장(세그먼트)별로 음성을 따로 합성하게 되면서,
+// 호출마다 랜덤으로 뽑으면 문장마다 목소리가 바뀌어버리기 때문. 자막 폰트/색과 같은 원리.
+function pickTtsVoices() {
+  return {
+    natural: KOREAN_TTS_VOICES_NATURAL[Math.floor(Math.random() * KOREAN_TTS_VOICES_NATURAL.length)],
+    fallback: KOREAN_TTS_VOICES_FALLBACK[Math.floor(Math.random() * KOREAN_TTS_VOICES_FALLBACK.length)],
+  };
+}
+
+// voices: {natural, fallback} — 지정하면 그 목소리로 고정(세그먼트 합성용), 없으면 시도마다 랜덤(예전 동작).
+async function generateNarrationAudio(text, env, voices) {
   if (!env.GOOGLE_TTS_API_KEY) {
     return { buffer: null, error: 'GOOGLE_TTS_API_KEY 환경변수 미설정' };
   }
@@ -622,7 +632,7 @@ async function generateNarrationAudio(text, env) {
     let attempt = null;
 
     for (let i = 0; i < RETRIES_PER_TIER && !attempt?.ok; i++) {
-      voiceName = KOREAN_TTS_VOICES_NATURAL[Math.floor(Math.random() * KOREAN_TTS_VOICES_NATURAL.length)];
+      voiceName = voices?.natural || KOREAN_TTS_VOICES_NATURAL[Math.floor(Math.random() * KOREAN_TTS_VOICES_NATURAL.length)];
       attempt = await tryVoice(voiceName, true);
       if (!attempt.ok) {
         attemptErrors.push(`Chirp3-HD 시도${i + 1}(${voiceName}) 실패: ${attempt.error}`);
@@ -632,7 +642,7 @@ async function generateNarrationAudio(text, env) {
 
     if (!attempt.ok) {
       for (let i = 0; i < RETRIES_PER_TIER && !attempt.ok; i++) {
-        voiceName = KOREAN_TTS_VOICES_FALLBACK[Math.floor(Math.random() * KOREAN_TTS_VOICES_FALLBACK.length)];
+        voiceName = voices?.fallback || KOREAN_TTS_VOICES_FALLBACK[Math.floor(Math.random() * KOREAN_TTS_VOICES_FALLBACK.length)];
         attempt = await tryVoice(voiceName, false);
         if (!attempt.ok) {
           attemptErrors.push(`Wavenet 시도${i + 1}(${voiceName}) 실패: ${attempt.error}`);
@@ -684,10 +694,10 @@ async function generateNarrationAudio(text, env) {
 // 그래도 다 실패하면 예전엔 그냥 무음으로 발행돼버렸음. 여기서 그 전체 패스를 한 번 더 감싸서
 // 총 3패스(최대 21번 시도)까지 기다렸다가 포기하도록 함 — 순간적인 429/5xx/게이트웨이 hiccup 정도는
 // 이 정도면 거의 다 흡수됨. API 키 자체가 없는 경우는 각 패스가 즉시 실패라 금방 끝남.
-async function generateNarrationAudioWithRetry(text, env, maxAttempts = 3) {
+async function generateNarrationAudioWithRetry(text, env, maxAttempts = 3, voices = null) {
   let lastError = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const result = await generateNarrationAudio(text, env);
+    const result = await generateNarrationAudio(text, env, voices);
     if (result.buffer) {
       if (attempt > 1) console.log(`음성합성 ${attempt}차 시도에서 성공`);
       return result;
@@ -697,6 +707,50 @@ async function generateNarrationAudioWithRetry(text, env, maxAttempts = 3) {
     if (attempt < maxAttempts) await sleep(2000);
   }
   return { buffer: null, error: `음성합성 ${maxAttempts}차 전량 실패 — ${lastError}` };
+}
+
+// ---------- 문장(세그먼트)별 음성 합성 ----------
+// 자막-음성 싱크의 근본 해결책: 나레이션 전체를 한 번에 합성하면 각 문장이 언제 시작하는지 알 방법이
+// 없어서(Chirp3-HD는 SSML 타임포인트 미지원) 글자수로 추정할 수밖에 없고, 그 추정 오차가 누적돼 뒤로
+// 갈수록 자막이 어긋났음. 무음 감지로 맞추는 시도도 실제 TTS(숨소리 섞인 사람 같은 음성)에선 불안정.
+// → 문장을 몇 개씩 묶은 "세그먼트" 단위로 음성을 따로따로 합성하면, 릴레이(ffmpeg)가 각 조각의 실제
+// 길이를 정확히 잰 뒤 이어붙이므로 세그먼트 경계마다 자막 타이밍이 구조적으로 정확해짐(추정이 아예 없음).
+
+function splitIntoSentences(text) {
+  return (text || '').split(/(?<=[.!?。！？])\s+/).filter(Boolean);
+}
+
+// 인접 문장을 maxChars 이내로 묶어 세그먼트 목록을 만듦 — 너무 잘게 나누면 TTS 호출이 많아지고
+// 문장 사이 억양이 뚝뚝 끊기므로 적당히 묶되, 한 세그먼트 안에서의 자막 줄 배분(글자수 비례 추정)
+// 오차가 눈에 안 띄게 세그먼트를 짧게 유지함. 반환: [{ text, sentences: [문장...] }]
+function planAudioSegments(sentences, maxChars) {
+  const segments = [];
+  let current = [];
+  let currentLen = 0;
+  for (const s of sentences) {
+    if (current.length && currentLen + s.length > maxChars) {
+      segments.push({ text: current.join(' '), sentences: current });
+      current = [];
+      currentLen = 0;
+    }
+    current.push(s);
+    currentLen += s.length;
+  }
+  if (current.length) segments.push({ text: current.join(' '), sentences: current });
+  return segments;
+}
+
+// 세그먼트들을 순서대로 이어붙인 하나의 mp3 버퍼 — 웹 슬라이드쇼 재생용(post.audio).
+// mp3는 프레임 단위 포맷이라 단순 바이트 연결로도 대부분의 플레이어에서 정상 재생됨.
+function concatAudioBuffers(buffers) {
+  const total = buffers.reduce((a, b) => a + b.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const b of buffers) {
+    out.set(new Uint8Array(b), offset);
+    offset += b.byteLength;
+  }
+  return out.buffer;
 }
 
 async function buildVeoPrompt(topic, articleTitle, env) {
@@ -743,21 +797,25 @@ const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
 // 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
-async function startRelayRender(imageKeys, audioKey, outputKey, weights, captionBeats, captionFontKey, captionColor, env) {
+async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey, weights, captionBeats, captionFontKey, captionColor, env) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
   if (!imageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
   const imageUrls = imageKeys.map((k) => `${SITE_ORIGIN}/media/${k}`);
   const audioUrl = audioKey ? `${SITE_ORIGIN}/media/${audioKey}` : null;
+  // 세그먼트 원본 목록 — 릴레이가 각각의 실제 길이를 재서 이어붙이고, 자막 타이밍을 실측으로 맞추는 데 씀.
+  const audioSegments = Array.isArray(audioSegmentKeys) && audioSegmentKeys.length
+    ? audioSegmentKeys.map((k) => `${SITE_ORIGIN}/media/${k}`)
+    : null;
 
   try {
     const res = await fetch(`${env.RELAY_URL}/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
       // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
-      // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림)
+      // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림; 비트마다 segIndex로 음성 세그먼트 매핑)
       // captionFontKey/captionColor: 이 영상 전체에 고정으로 쓸 폰트 키/색 하나(위치도 영상당 하나로 고정 — captionBeats의 styleIndex가 이미 전부 동일한 값으로 옴)
-      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights, captionBeats, captionFontKey, captionColor }),
+      body: JSON.stringify({ images: imageUrls, audioUrl, audioSegments, outputKey, weights, captionBeats, captionFontKey, captionColor }),
       signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) {
@@ -781,14 +839,15 @@ async function finalizeRenderDone(job, renderJobKeyName, env, ctx) {
     const post = JSON.parse(postRaw);
     post.video = job.r2Key;
 
-    // mp4가 완성되면 이미지·mp3는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
-    const toDelete = [...(post.images || [])];
+    // mp4가 완성되면 이미지·mp3(세그먼트 포함)는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
+    const toDelete = [...(post.images || []), ...(post.audioSegments || [])];
     if (post.audio) toDelete.push(post.audio);
     if (toDelete.length) {
       await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
     }
     post.images = [];
     post.audio = null;
+    post.audioSegments = [];
 
     await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
 
@@ -976,7 +1035,7 @@ async function deletePostCompletely(slug, env) {
   const postRaw = await env.POSTS.get(`post:${slug}`);
   if (postRaw) {
     const post = JSON.parse(postRaw);
-    const toDelete = [...(post.images || [])];
+    const toDelete = [...(post.images || []), ...(post.audioSegments || [])];
     if (post.audio) toDelete.push(post.audio);
     if (post.video) toDelete.push(post.video);
     if (toDelete.length) {
@@ -1155,19 +1214,21 @@ function arrayBufferToBase64(buffer) {
 // 문장을 N개 구간(이미지 개수)으로 나누되, 문장 "개수"가 아니라 "글자수"가 균등해지도록 배분 —
 // 이래야 각 이미지에 배정된 자막 분량이 실제 발화 시간과 비례해서, 나레이션 속도와 슬라이드 전환이 맞아떨어짐.
 // 문장 배열을 그대로 들고 있어야, 한 이미지에 문장이 여러 개 몰렸을 때 그걸 순서대로 갈아끼울 수 있음(자막 잘림 방지).
-function splitTextIntoNChunks(text, n) {
-  const sentences = (text || '').split(/(?<=[.!?。！？])\s+/).filter(Boolean);
+// sentenceInfos: [{ text, segIndex }] — segIndex는 그 문장이 몇 번째 음성 세그먼트에서 합성됐는지.
+// 릴레이가 세그먼트별 실제 길이로 자막 타이밍을 정확히 맞출 때 이 매핑을 씀(비트에 그대로 실려감).
+function splitTextIntoNChunks(sentenceInfos, n) {
+  const sentences = Array.isArray(sentenceInfos) ? sentenceInfos : [];
   if (n <= 0) return [];
   if (!sentences.length) return Array.from({ length: n }, () => ({ sentences: [], weight: 1 / n }));
 
-  const totalChars = sentences.reduce((sum, s) => sum + s.length, 0) || 1;
+  const totalChars = sentences.reduce((sum, s) => sum + s.text.length, 0) || 1;
   const target = totalChars / n;
   const chunks = [];
   let current = [];
   let currentLen = 0;
   for (const sentence of sentences) {
     current.push(sentence);
-    currentLen += sentence.length;
+    currentLen += sentence.text.length;
     if (currentLen >= target && chunks.length < n - 1) {
       chunks.push(current);
       current = [];
@@ -1186,7 +1247,7 @@ function splitTextIntoNChunks(text, n) {
   // → 문장 하나당 "정지시간에 해당하는 글자수"를 가상으로 더해서 가중치를 보정.
   const PAUSE_EQUIVALENT_CHARS = 6;
   const rawWeights = chunks.map((sents) => {
-    const chars = sents.reduce((sum, s) => sum + s.length, 0);
+    const chars = sents.reduce((sum, s) => sum + s.text.length, 0);
     const pauseChars = sents.length * PAUSE_EQUIVALENT_CHARS;
     return Math.max(chars + pauseChars, PAUSE_EQUIVALENT_CHARS); // 빈 칸도 최소 노출시간은 보장
   });
@@ -1194,30 +1255,40 @@ function splitTextIntoNChunks(text, n) {
   return chunks.map((sentences, i) => ({ sentences, weight: rawWeights[i] / sumWeights }));
 }
 
+// 세그먼트 목록(planAudioSegments 결과)을 "문장+세그먼트 번호" 평면 배열로 펼침 — 자막 배분/비트 생성 입력용.
+function buildSentenceInfos(segSentences) {
+  const infos = [];
+  (segSentences || []).forEach((sentences, segIndex) => {
+    (sentences || []).forEach((text) => infos.push({ text, segIndex }));
+  });
+  return infos;
+}
+
 // 한 이미지에 배정된 문장들을 "자막 비트"로 쪼갬 — 이번엔 문장 단위가 아니라 "줄" 단위로 쪼개서,
 // 화면엔 항상 한 줄만 보이고 그 줄이 순서대로 갈아끼워짐(긴 문장이 여러 줄 한꺼번에 뜨지 않음).
 // 각 줄의 노출시간은 글자수 비례, 문장이 끝나는 마지막 줄에만 정지시간(가상 글자수)을 더해줌.
 // positionIndex: 이 영상 전체에 고정으로 쓸 위치 하나(POSITION_STYLES 참고, renderSlideshow 안) — 예전엔 비트마다
 // 순환했는데 너무 산만하다는 피드백으로 위치/폰트/색 다 영상 하나당 하나로 고정.
-// isSentenceEnd: 문장의 마지막 줄에만 true — relay.js가 실제 음성 파일에서 문장 사이 무음 구간을 찾아서
-// (silencedetect) 이 지점들에 정확히 맞춰 자막 타이밍을 다시 계산할 때, "문장 경계가 몇 개여야 하는지"
-// 알기 위한 표시. 글자수 비율 추정만으로는 문장이 쌓일수록 오차가 누적돼서 자막이 점점 밀리는 문제가 있었음
-// ("일정 시간 후 자막이 안 맞음") — 무음 구간 개수가 이 표시 개수랑 정확히 맞아떨어지면 실제 무음 위치를
-// 기준으로 삼고, 안 맞으면(TTS가 무음을 안 두는 등) 지금처럼 글자수 비율 추정으로 안전하게 되돌아감.
+// segIndex: 이 줄이 속한 문장이 몇 번째 음성 세그먼트에서 합성됐는지 — 릴레이가 세그먼트별 실제 음성
+// 길이(ffprobe 실측)로 자막 타이밍을 배분할 때 쓰는 핵심 매핑. 세그먼트 경계에서는 추정이 전혀 없어서
+// 자막이 밀릴 수가 없고, 한 세그먼트 안(짧음)에서만 글자수 비례 배분이라 오차가 눈에 안 띔.
+// isSentenceEnd: 문장의 마지막 줄 표시 — 세그먼트 정보가 없을 때(하위호환) 릴레이의 무음 감지 정렬용.
 function buildCaptionBeats(sentences, positionIndex) {
   if (!sentences.length) return [];
   const PAUSE_EQUIVALENT_CHARS = 6;
   const beats = [];
   for (const s of sentences) {
-    const lines = wrapCaptionLines(s, 20, 50); // 줄 수 제한 없이 문장 전체를 다 담음(한 줄씩 보여줄 거라 잘릴 일 없음)
+    const text = typeof s === 'string' ? s : s.text; // 문자열(옛 형식)과 {text, segIndex} 둘 다 수용
+    const segIndex = typeof s === 'string' ? null : s.segIndex;
+    const lines = wrapCaptionLines(text, 20, 50); // 줄 수 제한 없이 문장 전체를 다 담음(한 줄씩 보여줄 거라 잘릴 일 없음)
     lines.forEach((line, li) => {
       const isLastLineOfSentence = li === lines.length - 1;
       const weight = Math.max(line.length + (isLastLineOfSentence ? PAUSE_EQUIVALENT_CHARS : 0), 4);
-      beats.push({ text: line, weight, isSentenceEnd: isLastLineOfSentence });
+      beats.push({ text: line, weight, isSentenceEnd: isLastLineOfSentence, segIndex });
     });
   }
   const sumWeights = beats.reduce((a, b) => a + b.weight, 0) || 1;
-  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: positionIndex, isSentenceEnd: !!b.isSentenceEnd }));
+  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: positionIndex, isSentenceEnd: !!b.isSentenceEnd, segIndex: b.segIndex }));
 }
 
 function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
@@ -1275,17 +1346,41 @@ async function generateAndSavePost(topic, env, onProgress) {
   const narrationText = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ').slice(0, 3000);
 
   report('음성 생성 중', 30);
+  // 문장 몇 개씩 묶은 세그먼트 단위로 따로 합성 — 릴레이가 각 조각의 실제 길이를 재서 자막을 실측으로 맞춤.
+  // 이 경로(/api/generate)는 한 번의 호출로 전부 처리해야 해서, 요청 수를 아끼려고 스텝 방식(90자)보다
+  // 세그먼트를 크게(220자) 묶음 — 세그먼트 안 오차는 조금 커지지만 경계마다 실측이라 누적은 안 됨.
   let audioKey = null;
   let audioError = null;
+  let audioSegmentKeys = [];
+  let segSentencesList = [];
   if (env.MEDIA) {
-    const { buffer: audioBuffer, error } = await generateNarrationAudioWithRetry(narrationText, env);
-    if (audioBuffer) {
+    const segments = planAudioSegments(splitIntoSentences(narrationText), 220);
+    const voices = pickTtsVoices(); // 목소리는 영상 전체에 하나로 고정(세그먼트마다 바뀌면 안 됨)
+    const buffers = [];
+    for (let i = 0; i < segments.length; i++) {
+      report(`음성 생성 중 (${i + 1}/${segments.length})`, 25 + Math.round(((i + 1) / segments.length) * 10)); // 25~35%
+      const { buffer, error } = await generateNarrationAudioWithRetry(segments[i].text, env, 2, voices);
+      if (!buffer) {
+        audioError = `음성 세그먼트 ${i + 1}/${segments.length} 합성 최종 실패 — ${error || '알 수 없는 오류'}`;
+        break;
+      }
+      buffers.push(buffer);
+    }
+    if (!audioError && buffers.length === segments.length) {
+      for (let i = 0; i < buffers.length; i++) {
+        const key = `${slug}-narr-${i}.mp3`;
+        await env.MEDIA.put(key, buffers[i], { httpMetadata: { contentType: 'audio/mpeg' } });
+        audioSegmentKeys.push(key);
+      }
       audioKey = `${slug}-narration.mp3`;
-      await env.MEDIA.put(audioKey, audioBuffer, { httpMetadata: { contentType: 'audio/mpeg' } });
-      console.log('내레이션 음성 생성 완료');
+      await env.MEDIA.put(audioKey, concatAudioBuffers(buffers), { httpMetadata: { contentType: 'audio/mpeg' } });
+      segSentencesList = segments.map((s) => s.sentences);
+      console.log(`내레이션 음성 생성 완료 (세그먼트 ${segments.length}개)`);
     } else {
-      audioError = error;
-      console.log(`내레이션 음성 생성 실패(글 발행은 계속 진행): ${error}`);
+      // 부분적으로 올라간 세그먼트가 있다면 정리(아래 audioKey 없음 분기에서 발행 중단됨)
+      await Promise.all(audioSegmentKeys.map((k) => env.MEDIA.delete(k).catch(() => {})));
+      audioSegmentKeys = [];
+      console.log(`내레이션 음성 생성 실패: ${audioError}`);
     }
   }
 
@@ -1309,8 +1404,8 @@ async function generateAndSavePost(topic, env, onProgress) {
 
     // 내레이션 텍스트를 확보된 이미지 개수만큼 나눠서 각 이미지에 배정 — 자막은 이미지에 직접 굽지 않고
     // 웹/mp4 둘 다 "그 이미지가 떠 있는 동안 문장을 순서대로 갈아끼우는" 방식으로 오버레이함
-    // (한 이미지에 문장이 여러 개 몰려도 잘려나가지 않고 전부 노출됨).
-    const perImageChunks = splitTextIntoNChunks(narrationText, rawImages.length || 1);
+    // (한 이미지에 문장이 여러 개 몰려도 잘려나가지 않고 전부 노출됨). 문장마다 음성 세그먼트 번호를 실음.
+    const perImageChunks = splitTextIntoNChunks(buildSentenceInfos(segSentencesList), rawImages.length || 1);
     for (let i = 0; i < rawImages.length; i++) {
       const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (rawImages.length || 1) };
       const key = `${slug}-scene-${i}.jpg`;
@@ -1336,7 +1431,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   const post = {
     slug, topic, title: article.title, createdAt: new Date().toISOString(),
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
-    images, audio: audioKey, audioError, usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
+    images, audio: audioKey, audioSegments: audioSegmentKeys, audioError, usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
   };
   await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
   const idxRaw = await env.POSTS.get('index');
@@ -1348,7 +1443,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
   if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && images.length) {
     const outputKey = `${slug}.mp4`;
-    const render = await startRelayRender(images, audioKey, outputKey, captionWeights, captionBeats, captionFontKey, captionColor, env);
+    const render = await startRelayRender(images, audioKey, audioSegmentKeys, outputKey, captionWeights, captionBeats, captionFontKey, captionColor, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
         jobId: render.jobId, slug, r2Key: outputKey, imageKeys: images, startedAt: Date.now(),
@@ -1901,23 +1996,56 @@ async function runGenerationStep(job, env) {
     const { article, error: articleError } = await generateArticle(topic, newsResults, env);
     if (!article) throw new Error(`글 생성 실패 — ${articleError || '알 수 없는 오류'}`);
     const narrationText = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ').slice(0, 3000);
-    return { ...job, slug, article, usedNews: newsResults.length > 0, narrationText, stage: 'audio', percent: 15 };
+    // 음성은 문장 몇 개씩 묶은 "세그먼트" 단위로 따로 합성(자막-음성 싱크를 실측으로 맞추기 위함).
+    // 목소리는 여기서 한 번 뽑아 영상 전체에 고정 — 세그먼트마다 목소리가 바뀌면 안 되니까.
+    const segments = planAudioSegments(splitIntoSentences(narrationText), 90);
+    return {
+      ...job, slug, article, usedNews: newsResults.length > 0, narrationText,
+      segTexts: segments.map((s) => s.text), segSentences: segments.map((s) => s.sentences),
+      ttsVoices: pickTtsVoices(), segDone: 0, audioSegmentKeys: [],
+      stage: 'audio', percent: 15,
+    };
   }
 
   if (job.stage === 'audio') {
-    let audioKey = null;
-    let audioError = null;
-    if (env.MEDIA) {
-      const { buffer: audioBuffer, error } = await generateNarrationAudioWithRetry(job.narrationText, env);
-      if (audioBuffer) {
-        audioKey = `${job.slug}-narration.mp3`;
-        await env.MEDIA.put(audioKey, audioBuffer, { httpMetadata: { contentType: 'audio/mpeg' } });
-      } else {
-        audioError = error;
+    // 세그먼트를 몇 개씩(배치) 합성해 R2에 저장 — 한 스텝이 몇 초 안에 끝나도록 나눠서 진행.
+    // 세그먼트 하나라도 최종 실패하면 무음/불일치 영상을 만들 수 없으니 여기서 중단(이미 올린 조각 정리).
+    const AUDIO_BATCH = 4;
+    if (!env.MEDIA) return { ...job, audioKey: null, audioError: 'MEDIA(R2) 바인딩 없음', scenes: [], sceneIndex: 0, images: [], stage: 'finalize', percent: 30 };
+    const keys = job.audioSegmentKeys.slice();
+    let segDone = job.segDone;
+    const batchEnd = Math.min(segDone + AUDIO_BATCH, job.segTexts.length);
+    for (; segDone < batchEnd; segDone++) {
+      const { buffer, error } = await generateNarrationAudioWithRetry(job.segTexts[segDone], env, 2, job.ttsVoices);
+      if (!buffer) {
+        await Promise.all(keys.map((k) => env.MEDIA.delete(k).catch(() => {})));
+        throw new Error(`음성 세그먼트 ${segDone + 1}/${job.segTexts.length} 합성 최종 실패로 발행 중단 — ${error || '알 수 없는 오류'}`);
       }
+      const key = `${job.slug}-narr-${segDone}.mp3`;
+      await env.MEDIA.put(key, buffer, { httpMetadata: { contentType: 'audio/mpeg' } });
+      keys.push(key);
     }
-    const scenes = env.MEDIA ? await generateScenePrompts(topic, job.article.title, env) : [];
-    return { ...job, audioKey, audioError, scenes, sceneIndex: 0, images: [], stage: scenes.length ? 'images' : 'finalize', percent: 30 };
+    const allDone = segDone >= job.segTexts.length;
+    return {
+      ...job, segDone, audioSegmentKeys: keys,
+      stage: allDone ? 'audio-concat' : 'audio',
+      percent: 15 + Math.round((segDone / (job.segTexts.length || 1)) * 13), // 15~28%
+    };
+  }
+
+  if (job.stage === 'audio-concat') {
+    // 세그먼트들을 이어붙인 전체 나레이션 mp3 하나를 만들어 저장 — 웹 슬라이드쇼 재생용(post.audio).
+    // 실제 mp4 렌더링은 이 파일이 아니라 세그먼트 원본들을 릴레이가 직접 이어붙여 씀(그래야 실측 타이밍이 정확).
+    const buffers = [];
+    for (const key of job.audioSegmentKeys) {
+      const obj = await env.MEDIA.get(key);
+      if (!obj) throw new Error(`음성 세그먼트 유실(${key}) — 발행 중단`);
+      buffers.push(await obj.arrayBuffer());
+    }
+    const audioKey = `${job.slug}-narration.mp3`;
+    await env.MEDIA.put(audioKey, concatAudioBuffers(buffers), { httpMetadata: { contentType: 'audio/mpeg' } });
+    const scenes = await generateScenePrompts(topic, job.article.title, env);
+    return { ...job, audioKey, audioError: null, scenes, sceneIndex: 0, images: [], stage: scenes.length ? 'images' : 'finalize', percent: 30 };
   }
 
   if (job.stage === 'images') {
@@ -1947,11 +2075,16 @@ async function runGenerationStep(job, env) {
       if (job.images?.length && env.MEDIA) {
         await Promise.all(job.images.map((k) => env.MEDIA.delete(k).catch(() => {})));
       }
+      if (job.audioSegmentKeys?.length && env.MEDIA) {
+        await Promise.all(job.audioSegmentKeys.map((k) => env.MEDIA.delete(k).catch(() => {})));
+      }
       throw new Error(`음성 생성 최종 실패로 발행 중단 — ${job.audioError || '알 수 없는 오류'}`);
     }
     // 자막 위치/폰트/색은 이 영상 하나에 쓸 값을 미리 하나씩 고정 선택 — 비트마다 안 바뀌고 영상 전체 동일.
     const { captionFontKey, captionColor, captionPositionIndex } = pickCaptionStyle();
-    const perImageChunks = splitTextIntoNChunks(job.narrationText, job.images.length || 1);
+    // 문장마다 어떤 음성 세그먼트에서 나왔는지(segIndex)를 자막 비트에 실어 보냄 — 릴레이가 실측 타이밍에 씀.
+    const sentenceInfos = buildSentenceInfos(job.segSentences);
+    const perImageChunks = splitTextIntoNChunks(sentenceInfos, job.images.length || 1);
     const captionWeights = [];
     const captionBeats = [];
     for (let i = 0; i < job.images.length; i++) {
@@ -1963,7 +2096,7 @@ async function runGenerationStep(job, env) {
     const post = {
       slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
       intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
-      images: job.images, audio: job.audioKey, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
+      images: job.images, audio: job.audioKey, audioSegments: job.audioSegmentKeys, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
     };
     await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
     const idxRaw = await env.POSTS.get('index');
@@ -1976,7 +2109,7 @@ async function runGenerationStep(job, env) {
   if (job.stage === 'render') {
     if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && job.images.length) {
       const outputKey = `${job.slug}.mp4`;
-      const render = await startRelayRender(job.images, job.audioKey, outputKey, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env);
+      const render = await startRelayRender(job.images, job.audioKey, job.audioSegmentKeys, outputKey, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env);
       if (render.ok) {
         await env.POSTS.put(`renderJob:${job.slug}`, JSON.stringify({
           jobId: render.jobId, slug: job.slug, r2Key: outputKey, startedAt: Date.now(),
