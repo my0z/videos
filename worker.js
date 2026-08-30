@@ -1239,29 +1239,42 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
       console.log(`[youtube:${slug}] 업로드 실패: ${result.error}`);
     }
 
-    // [2026-08-30 22:55] 숏츠(도입/중간/결론 최대 3개)를 본편에 이어 순차 업로드 — 개별 실패는 나머지에 영향 없음.
+    // [2026-08-30 23:37] 숏츠(도입/중간/결론 최대 3개)를 본편과 동시 업로드 — Promise.all로 병렬 처리, 개별 실패는 나머지에 영향 없음.
     // 유튜브 쿼터 참고: 업로드 1건당 1,600유닛이라 본편+숏츠3 = 6,400유닛(기본 일일 10,000 → 하루 1편 페이스).
     const shortsToUpload = Array.isArray(freshPost.videoShorts) && freshPost.videoShorts.length
       ? freshPost.videoShorts : (freshPost.videoShort ? [freshPost.videoShort] : []);
     if (shortsToUpload.length) {
       freshPost.youtubeShortsUrls = [];
-      for (let si = 0; si < shortsToUpload.length; si++) {
+      const shortUploadPromises = shortsToUpload.map(async (shortKey, si) => {
         try {
-          const shortObj = await env.MEDIA.get(shortsToUpload[si]);
-          if (!shortObj) continue;
+          const shortObj = await env.MEDIA.get(shortKey);
+          if (!shortObj) return null;
           const shortBuffer = await shortObj.arrayBuffer();
           const shortResult = await uploadVideoToYoutube(freshPost, shortBuffer, env, null, { shorts: true, partNo: si + 1, partTotal: shortsToUpload.length });
           if (shortResult.ok) {
-            freshPost.youtubeShortsUrls.push(shortResult.youtubeUrl);
-            if (si === 0) { freshPost.youtubeShortsId = shortResult.youtubeId; freshPost.youtubeShortsUrl = shortResult.youtubeUrl; freshPost.youtubeShortsError = null; }
             console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 성공: ${shortResult.youtubeUrl}`);
+            return { ok: true, index: si, url: shortResult.youtubeUrl, id: shortResult.youtubeId };
           } else {
-            if (si === 0) freshPost.youtubeShortsError = shortResult.error;
             console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 실패: ${shortResult.error}`);
+            return { ok: false, index: si, error: shortResult.error };
           }
         } catch (e) {
-          if (si === 0) freshPost.youtubeShortsError = e.message;
           console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 예외: ${e.message}`);
+          return { ok: false, index: si, error: e.message };
+        }
+      });
+      const shortResults = await Promise.all(shortUploadPromises);
+      for (const result of shortResults) {
+        if (!result) continue;
+        if (result.ok) {
+          freshPost.youtubeShortsUrls[result.index] = result.url;
+          if (result.index === 0) {
+            freshPost.youtubeShortsId = result.id;
+            freshPost.youtubeShortsUrl = result.url;
+            freshPost.youtubeShortsError = null;
+          }
+        } else {
+          if (result.index === 0) freshPost.youtubeShortsError = result.error;
         }
       }
     }
