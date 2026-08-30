@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-31 00:22 (KST)
+ * 생성(마지막 작업): 2026-08-31 07:05 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -12,16 +12,22 @@
  * 자막: 문장 하나를 통째(내부 줄바꿈)로 이미지별 "비트"에 배정 + 비트마다 음성 조각 번호(segIndex)를 실어 보내
  *      relay.js가 세그먼트 실측 시각으로 타이밍을 맞춤(추정 없음). 위치/폰트/색은 영상당 하나씩 랜덤 고정.
  * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환(xfade)/컬러그레이딩/loudnorm/
- *            청크 분할 렌더링(5장씩)까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
+ *            청크 분할 렌더링(5장씩)까지 relay.js가 처리, 이 워커는 1분 크론 + 실시간 폴링으로 완료 감지
  * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(청크 업로드, 진행률 실시간 표시) + 숏츠 3개(도입/중간/결론, 세로 9:16, 각 ~57초, #Shorts)도 이어서 업로드,
  *        privacyStatus public. 실패해도 글은 유지하고 youtubeError만 기록(음성과 달리 발행을 막지 않음)
- * 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피), 관리자 페이지가 열려있는 동안만 진행됨
+ * [2026-08-31 07:05] 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피).
+ *   관리자 페이지가 열려있으면 1.5초마다 빠르게 진행되고, 페이지를 닫아도 1분 크론(scheduled)이 pollPendingGenJobs로
+ *   같은 runGenerationStep을 대신 호출해 한 단계씩 이어서 진행함 — 더 이상 "탭을 보고 있어야만" 만들어지지 않음.
+ *   다만 크론 주기가 느려서(1.5초 vs 1분) 탭 없이 완성되는 데는 몇십 분 걸릴 수 있음(1분마다 한 단계씩).
  */
 
 const CF_ACCOUNT_ID = '709dcc6af36c8ee7b6d3d99e7a9fe422';
 const VEO_MODEL = 'veo-3.1-fast-generate-preview';
 const VIDEO_JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30분 넘게 안 끝나면 포기
-const VIDEO_POLL_CRON = '*/5 * * * *'; // 이 크론이 실행되면 콘텐츠 발행 대신 영상 작업 폴링만 함
+// [2026-08-31 07:05] 5분 → 1분: Cloudflare Cron 트리거의 최소 단위가 1분이라 이보다 더 못 줄임.
+// wrangler.toml의 crons 배열도 이 값과 반드시 똑같이 '* * * * *'로 맞춰야 실제로 1분마다 실행됨(둘이 안 맞으면
+// event.cron이 이 상수와 달라서 아래 scheduled()의 if문을 그냥 건너뜀 — 배포 후 크론 안 도는 흔한 원인).
+const VIDEO_POLL_CRON = '* * * * *'; // 이 크론이 실행되면 콘텐츠 발행 대신 영상 작업 폴링 + 생성 작업 진행만 함
 const CF_AI_GATEWAY = 'yzusb';
 const VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
 const SCENE_COUNT = 20; // 슬라이드쇼에 쓸 장면 이미지 개수 — 4분 분량 영상 기준 20장(장당 평균 12초 내외)
@@ -150,7 +156,8 @@ export default {
       (async () => {
         console.log(`=== 크론 실행: ${new Date().toISOString()} (cron: ${event.cron}) ===`);
         if (event.cron === VIDEO_POLL_CRON) {
-          await checkRelayHealth(env); // [2026-08-31 00:07] 5분마다 relay 헬스 체크
+          await checkRelayHealth(env); // 1분마다 relay 헬스 체크
+          await pollPendingGenJobs(env); // [2026-08-31 07:05] 탭이 안 열려있어도 생성이 이어지도록 한 단계씩 진행
           await pollPendingVideoJobs(env);
           await pollPendingRenderJobs(env, ctx);
         }
@@ -1452,6 +1459,40 @@ async function pollPendingRenderJobs(env, ctx) {
   }
 }
 
+// [2026-08-31 07:05] 관리자 페이지(브라우저)가 안 열려있어도 생성이 진행되게 하는 크론 폴백 —
+// runGenerationStep(handleGenerateStep과 완전히 같은 함수)을 그대로 재사용해서 대기 중인 genJob마다
+// 딱 한 단계씩만 진행함. 실패 처리 규칙도 handleGenerateStep과 동일(에러 나면 job.failed=true로 표시해서
+// admin 페이지의 3분 정리 로직이 그대로 정리해줌 — 이 함수는 failed:true인 작업은 건드리지 않음).
+async function pollPendingGenJobs(env) {
+  const list = await env.POSTS.list({ prefix: 'genJob:' });
+  if (!list.keys.length) {
+    console.log('대기 중인 생성 작업 없음.');
+    return;
+  }
+  console.log(`대기 중인 생성 작업 ${list.keys.length}건 확인, 각각 한 단계씩 진행.`);
+
+  for (const keyInfo of list.keys) {
+    const raw = await env.POSTS.get(keyInfo.name);
+    if (!raw) continue;
+    let job = JSON.parse(raw);
+    if (job.failed) continue; // 이미 실패로 끝난 건 admin 페이지의 정리 타이머가 알아서 지움
+
+    try {
+      job = await runGenerationStep(job, env);
+      if (job.stage === 'done') {
+        await env.POSTS.delete(keyInfo.name);
+        console.log(`[${keyInfo.name}] 크론이 생성 완료시킴: ${job.slug}`);
+        continue;
+      }
+      job.startedAt = Date.now(); // 마지막 갱신 시각(admin 페이지의 "멈춤" 판정과 공유)
+      await env.POSTS.put(keyInfo.name, JSON.stringify(job));
+    } catch (e) {
+      await env.POSTS.put(keyInfo.name, JSON.stringify({ ...job, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() })).catch(() => {});
+      console.log(`[${keyInfo.name}] 크론 진행 중 실패: ${e.message}`);
+    }
+  }
+}
+
 async function pollPendingVideoJobs(env) {
   const list = await env.POSTS.list({ prefix: 'videoJob:' });
   if (!list.keys.length) {
@@ -2385,7 +2426,7 @@ async function renderAdminPage(env, requestUrl) {
 
   const body = `${siteHeader()}<div class="wrap" style="padding:32px 0;">
     <h2>관리자 (총 ${idx.length}건)</h2>
-    <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아오고, 진행률은 아래에서 실시간으로 확인할 수 있어요.</p>
+    <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아와요. 이 페이지를 열어두면 1.5초마다 빠르게 진행되고, 닫아도 1분마다 크론이 대신 이어서 진행해요(다만 느려요).</p>
     <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;" onsubmit="this.querySelector('button').disabled=true; this.querySelector('button').textContent='생성 중...';">
       <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;" required>
       <button type="submit">글+슬라이드쇼 생성</button>
