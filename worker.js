@@ -784,6 +784,15 @@ async function finalizeRenderDone(job, renderJobKeyName, env) {
 }
 
 async function finalizeRenderFailed(job, renderJobKeyName, errMsg, env) {
+  // relay.js가 "나레이션은 있었는데 최종 mp4에 오디오 트랙이 없음"을 NO_AUDIO_TRACK 마커로 알려주는 경우엔
+  // 일반 렌더링 실패(videoError만 기록하고 슬라이드쇼로 계속 발행)와 다르게, 글 자체를 완전히 삭제함 —
+  // 음성 없는 영상이 조용히 발행되는 걸 원천 차단.
+  if (errMsg && errMsg.includes('NO_AUDIO_TRACK')) {
+    await deletePostCompletely(job.slug, env);
+    await env.POSTS.delete(renderJobKeyName);
+    console.log(`[${renderJobKeyName}] 오디오 트랙 검증 실패로 글 삭제됨: ${job.slug} — ${errMsg}`);
+    return;
+  }
   const failedPostRaw = await env.POSTS.get(`post:${job.slug}`);
   if (failedPostRaw) {
     const failedPost = JSON.parse(failedPostRaw);
@@ -792,6 +801,27 @@ async function finalizeRenderFailed(job, renderJobKeyName, errMsg, env) {
   }
   await env.POSTS.delete(renderJobKeyName);
   console.log(`[${renderJobKeyName}] 릴레이 렌더링 실패 — ${errMsg}`);
+}
+
+// 글(post)을 관련 미디어(이미지/음성/mp4)까지 포함해서 완전히 삭제 — 음성 검증 실패 시 등
+// "조용히 무음으로 발행되느니 아예 안 나오는 게 낫다" 상황에서 씀.
+async function deletePostCompletely(slug, env) {
+  const postRaw = await env.POSTS.get(`post:${slug}`);
+  if (postRaw) {
+    const post = JSON.parse(postRaw);
+    const toDelete = [...(post.images || [])];
+    if (post.audio) toDelete.push(post.audio);
+    if (post.video) toDelete.push(post.video);
+    if (toDelete.length) {
+      await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
+    }
+  }
+  await env.POSTS.delete(`post:${slug}`);
+  const idxRaw = await env.POSTS.get('index');
+  if (idxRaw) {
+    const idx = JSON.parse(idxRaw);
+    await env.POSTS.put('index', JSON.stringify(idx.filter((s) => s !== slug)));
+  }
 }
 
 async function pollPendingRenderJobs(env) {
@@ -1119,6 +1149,15 @@ async function generateAndSavePost(topic, env, onProgress) {
       captionBeats.push(beats);
     }
     console.log(`장면 이미지 ${images.length}개 저장 완료`);
+  }
+
+  // 음성이 끝내 실패했으면(재시도 다 소진) 무음 영상을 조용히 발행하는 대신 여기서 중단 —
+  // 이미 올려둔 장면 이미지는 정리하고 실패로 반환(글 자체를 안 만듦).
+  if (!audioKey) {
+    if (images.length && env.MEDIA) {
+      await Promise.all(images.map((k) => env.MEDIA.delete(k).catch(() => {})));
+    }
+    return { ok: false, reason: `음성 생성 최종 실패로 발행 중단 — ${audioError || '알 수 없는 오류'}` };
   }
 
   report('글 저장 중', 80);
@@ -1653,6 +1692,14 @@ async function runGenerationStep(job, env) {
   }
 
   if (job.stage === 'finalize') {
+    // 음성이 끝내 실패했으면(재시도 다 소진) 무음 영상을 조용히 발행하는 대신 여기서 중단 —
+    // 이미 올려둔 장면 이미지는 정리하고 실패로 처리(글 자체를 안 만듦, handleGenerateStep의 catch가 job.failed 처리).
+    if (!job.audioKey) {
+      if (job.images?.length && env.MEDIA) {
+        await Promise.all(job.images.map((k) => env.MEDIA.delete(k).catch(() => {})));
+      }
+      throw new Error(`음성 생성 최종 실패로 발행 중단 — ${job.audioError || '알 수 없는 오류'}`);
+    }
     // 자막 위치/폰트/색은 이 영상 하나에 쓸 값을 미리 하나씩 고정 선택 — 비트마다 안 바뀌고 영상 전체 동일.
     const { captionFontKey, captionColor, captionPositionIndex } = pickCaptionStyle();
     const perImageChunks = splitTextIntoNChunks(job.narrationText, job.images.length || 1);
