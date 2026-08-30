@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 19:59 (KST)
+ * 생성(마지막 작업): 2026-08-30 20:13 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(25~60자 짧은 문장, 특수기호 금지 등) 적용
@@ -1654,12 +1654,13 @@ function renderSlideshow(post) {
       // 위치/폰트/색 전부 영상 하나당 하나로 고정(서버가 미리 뽑아서 내려줌, 비트마다 안 바뀜) — 위치는
       // captionBeats의 모든 styleIndex가 이미 같은 값으로 와서 자연히 고정됨. 폰트/색은 아래 FIXED_FONT/FIXED_COLOR로 고정.
       // relay.js(mp4)에도 같은 위치표 + 고정 폰트/색 규칙이 있음(POSITION_STYLES 인덱스 규칙 일치, styleIndex 그대로 재사용).
+      // [2026-08-30 20:13] 자막 크기 2/3로 축소(사용자 요청, mp4쪽 CAPTION_POSITIONS와 같은 비율)
       var POSITION_STYLES = [
-        { pos:'bottom', size:35 },
-        { pos:'top',    size:33 },
-        { pos:'bl',     size:44 },
-        { pos:'br',     size:40 },
-        { pos:'middle', size:42 }
+        { pos:'bottom', size:23 },
+        { pos:'top',    size:22 },
+        { pos:'bl',     size:29 },
+        { pos:'br',     size:27 },
+        { pos:'middle', size:28 }
       ];
       var FIXED_FONT = ${JSON.stringify(fixedFontCss)};
       var FIXED_COLOR = ${JSON.stringify(fixedColorCss)};
