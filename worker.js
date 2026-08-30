@@ -1027,6 +1027,19 @@ async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey
     : null;
 
   try {
+    // [2026-08-31 00:33] 렌더링 전 메모리 정리 — 오래된 작업 제거 + GC 강제 실행
+    try {
+      const cleanupRes = await fetch(`${env.RELAY_URL}/cleanup`, {
+        method: 'POST',
+        headers: { 'x-relay-secret': env.RELAY_SECRET },
+        signal: AbortSignal.timeout(5000),
+      });
+      // cleanup 실패는 경고만 하고 계속 진행
+      if (!cleanupRes.ok) console.warn(`relay cleanup 실패: HTTP ${cleanupRes.status}`);
+    } catch (cleanupErr) {
+      console.warn(`relay cleanup 요청 오류: ${cleanupErr.message}`);
+    }
+
     const res = await fetch(`${env.RELAY_URL}/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
