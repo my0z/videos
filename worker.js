@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 21:08 (KST)
+ * 생성(마지막 작업): 2026-08-30 21:17 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -151,6 +151,12 @@ function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// [2026-08-30 21:17] 긴 에러를 앞+뒤로 나눠 표시 — 다단계 폴백 에러는 마지막 단계 결과가 끝에 있어서 앞만 자르면 안 보임
+function truncErrText(msg, head = 220, tail = 220) {
+  const s = String(msg || '');
+  return s.length <= head + tail + 3 ? s : s.slice(0, head) + ' … ' + s.slice(-tail);
+}
+
 function makeExcerpt(html, maxLen = 130) {
   const text = (html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   return text.length > maxLen ? text.slice(0, maxLen).trim() + '…' : text;
@@ -191,7 +197,7 @@ async function callAiChain(systemPrompt, userPrompt, env) {
             model,
             messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
             temperature: 0.7,
-            max_tokens: 8000,
+            max_tokens: 4000, // [2026-08-30 21:17] 8000→4000: 무료 티어 분당 토큰 한도에 입력+max_tokens가 합산돼 413 나던 문제(reasoning low라 4000이면 충분)
             ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
           }),
           signal: AbortSignal.timeout(45000), // 4분 분량 생성이라 넉넉히(스텝 방식이라 오래 기다려도 됨)
@@ -230,7 +236,7 @@ async function callAiChain(systemPrompt, userPrompt, env) {
       const response = await withTimeout(env.AI.run('@cf/zai-org/glm-4.7-flash', {
         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
         max_tokens: 5000, // [2026-08-30 19:38] 4분 분량(1,700~2,000자) 글이 2000토큰에서 잘려 JSON 파싱 실패하던 문제 수정
-      }, { gateway: { id: CF_AI_GATEWAY } }), 55000, 'workers-ai 글 생성'); // [2026-08-30 21:08] 20초→55초(4분 분량엔 부족했음)
+      }, { gateway: { id: CF_AI_GATEWAY } }), 90000, 'workers-ai 글 생성'); // [2026-08-30 21:17] 90초로 확대(55초도 4분 분량 한국어 JSON엔 빠듯했음)
       let raw = response?.response;
       if (raw) {
         raw = raw.trim().replace(/^```json\s*|\s*```$/gm, '').trim();
@@ -1965,7 +1971,7 @@ async function renderAdminPage(env, requestUrl) {
   const genJobRows = genJobs.map((j) => {
     const isStale = !j.failed && (Date.now() - (j.startedAt || 0) > STALE_MS);
     const label = j.failed
-      ? `❌ 생성 실패: ${escapeHtml((j.error || '').slice(0, 400))}` // [2026-08-30 19:38] 80자→400자: 폴백 단계별 실패 원인까지 보이게
+      ? `❌ 생성 실패: ${escapeHtml(truncErrText(j.error))}` // [2026-08-30 21:17] 앞+뒤 표시로 변경(마지막 폴백 결과까지 보이게)
       : isStale
         ? `⚠️ 응답 없음(멈춤) — ${escapeHtml(j.topic)} · 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (10분 지나면 자동으로 정리돼요)`
         : `${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
@@ -2150,7 +2156,7 @@ async function renderAdminPage(env, requestUrl) {
                 return;
               }
               if (data.status === 'failed') {
-                el.textContent = '❌ 생성 실패: ' + (data.error || '').slice(0, 400); // 80자→400자(서버 표시와 동일)
+                el.textContent = '❌ 생성 실패: ' + (function(s){ s = String(s || ''); return s.length <= 443 ? s : s.slice(0, 220) + ' … ' + s.slice(-220); })(data.error); // [2026-08-30 21:17] 앞+뒤 표시
                 el.dataset.terminal = '1';
                 return;
               }
