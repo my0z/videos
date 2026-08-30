@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 19:38 (KST)
+ * 생성(마지막 작업): 2026-08-30 19:41 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(25~60자 짧은 문장, 특수기호 금지 등) 적용
@@ -163,45 +163,10 @@ function siteHeader() {
   return `<header class="site"><div class="wrap"><a class="logo" href="/">life<span>.news</span></a><div class="mono" style="font-size:12px;color:var(--muted)">생활뉴스 · 글+슬라이드쇼</div></div></header>`;
 }
 
+// [2026-08-30 19:41] Cerebras 제거(크레딧 소진으로 402만 뱉어서 뺌) — 이제 Groq(2개 모델) → Workers AI 순.
+// CEREBRAS_API_KEY 환경변수는 더 이상 안 읽으므로 그대로 둬도 무해함(지워도 됨).
 async function callAiChain(systemPrompt, userPrompt, env) {
   const attemptErrors = [];
-
-  if (env.CEREBRAS_API_KEY) {
-    try {
-      const res = await fetch(`https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/cerebras/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.CEREBRAS_API_KEY}` },
-        body: JSON.stringify({
-          model: 'gpt-oss-120b',
-          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-          temperature: 0.7,
-          max_tokens: 5000, // [2026-08-30 19:38] 4분 분량(1,700~2,000자) 글이 2000토큰에서 잘려 JSON 파싱 실패하던 문제 수정
-        }),
-        signal: AbortSignal.timeout(20000),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        let raw = data?.choices?.[0]?.message?.content;
-        if (raw) {
-          raw = raw.trim().replace(/^```json\s*|\s*```$/gm, '').trim();
-          try {
-            return { result: JSON.parse(raw), error: null, modelUsed: 'cerebras:gpt-oss-120b' };
-          } catch (e) {
-            attemptErrors.push(`[cerebras] JSON 파싱 실패: ${e.message}`);
-          }
-        } else {
-          attemptErrors.push('[cerebras] 응답에 content 없음');
-        }
-      } else {
-        const bodyText = await res.text();
-        attemptErrors.push(`[cerebras] HTTP ${res.status}: ${bodyText.slice(0, 150)}`);
-      }
-    } catch (e) {
-      attemptErrors.push(`[cerebras] 네트워크 오류: ${e.message}`);
-    }
-  } else {
-    attemptErrors.push('[cerebras] CEREBRAS_API_KEY 미설정');
-  }
 
   if (env.GROQ_API_KEY) {
     for (const model of ['llama-3.1-8b-instant', 'openai/gpt-oss-120b']) {
