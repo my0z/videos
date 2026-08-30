@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 21:51 (KST)
+ * 생성(마지막 작업): 2026-08-30 21:55 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -9,7 +9,7 @@
  *      문장 하나하나를 따로 합성해 relay.js가 실측 길이로 이어붙임 — 모든 문장 시작이 실측 리셋 지점(자막 싱크의 핵심).
  *      세그먼트 하나라도 끝내 실패하면 무음으로 발행하지 않고 발행 자체를 중단(올린 조각/이미지 정리 후 실패 처리).
  *      mp4까지 다 만들었는데 최종 파일에 오디오 트랙이 없는 경우(relay.js가 ffprobe로 검증)도 글째로 삭제.
- * 자막: 문장을 줄 단위로 쪼개 이미지별 "비트"로 배정 + 비트마다 음성 세그먼트 번호(segIndex)를 실어 보내
+ * 자막: 문장 하나를 통째(내부 줄바꿈)로 이미지별 "비트"에 배정 + 비트마다 음성 조각 번호(segIndex)를 실어 보내
  *      relay.js가 세그먼트 실측 시각으로 타이밍을 맞춤(추정 없음). 위치/폰트/색은 영상당 하나씩 랜덤 고정.
  * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환(xfade)/컬러그레이딩/loudnorm/
  *            청크 분할 렌더링(5장씩)까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
@@ -1429,10 +1429,11 @@ function buildSentenceInfos(segSentences) {
 // 각 줄의 노출시간은 글자수 비례, 문장이 끝나는 마지막 줄에만 정지시간(가상 글자수)을 더해줌.
 // positionIndex: 이 영상 전체에 고정으로 쓸 위치 하나(POSITION_STYLES 참고, renderSlideshow 안) — 예전엔 비트마다
 // 순환했는데 너무 산만하다는 피드백으로 위치/폰트/색 다 영상 하나당 하나로 고정.
-// segIndex: 이 줄이 속한 문장이 몇 번째 음성 세그먼트에서 합성됐는지 — 릴레이가 세그먼트별 실제 음성
-// 길이(ffprobe 실측)로 자막 타이밍을 배분할 때 쓰는 핵심 매핑. 세그먼트 경계에서는 추정이 전혀 없어서
-// 자막이 밀릴 수가 없고, 한 세그먼트 안(짧음)에서만 글자수 비례 배분이라 오차가 눈에 안 띔.
-// isSentenceEnd: 문장의 마지막 줄 표시 — 세그먼트 정보가 없을 때(하위호환) 릴레이의 무음 감지 정렬용.
+// [2026-08-30 21:55] 자막 비트 = 문장 하나 통째(내부 줄바꿈 포함) — 예전엔 문장을 줄 단위로 쪼개 순서대로
+// 갈아끼웠는데, 줄 전환 시각만은 문장 안에서 글자수 비례 "추정"이라 미세하게 어긋날 수 있었음.
+// 이제 문장 전체를 2~3줄로 줄바꿈해 그 문장의 실측 구간 내내 표시 → 화면의 모든 자막 전환이
+// 음성 조각의 측정된 시작 시각과 정확히 일치(추정 0). segIndex: 이 문장이 합성된 음성 조각 번호.
+// isSentenceEnd: 하위호환(옛 relay의 무음 감지 정렬용) — 문장 단위 비트라 항상 true.
 function buildCaptionBeats(sentences, positionIndex) {
   if (!sentences.length) return [];
   const PAUSE_EQUIVALENT_CHARS = 6;
@@ -1440,15 +1441,12 @@ function buildCaptionBeats(sentences, positionIndex) {
   for (const s of sentences) {
     const text = typeof s === 'string' ? s : s.text; // 문자열(옛 형식)과 {text, segIndex} 둘 다 수용
     const segIndex = typeof s === 'string' ? null : s.segIndex;
-    const lines = wrapCaptionLines(text, 20, 50); // 줄 수 제한 없이 문장 전체를 다 담음(한 줄씩 보여줄 거라 잘릴 일 없음)
-    lines.forEach((line, li) => {
-      const isLastLineOfSentence = li === lines.length - 1;
-      const weight = Math.max(line.length + (isLastLineOfSentence ? PAUSE_EQUIVALENT_CHARS : 0), 4);
-      beats.push({ text: line, weight, isSentenceEnd: isLastLineOfSentence, segIndex });
-    });
+    const wrapped = wrapCaptionLines(text, 20, 5).join('\n'); // 문장 전체를 최대 5줄로 줄바꿈(20~45자 문장이면 보통 1~3줄)
+    const weight = Math.max(text.length + PAUSE_EQUIVALENT_CHARS, 4);
+    beats.push({ text: wrapped, weight, isSentenceEnd: true, segIndex });
   }
   const sumWeights = beats.reduce((a, b) => a + b.weight, 0) || 1;
-  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: positionIndex, isSentenceEnd: !!b.isSentenceEnd, segIndex: b.segIndex }));
+  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: positionIndex, isSentenceEnd: true, segIndex: b.segIndex }));
 }
 
 function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
