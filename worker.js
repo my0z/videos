@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-30 19:41 (KST)
+ * 생성(마지막 작업): 2026-08-30 19:53 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(25~60자 짧은 문장, 특수기호 금지 등) 적용
@@ -114,6 +114,12 @@ export default {
       if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env);
       if (path === '/api/generate' && request.method === 'POST') return await handleApiGenerate(request, env);
       if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
+      if (path === '/admin/dismiss-fail' && request.method === 'POST') { // [2026-08-30 19:52] 렌더링 실패 기록 확인 후 지우기
+        const form = await request.formData();
+        const failSlug = (form.get('slug') || '').toString();
+        if (failSlug) await env.POSTS.delete(`renderFail:${failSlug}`);
+        return new Response(null, { status: 302, headers: { Location: '/admin' } });
+      }
       if (path === '/admin/render-progress') return await handleRenderProgress(request, env, ctx);
       if (path === '/admin/generate-step' && request.method === 'POST') return await handleGenerateStep(request, env);
       if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
@@ -1101,6 +1107,7 @@ async function updateYoutubeUploadPercent(slug, percent, env) {
 
 // mp4가 R2(env.MEDIA)에 올라간 직후 호출 — 그 자리에서 바로 바이트를 읽어 유튜브에 올리고 결과를 post에 반영.
 async function triggerYoutubeUpload(slug, r2Key, env) {
+  const uploadStartMs = Date.now(); // [2026-08-30 19:45] 업로드 소요시간 측정(관리자 표시용)
   try {
     const videoObj = await env.MEDIA.get(r2Key);
     if (!videoObj) {
@@ -1116,6 +1123,7 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
     if (!freshRaw) return;
     const freshPost = JSON.parse(freshRaw);
     freshPost.youtubeUploadPercent = null; // 끝났으니 진행률 표시는 지우고 youtubeUrl/youtubeError로 결과만 남김
+    freshPost.youtubeUploadSec = Math.round((Date.now() - uploadStartMs) / 1000); // [2026-08-30 19:45] mp4 읽기+업로드 전체 소요
     if (result.ok) {
       freshPost.youtubeId = result.youtubeId;
       freshPost.youtubeUrl = result.youtubeUrl;
@@ -1131,16 +1139,32 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
   }
 }
 
+// [2026-08-30 19:52] 렌더링 실패 기록 — 실패 이유가 화면에서 사라지지 않도록 KV에 3일간 보관.
+// 특히 오디오 검증 실패(NO_AUDIO_TRACK)는 글 자체가 삭제돼서 이 기록이 유일한 흔적이 됨(관리자 상단에 표시).
+async function recordRenderFailure(slug, errMsg, postDeleted, env) {
+  try {
+    const postRaw = await env.POSTS.get(`post:${slug}`);
+    const title = postRaw ? (JSON.parse(postRaw).title || '') : '';
+    await env.POSTS.put(`renderFail:${slug}`, JSON.stringify({
+      slug, title, error: (errMsg || '').slice(0, 500), postDeleted: !!postDeleted, at: new Date().toISOString(),
+    }), { expirationTtl: 3 * 24 * 3600 });
+  } catch (e) {
+    console.log(`렌더링 실패 기록 실패(무시): ${e.message}`);
+  }
+}
+
 async function finalizeRenderFailed(job, renderJobKeyName, errMsg, env) {
   // relay.js가 "나레이션은 있었는데 최종 mp4에 오디오 트랙이 없음"을 NO_AUDIO_TRACK 마커로 알려주는 경우엔
   // 일반 렌더링 실패(videoError만 기록하고 슬라이드쇼로 계속 발행)와 다르게, 글 자체를 완전히 삭제함 —
   // 음성 없는 영상이 조용히 발행되는 걸 원천 차단.
   if (errMsg && errMsg.includes('NO_AUDIO_TRACK')) {
+    await recordRenderFailure(job.slug, errMsg, true, env); // 삭제 전에 제목까지 기록
     await deletePostCompletely(job.slug, env);
     await env.POSTS.delete(renderJobKeyName);
     console.log(`[${renderJobKeyName}] 오디오 트랙 검증 실패로 글 삭제됨: ${job.slug} — ${errMsg}`);
     return;
   }
+  await recordRenderFailure(job.slug, errMsg, false, env);
   const failedPostRaw = await env.POSTS.get(`post:${job.slug}`);
   if (failedPostRaw) {
     const failedPost = JSON.parse(failedPostRaw);
@@ -1447,6 +1471,7 @@ async function mapWithConcurrency(items, limit, fn) {
 }
 
 async function generateAndSavePost(topic, env, onProgress) {
+  const genStartMs = Date.now(); // [2026-08-30 19:45] 생성 소요시간 측정(관리자 표시용)
   const report = (stage, percent) => { if (onProgress) onProgress(stage, percent); };
   if (!env.POSTS) return { ok: false, reason: 'POSTS(KV) 바인딩 없음' };
 
@@ -1563,6 +1588,7 @@ async function generateAndSavePost(topic, env, onProgress) {
     slug, topic, title: article.title, createdAt: new Date().toISOString(),
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
     images, audio: audioKey, audioSegments: audioSegmentKeys, audioError, usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
+    generationSec: Math.round((Date.now() - genStartMs) / 1000), // [2026-08-30 19:45] 생성 소요시간(관리자 표시용)
   };
   await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
   const idxRaw = await env.POSTS.get('index');
@@ -1911,6 +1937,22 @@ async function renderAdminPage(env, requestUrl) {
     if (freshRaw) genJobs.unshift({ id: freshGenId, ...JSON.parse(freshRaw) });
   }
 
+  // [2026-08-30 19:52] 최근 렌더링 실패 기록(3일 보관) — 이유를 그대로 보여줌. 글이 삭제된 실패는 여기서만 보임.
+  const renderFailsRaw = await env.POSTS.list({ prefix: 'renderFail:' });
+  const renderFails = [];
+  for (const k of renderFailsRaw.keys.slice(0, 5)) {
+    const raw = await env.POSTS.get(k.name);
+    if (raw) renderFails.push(JSON.parse(raw));
+  }
+  renderFails.sort((a, b) => new Date(b.at) - new Date(a.at));
+  const renderFailRows = renderFails.map((f) => `<tr>
+    <td colspan="7" class="mono" style="background:#FEF3C7;color:#92400E;border-left:4px solid #F59E0B;">
+      🎬❌ 렌더링 실패(${new Date(f.at).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}) — ${escapeHtml(f.title || f.slug)}${f.postDeleted ? ' · 글 자동삭제됨(오디오 검증)' : ''}<br>
+      사유: ${escapeHtml(f.error || '기록 없음')}
+      <form method="POST" action="/admin/dismiss-fail" style="display:inline;margin-left:8px;"><input type="hidden" name="slug" value="${escapeHtml(f.slug)}"><button type="submit" style="font-size:11px;padding:2px 8px;">확인(지우기)</button></form>
+    </td>
+  </tr>`).join('');
+
   const genJobRows = genJobs.map((j) => {
     const isStale = !j.failed && (Date.now() - (j.startedAt || 0) > STALE_MS);
     const label = j.failed
@@ -1926,6 +1968,8 @@ async function renderAdminPage(env, requestUrl) {
   }).join('');
 
   const rows = posts.map((p) => {
+    // [2026-08-30 19:45] 소요시간 표시용 — 초를 "M분 S초"/"S초"로
+    const fmtDurSec = (sec) => (typeof sec === 'number' && sec >= 0 ? (sec >= 60 ? `${Math.floor(sec / 60)}분 ${sec % 60}초` : `${sec}초`) : '');
     // [2026-08-30 19:10] 클립(mp4)이 섞이면 "🎞️N·🖼️M장"으로 구분 표시
     const clipN = (p.images || []).filter((k) => k.endsWith('.mp4')).length;
     const photoN = (p.images || []).length - clipN;
@@ -1940,18 +1984,18 @@ async function renderAdminPage(env, requestUrl) {
     const videoStatus = p.video
       ? (needsYoutubePoll
           ? `<span class="render-progress" data-slug="${p.slug}">🎬 mp4 완료 · 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}</span>`
-          : `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>` : ` · ⚠️ 유튜브실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`}`)
+          : `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>${p.youtubeUploadSec ? ` (업로드 ${fmtDurSec(p.youtubeUploadSec)})` : ''}` : ` · ⚠️ 유튜브실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`}`)
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
         : p.videoError
-          ? `❌ 실패: ${escapeHtml(p.videoError.slice(0, 60))}`
+          ? `❌ 실패: ${escapeHtml(p.videoError.slice(0, 200))}`
           : '—';
     return `<tr>
       <td>${escapeHtml(p.title)}</td>
       <td class="mono">${escapeHtml(p.topic)}</td>
       <td class="mono">${mediaStatus}</td>
       <td class="mono">${videoStatus}</td>
-      <td class="mono">${new Date(p.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}</td>
+      <td class="mono">${new Date(p.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}${p.generationSec ? `<br>⏱ 생성 ${fmtDurSec(p.generationSec)}` : ''}</td>
       <td><a href="/${p.slug}" target="_blank">보기</a></td>
       <td><form method="POST" action="/admin/delete" style="margin:0;"><input type="hidden" name="slug" value="${p.slug}"><button class="danger" type="submit">삭제</button></form></td>
     </tr>`;
@@ -2018,6 +2062,10 @@ async function renderAdminPage(env, requestUrl) {
                   el.appendChild(document.createTextNode('🎬 mp4 완료 · '));
                   var a = document.createElement('a'); a.href = data.youtubeUrl; a.target = '_blank'; a.textContent = '▶ 유튜브';
                   el.appendChild(a);
+                  if (typeof data.youtubeUploadSec === 'number') { // [2026-08-30 19:45] 업로드 소요시간 표시
+                    var us = data.youtubeUploadSec;
+                    el.appendChild(document.createTextNode(' (업로드 ' + (us >= 60 ? Math.floor(us / 60) + '분 ' + (us % 60) + '초' : us + '초') + ')'));
+                  }
                   el.dataset.terminal = '1';
                 } else if (data.youtubeError) {
                   el.textContent = '🎬 mp4 완료 · ⚠️ 유튜브실패(' + String(data.youtubeError).slice(0, 150) + ')';
@@ -2040,7 +2088,8 @@ async function renderAdminPage(env, requestUrl) {
                 return;
               }
               if (data.status === 'failed') {
-                el.textContent = '❌ 렌더링 실패';
+                // [2026-08-30 19:52] 이유 없이 "렌더링 실패"만 뜨던 것 → 서버가 보내주는 이유까지 표시
+                el.textContent = '❌ 렌더링 실패' + (data.error ? ': ' + String(data.error).slice(0, 200) : '');
                 el.dataset.terminal = '1';
                 return;
               }
@@ -2117,7 +2166,7 @@ async function renderAdminPage(env, requestUrl) {
       <button type="submit">글+슬라이드쇼 생성</button>
     </form>
     <div class="table-scroll"><table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>작성일</th><th></th><th></th></tr></thead>
-    <tbody>${genJobRows}<tr id="posts-anchor" style="display:none;"><td colspan="7"></td></tr>${rows || '<tr id="empty-row"><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table></div>
+    <tbody>${renderFailRows}${genJobRows}<tr id="posts-anchor" style="display:none;"><td colspan="7"></td></tr>${rows || '<tr id="empty-row"><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table></div>
   </div>${progressScript}`;
 
   return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
@@ -2254,6 +2303,7 @@ async function runGenerationStep(job, env) {
       slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
       intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
       images: job.images, audio: job.audioKey, audioSegments: job.audioSegmentKeys, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
+      generationSec: job.createdAt ? Math.round((Date.now() - job.createdAt) / 1000) : null, // [2026-08-30 19:45] 생성 버튼 → 글 저장까지 걸린 시간(관리자 표시용)
     };
     await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
     const idxRaw = await env.POSTS.get('index');
@@ -2345,12 +2395,20 @@ async function handleRenderProgress(request, env, ctx) {
     // 관리자 화면이 "mp4 완료"에서 멈추지 않고 업로드 결과(링크/실패)까지 이어서 보여줄 수 있음.
     const postRaw = await env.POSTS.get(`post:${slug}`);
     const post = postRaw ? JSON.parse(postRaw) : null;
+    // [2026-08-30 19:52] 실패 이유 전달 — post의 videoError, 글이 삭제된 경우(오디오 검증 실패)엔 renderFail 기록에서
+    let failReason = post?.videoError || null;
+    if (!post?.video && !failReason) {
+      const failRaw = await env.POSTS.get(`renderFail:${slug}`);
+      if (failRaw) failReason = JSON.parse(failRaw).error;
+    }
     return new Response(JSON.stringify({
       status: post?.video ? 'done' : 'failed',
       percent: post?.video ? 100 : 0,
+      error: failReason,
       youtubeUrl: post?.youtubeUrl || null,
       youtubeError: post?.youtubeError || null,
       youtubeUploadPercent: post?.youtubeUploadPercent ?? null,
+      youtubeUploadSec: post?.youtubeUploadSec ?? null,
     }), { headers: { 'Content-Type': 'application/json' } });
   }
   const job = JSON.parse(jobRaw);
@@ -2371,6 +2429,7 @@ async function handleRenderProgress(request, env, ctx) {
     let youtubeUrl = null;
     let youtubeError = null;
     let youtubeUploadPercent = null;
+    let youtubeUploadSec = null;
     if (data.status === 'done') {
       await finalizeRenderDone(job, `renderJob:${slug}`, env, ctx);
       // finalizeRenderDone 안의 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행돼서 이 시점엔 보통 아직 안 끝남 —
@@ -2380,10 +2439,11 @@ async function handleRenderProgress(request, env, ctx) {
       youtubeUrl = freshPost?.youtubeUrl || null;
       youtubeError = freshPost?.youtubeError || null;
       youtubeUploadPercent = freshPost?.youtubeUploadPercent ?? null;
+      youtubeUploadSec = freshPost?.youtubeUploadSec ?? null;
     } else if (data.status === 'failed') {
       await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
     }
-    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, youtubeUrl, youtubeError, youtubeUploadPercent }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, youtubeUrl, youtubeError, youtubeUploadPercent, youtubeUploadSec }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
   }
@@ -2422,7 +2482,7 @@ async function handleGenerate(request, env) {
   // 여기선 작업 "등록"만 하고, 실제 진행은 관리자 페이지가 /admin/generate-step을 반복 호출하며
   // 한 단계씩(글쓰기/음성/이미지 1장씩/저장/렌더링등록) 진행시킴. 각 단계는 몇 초 안에 끝나서 시간제한에 안 걸림.
   const jobId = crypto.randomUUID();
-  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: 'start', percent: 0, startedAt: Date.now() }));
+  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: 'start', percent: 0, startedAt: Date.now(), createdAt: Date.now() /* [2026-08-30 19:45] 생성 소요시간 측정용(startedAt은 스텝마다 갱신됨) */ }));
 
   return new Response(null, { status: 302, headers: { Location: '/admin?genId=' + jobId + '&msg=' + encodeURIComponent(`생성 시작됨: ${topic} (진행률은 아래 목록에서 확인)`) } });
 }
