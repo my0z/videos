@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-31 07:05 (KST)
+ * 생성(마지막 작업): 2026-08-31 19:50 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -12,29 +12,22 @@
  * 자막: 문장 하나를 통째(내부 줄바꿈)로 이미지별 "비트"에 배정 + 비트마다 음성 조각 번호(segIndex)를 실어 보내
  *      relay.js가 세그먼트 실측 시각으로 타이밍을 맞춤(추정 없음). 위치/폰트/색은 영상당 하나씩 랜덤 고정.
  * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환(xfade)/컬러그레이딩/loudnorm/
- *            청크 분할 렌더링(5장씩)까지 relay.js가 처리, 이 워커는 1분 크론 + 실시간 폴링으로 완료 감지
+ *            청크 분할 렌더링(5장씩)까지 relay.js가 처리, 이 워커는 5분 크론 + 실시간 폴링으로 완료 감지
  * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(청크 업로드, 진행률 실시간 표시) + 숏츠 3개(도입/중간/결론, 세로 9:16, 각 ~57초, #Shorts)도 이어서 업로드,
  *        privacyStatus public. 실패해도 글은 유지하고 youtubeError만 기록(음성과 달리 발행을 막지 않음)
- * [2026-08-31 07:05] 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피).
- *   관리자 페이지가 열려있으면 1.5초마다 빠르게 진행되고, 페이지를 닫아도 1분 크론(scheduled)이 pollPendingGenJobs로
- *   같은 runGenerationStep을 대신 호출해 한 단계씩 이어서 진행함 — 더 이상 "탭을 보고 있어야만" 만들어지지 않음.
- *   다만 크론 주기가 느려서(1.5초 vs 1분) 탭 없이 완성되는 데는 몇십 분 걸릴 수 있음(1분마다 한 단계씩).
+ * 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피), 관리자 페이지가 열려있는 동안만 진행됨
  */
 
 const CF_ACCOUNT_ID = '709dcc6af36c8ee7b6d3d99e7a9fe422';
 const VEO_MODEL = 'veo-3.1-fast-generate-preview';
 const VIDEO_JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30분 넘게 안 끝나면 포기
-// [2026-08-31 07:05] 5분 → 1분: Cloudflare Cron 트리거의 최소 단위가 1분이라 이보다 더 못 줄임.
-// wrangler.toml의 crons 배열도 이 값과 반드시 똑같이 '* * * * *'로 맞춰야 실제로 1분마다 실행됨(둘이 안 맞으면
-// event.cron이 이 상수와 달라서 아래 scheduled()의 if문을 그냥 건너뜀 — 배포 후 크론 안 도는 흔한 원인).
-const VIDEO_POLL_CRON = '* * * * *'; // 이 크론이 실행되면 콘텐츠 발행 대신 영상 작업 폴링 + 생성 작업 진행만 함
+const VIDEO_POLL_CRON = '*/5 * * * *'; // 이 크론이 실행되면 콘텐츠 발행 대신 영상 작업 폴링만 함
 const CF_AI_GATEWAY = 'yzusb';
 const VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
 const SCENE_COUNT = 20; // 슬라이드쇼에 쓸 장면 이미지 개수 — 4분 분량 영상 기준 20장(장당 평균 12초 내외)
 // 나레이션 길이 안전 상한(공백 포함) — 글 생성 프롬프트가 "낭독 약 4분(1,700~2,000자)"을 목표로 쓰지만,
 // 모델이 초과해서 쓸 경우를 대비해 문장 경계에서 잘라 최대 5분대 중반을 넘지 않게 함(한국어 TTS ≈ 분당 400자).
-// [2026-08-31 07:29] 4분(1,700~2,000자) → 5분(2,000~2,500자) 목표로 상향 — 상한도 그만큼 여유있게 늘림.
-const NARRATION_MAX_CHARS = 3000;
+const NARRATION_MAX_CHARS = 2400;
 const CAPTION_STYLE_COUNT = 5; // 자막 "위치" 종류 개수 — 웹(CSS)과 mp4(relay.js drawtext) 둘 다 같은 인덱스 규칙을 씀
 // 자막 위치/폰트/색 전부 영상 하나당 하나씩만 랜덤 고정(비트마다 안 바뀜 — 계속 바뀌면 산만해서 전부 고정으로 변경).
 // font key는 relay.js가 실제로 서버에 설치해둔 폰트 파일과 매칭되는 키만 사용(웹/mp4 폰트 일치 보장).
@@ -157,9 +150,7 @@ export default {
       (async () => {
         console.log(`=== 크론 실행: ${new Date().toISOString()} (cron: ${event.cron}) ===`);
         if (event.cron === VIDEO_POLL_CRON) {
-          await checkRelayHealth(env); // 1분마다 relay 헬스 체크
-          await pollPendingGenJobs(env); // [2026-08-31 07:05] 탭이 안 열려있어도 생성이 이어지도록 한 단계씩 진행
-          await pollYoutubeQuotaRetries(env); // [2026-08-31] 유튜브 할당량 초과로 막혔던 업로드, 리셋 시각 지나면 자동 재시도
+          await checkRelayHealth(env); // [2026-08-31 00:07] 5분마다 relay 헬스 체크
           await pollPendingVideoJobs(env);
           await pollPendingRenderJobs(env, ctx);
         }
@@ -367,11 +358,11 @@ async function generateArticle(topic, newsResults, env) {
     const referenceText = newsResults
       .map((n, i) => `[참고자료 ${i + 1}] ${n.title}\n${n.description}`)
       .join('\n\n');
-    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 5분이 되도록 공백 포함 2,000~2,500자로 쓴다. 소제목 섹션은 5~7개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. **제목 중요**: 주제 키워드를 직접 쓰지 말고 반드시 "훅(hook)"을 삽입해 새로운 제목으로 만든다. 훅은 읽는 사람이 클릭하고 싶게 만드는 강력한 각도다(예: 주제 "냉방병 예방"→ 제목 "에어컨 바람에 떨어지는 면역력, 이렇게 지켜야"). 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어, 반드시 훅을 포함한 새로운 제목)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
     userPrompt = `주제: ${topic}\n\n${referenceText}`;
   } else {
     console.log('네이버 뉴스검색 결과 없음(또는 키 미설정), 참고자료 없이 작성');
-    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 5분이 되도록 공백 포함 2,000~2,500자로 쓴다. 소제목 섹션은 5~7개로 나눈다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
+    systemPrompt = '너는 한국어 생활뉴스 블로그 필자다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다. 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 분량: 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 4분이 되도록 공백 포함 1,700~2,000자로 쓴다. 소제목 섹션은 4~6개로 나눈다. **제목 중요**: 주제 키워드를 직접 쓰지 말고 반드시 "훅(hook)"을 삽입해 새로운 제목으로 만든다. 훅은 읽는 사람이 클릭하고 싶게 만드는 강력한 각도다(예: 주제 "냉방병 예방"→ 제목 "에어컨 바람에 떨어지는 면역력, 이렇게 지켜야"). 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어, 반드시 훅을 포함한 새로운 제목)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
     userPrompt = `주제: ${topic}`;
   }
 
@@ -1173,7 +1164,7 @@ async function uploadVideoToYoutube(post, videoBuffer, env, onProgress, opts = {
     });
     if (!initRes.ok) {
       const bodyText = await initRes.text();
-      return { ok: false, error: `업로드 세션 생성 실패: HTTP ${initRes.status} — ${bodyText.slice(0, 300)}`, quotaExceeded: isQuotaExceededBody(bodyText) };
+      return { ok: false, error: `업로드 세션 생성 실패: HTTP ${initRes.status} — ${bodyText.slice(0, 300)}` };
     }
     const uploadUrl = initRes.headers.get('Location');
     if (!uploadUrl) return { ok: false, error: '업로드 세션 응답에 Location 헤더 없음' };
@@ -1211,7 +1202,7 @@ async function uploadVideoToYoutube(post, videoBuffer, env, onProgress, opts = {
         continue;
       }
       const bodyText = await chunkRes.text().catch(() => '');
-      return { ok: false, error: `영상 업로드 실패: HTTP ${chunkRes.status} — ${bodyText.slice(0, 300)}`, quotaExceeded: isQuotaExceededBody(bodyText) };
+      return { ok: false, error: `영상 업로드 실패: HTTP ${chunkRes.status} — ${bodyText.slice(0, 300)}` };
     }
     if (!finalData || !finalData.id) return { ok: false, error: `업로드 응답에 video id 없음: ${JSON.stringify(finalData || {}).slice(0, 300)}` };
     return { ok: true, youtubeId: finalData.id, youtubeUrl: `https://youtu.be/${finalData.id}` };
@@ -1276,191 +1267,73 @@ async function checkRelayHealth(env) {
 }
 
 // mp4가 R2(env.MEDIA)에 올라간 직후 호출 — 그 자리에서 바로 바이트를 읽어 유튜브에 올리고 결과를 post에 반영.
-// [2026-08-31] 유튜브 일일 업로드 할당량(태평양 시간 자정 리셋) 초과를 다른 실패(네트워크 오류, 파일 문제 등)와
-// 구분해서 감지 — 이거여야 "내일 자동 재시도"가 의미 있음(다른 실패는 재시도해도 똑같이 실패할 뿐).
-function isQuotaExceededBody(bodyText) {
-  return /quotaExceeded|dailyLimitExceeded/i.test(bodyText || '');
-}
-
-// 유튜브 할당량은 매일 태평양 시간(America/Los_Angeles) 자정에 리셋됨 — 지금 시각 기준으로
-// "다음 자정 + 5분 여유"를 밀리초 타임스탬프로 계산. DST 전환일 근처엔 몇 분 오차 있을 수 있는데
-// 재시도 타이밍이라 치명적이지 않음(그 정도는 몇 분 일찍/늦게 재시도돼도 무방).
-function nextYoutubeQuotaResetMs() {
-  const now = new Date();
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
-  }).formatToParts(now);
-  const get = (t) => parseInt(parts.find((p) => p.type === t).value, 10);
-  const y = get('year'), mo = get('month'), d = get('day'), h = get('hour'), mi = get('minute'), s = get('second');
-  // "지금 태평양시간 벽시계"를 UTC로 착각하고 만든 값과 실제 now의 차이 = 현재 UTC-PT 오프셋(ms)
-  const offsetMs = now.getTime() - Date.UTC(y, mo - 1, d, h, mi, s);
-  const nextMidnightAsUtc = Date.UTC(y, mo - 1, d + 1, 0, 0, 0);
-  return nextMidnightAsUtc + offsetMs + 5 * 60 * 1000; // 5분 여유
-}
-
-// [2026-08-31] 할당량 초과로 막힌 영상들을 "순서가 있는 큐"로 관리 — 개별 재시도 시각을 각자 따로 예약하던
-// 방식(ytRetry:슬러그) 대신, 하나의 KV 키에 순번이 있는 목록을 유지함. 막힌 순서대로 쌓이고, 리셋 시각이
-// 지나면 크론이 맨 앞부터 하나씩 차례로 다시 시도 — 본편이든 숏츠든 같은 큐로 관리.
-const YT_QUEUE_KEY = 'ytUploadQueue';
-async function getYoutubeQueue(env) {
-  const raw = await env.POSTS.get(YT_QUEUE_KEY);
-  if (!raw) return { items: [], nextAttemptAt: null };
-  try {
-    const q = JSON.parse(raw);
-    return { items: Array.isArray(q.items) ? q.items : [], nextAttemptAt: q.nextAttemptAt || null };
-  } catch {
-    return { items: [], nextAttemptAt: null };
-  }
-}
-async function saveYoutubeQueue(queue, env) {
-  await env.POSTS.put(YT_QUEUE_KEY, JSON.stringify(queue)).catch(() => {});
-}
-// 이 슬러그가 큐에서 몇 번째인지(1부터) — 없으면 null. admin 화면에 순번 표시용.
-async function getYoutubeQueuePosition(slug, env) {
-  const queue = await getYoutubeQueue(env);
-  const idx = queue.items.findIndex((it) => it.slug === slug);
-  return idx === -1 ? null : idx + 1;
-}
-// 할당량 초과로 여전히 막혀있으면 큐에 남겨두고(이미 있으면 순번 그대로, 없으면 맨 뒤에 새로 추가) 다음
-// 리셋 시각을 갱신 — 성공했거나 할당량과 무관한 실패로 확정되면 큐에서 뺌(재시도해도 소용없으므로).
-async function updateYoutubeQueue(slug, stillBlocked, env) {
-  const queue = await getYoutubeQueue(env);
-  const idx = queue.items.findIndex((it) => it.slug === slug);
-  if (stillBlocked) {
-    if (idx === -1) queue.items.push({ slug, addedAt: Date.now() }); // 새로 막힌 것 — 맨 뒤에 추가(도착 순서 = 순번)
-    queue.nextAttemptAt = nextYoutubeQuotaResetMs();
-    await saveYoutubeQueue(queue, env);
-    const whenText = new Date(queue.nextAttemptAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
-    console.log(`[youtube:${slug}] 할당량 초과 — 대기열 ${idx === -1 ? queue.items.length : idx + 1}번째, ${whenText} 이후 재시도`);
-    return `오늘 유튜브 업로드 할당량을 다 써서 실패했어요. 대기열 ${idx === -1 ? queue.items.length : idx + 1}번째로 등록됐고, ${whenText} 이후 차례가 되면 자동으로 재시도됩니다.`;
-  }
-  if (idx !== -1) {
-    queue.items.splice(idx, 1);
-    await saveYoutubeQueue(queue, env);
-  }
-  return null;
-}
-
-// 1분 크론이 호출 — 리셋 시각이 지났으면 큐 맨 앞의 항목 "딱 하나만" 다시 시도(한 틱에 여러 건 몰아서
-// 시도하면 할당량 재확인 없이 연달아 실패만 반복할 수 있어서, 한 번에 하나씩 순서대로 처리함).
-// 결과에 따라 triggerYoutubeUpload 내부에서 큐 순번을 알아서 갱신(성공/영구실패=제거, 계속 막힘=유지+다음날 예약).
-async function pollYoutubeQuotaRetries(env) {
-  const queue = await getYoutubeQueue(env);
-  if (!queue.items.length) return;
-  if (queue.nextAttemptAt && Date.now() < queue.nextAttemptAt) return; // 아직 리셋 시각 안 됨
-  // 맨 앞부터 훑되, 글 자체가 삭제됐거나 mp4가 없어진 무효 항목은 건너뛰지 말고 즉시 큐에서 제거하고 다음 항목으로.
-  while (queue.items.length) {
-    const front = queue.items[0];
-    const postRaw = await env.POSTS.get(`post:${front.slug}`);
-    if (!postRaw) { queue.items.shift(); await saveYoutubeQueue(queue, env); continue; }
-    const post = JSON.parse(postRaw);
-    if (!post.video) { queue.items.shift(); await saveYoutubeQueue(queue, env); continue; }
-    console.log(`[youtube-retry] 대기열 1번째(${front.slug}) 재업로드 시도`);
-    await triggerYoutubeUpload(front.slug, post.video, env); // 성공/실패 판정 후 큐 갱신은 내부에서 처리
-    return; // 한 틱에 하나만 — 다음 시도는 다음 분 크론에서
-  }
-}
-
 async function triggerYoutubeUpload(slug, r2Key, env) {
   const uploadStartMs = Date.now(); // [2026-08-30 19:45] 업로드 소요시간 측정(관리자 표시용)
   try {
-    const postRaw0 = await env.POSTS.get(`post:${slug}`);
-    if (!postRaw0) return;
-    const post0 = JSON.parse(postRaw0);
-
-    // [2026-08-31] 큐 재시도로 다시 불렸을 때, 본편이 이전 시도에서 이미 성공했다면 또 업로드하면 안 됨
-    // (중복 업로드 방지) — 이미 youtubeUrl이 있으면 본편은 건너뛰고 결과를 그대로 재사용.
-    let result;
-    if (post0.youtubeUrl) {
-      result = { ok: true, youtubeId: post0.youtubeId, youtubeUrl: post0.youtubeUrl };
-    } else {
-      const videoObj = await env.MEDIA.get(r2Key);
-      if (!videoObj) {
-        console.log(`[youtube:${slug}] mp4를 MEDIA에서 못 찾음(${r2Key}) — 업로드 스킵`);
-        return;
-      }
-      const videoBuffer = await videoObj.arrayBuffer();
-      result = await uploadVideoToYoutube(post0, videoBuffer, env, (percent) => updateYoutubeUploadPercent(slug, percent, env));
+    const videoObj = await env.MEDIA.get(r2Key);
+    if (!videoObj) {
+      console.log(`[youtube:${slug}] mp4를 MEDIA에서 못 찾음(${r2Key}) — 업로드 스킵`);
+      return;
     }
+    const videoBuffer = await videoObj.arrayBuffer();
+    const postRaw = await env.POSTS.get(`post:${slug}`);
+    if (!postRaw) return;
+    const post = JSON.parse(postRaw);
+    const result = await uploadVideoToYoutube(post, videoBuffer, env, (percent) => updateYoutubeUploadPercent(slug, percent, env));
     const freshRaw = await env.POSTS.get(`post:${slug}`); // 업로드 도중 post가 또 바뀌었을 수 있으니 최신본에 병합
     if (!freshRaw) return;
     const freshPost = JSON.parse(freshRaw);
     freshPost.youtubeUploadPercent = null; // 끝났으니 진행률 표시는 지우고 youtubeUrl/youtubeError로 결과만 남김
-    if (!post0.youtubeUrl) freshPost.youtubeUploadSec = Math.round((Date.now() - uploadStartMs) / 1000); // 이번에 실제로 업로드했을 때만 갱신
-    let mainStillBlocked = false;
+    freshPost.youtubeUploadSec = Math.round((Date.now() - uploadStartMs) / 1000); // [2026-08-30 19:45] mp4 읽기+업로드 전체 소요
     if (result.ok) {
       freshPost.youtubeId = result.youtubeId;
       freshPost.youtubeUrl = result.youtubeUrl;
       freshPost.youtubeError = null;
-      freshPost.youtubeQuotaExceeded = false;
-      if (!post0.youtubeUrl) console.log(`[youtube:${slug}] 본편 업로드 성공: ${result.youtubeUrl}`);
+      console.log(`[youtube:${slug}] 업로드 성공: ${result.youtubeUrl}`);
     } else {
-      mainStillBlocked = !!result.quotaExceeded;
-      freshPost.youtubeErrorRaw = result.error;
-      freshPost.youtubeQuotaExceeded = !!result.quotaExceeded;
-      console.log(`[youtube:${slug}] 본편 업로드 실패${result.quotaExceeded ? '(할당량 초과)' : ''}: ${result.error}`);
-      if (!result.quotaExceeded) freshPost.youtubeError = result.error; // 할당량 문구는 아래서 큐 상태 보고 통일해서 채움
+      freshPost.youtubeError = result.error;
+      console.log(`[youtube:${slug}] 업로드 실패: ${result.error}`);
     }
 
-    // [2026-08-30 23:56] 숏츠 업로드 — 본편이 아직 막혀있으면(이번에 막혔든, 전부터 막혀있었든) 숏츠도 어차피
-    // 막힐 게 뻔하니 시도 자체를 건너뜀. 본편이 이미 됐으면(이전 성공분 포함) 숏츠 중 "아직 안 된 것만" 시도 —
-    // 이미 성공한 숏츠를 또 올리는 중복 업로드를 막기 위함(큐 재시도 시 특히 중요).
-    const allShortKeys = Array.isArray(freshPost.videoShorts) && freshPost.videoShorts.length
+    // [2026-08-30 23:56] 숏츠(도입/중간/결론 최대 3개)를 본편과 동시 업로드 — Promise.all로 병렬 처리, 개별 실패는 나머지에 영향 없음.
+    // 유튜브 쿼터 참고: 업로드 1건당 1,600유닛이라 본편+숏츠3 = 6,400유닛(기본 일일 10,000 → 하루 1편 페이스).
+    const shortsToUpload = Array.isArray(freshPost.videoShorts) && freshPost.videoShorts.length
       ? freshPost.videoShorts : (freshPost.videoShort ? [freshPost.videoShort] : []);
-    const prevShortsUrls = Array.isArray(freshPost.youtubeShortsUrls) ? freshPost.youtubeShortsUrls : [];
-    const mainReady = !!freshPost.youtubeUrl;
-    let anyShortStillBlocked = false;
-    freshPost.youtubeShortsSkippedReason = (!mainReady) ? '본편이 아직 할당량 초과로 막혀있어서 숏츠는 시도하지 않음(본편 성공 시 함께 시도됨)' : null;
-
-    if (mainReady && allShortKeys.length) {
-      const nextUrls = new Array(allShortKeys.length).fill(null);
-      const nextErrors = new Array(allShortKeys.length).fill(null);
-      const toAttempt = [];
-      allShortKeys.forEach((k, si) => {
-        if (prevShortsUrls[si]) { nextUrls[si] = prevShortsUrls[si]; return; } // 이미 성공 — 재시도 안 함
-        toAttempt.push(si);
-      });
-      if (toAttempt.length) {
-        const results = await Promise.all(toAttempt.map(async (si) => {
-          const shortKey = allShortKeys[si];
-          try {
-            const shortObj = await env.MEDIA.get(shortKey);
-            if (!shortObj) return { index: si, ok: false, error: 'R2에서 숏츠 파일을 못 찾음', quotaExceeded: false };
-            const shortBuffer = await shortObj.arrayBuffer();
-            const shortResult = await uploadVideoToYoutube(freshPost, shortBuffer, env, null, { shorts: true, partNo: si + 1, partTotal: allShortKeys.length });
-            if (shortResult.ok) {
-              console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 성공: ${shortResult.youtubeUrl}`);
-              return { index: si, ok: true, url: shortResult.youtubeUrl };
-            }
-            console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 실패${shortResult.quotaExceeded ? '(할당량 초과)' : ''}: ${shortResult.error}`);
-            return { index: si, ok: false, error: shortResult.error, quotaExceeded: !!shortResult.quotaExceeded };
-          } catch (e) {
-            console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 예외: ${e.message}`);
-            return { index: si, ok: false, error: e.message, quotaExceeded: false };
-          }
-        }));
-        for (const r of results) {
-          if (r.ok) {
-            nextUrls[r.index] = r.url;
+    if (shortsToUpload.length) {
+      freshPost.youtubeShortsUrls = [];
+      const shortUploadPromises = shortsToUpload.map(async (shortKey, si) => {
+        try {
+          const shortObj = await env.MEDIA.get(shortKey);
+          if (!shortObj) return null;
+          const shortBuffer = await shortObj.arrayBuffer();
+          const shortResult = await uploadVideoToYoutube(freshPost, shortBuffer, env, null, { shorts: true, partNo: si + 1, partTotal: shortsToUpload.length });
+          if (shortResult.ok) {
+            console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 성공: ${shortResult.youtubeUrl}`);
+            return { ok: true, index: si, url: shortResult.youtubeUrl, id: shortResult.youtubeId };
           } else {
-            nextErrors[r.index] = r.quotaExceeded ? '할당량 초과로 실패 — 대기열에서 차례가 되면 자동 재시도' : r.error;
-            if (r.quotaExceeded) anyShortStillBlocked = true;
+            console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 실패: ${shortResult.error}`);
+            return { ok: false, index: si, error: shortResult.error };
           }
+        } catch (e) {
+          console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 예외: ${e.message}`);
+          return { ok: false, index: si, error: e.message };
+        }
+      });
+      const shortResults = await Promise.all(shortUploadPromises);
+      for (const result of shortResults) {
+        if (!result) continue;
+        if (result.ok) {
+          freshPost.youtubeShortsUrls[result.index] = result.url;
+          if (result.index === 0) {
+            freshPost.youtubeShortsId = result.id;
+            freshPost.youtubeShortsUrl = result.url;
+            freshPost.youtubeShortsError = null;
+          }
+        } else {
+          if (result.index === 0) freshPost.youtubeShortsError = result.error;
         }
       }
-      freshPost.youtubeShortsUrls = nextUrls;
-      freshPost.youtubeShortsErrors = nextErrors;
-      freshPost.youtubeShortsUrl = nextUrls[0] || null; // 하위호환
-      freshPost.youtubeShortsError = nextErrors[0] || null;
     }
-
-    // [2026-08-31] 본편이든 숏츠든 하나라도 여전히 할당량에 막혀있으면 큐에 유지(순번 부여)하고 다음 리셋
-    // 시각을 다시 예약 — 전부 끝났거나(성공) 할당량과 무관한 확정 실패면 큐에서 뺌.
-    const stillBlocked = mainStillBlocked || anyShortStillBlocked;
-    const queueMsg = await updateYoutubeQueue(slug, stillBlocked, env);
-    if (mainStillBlocked) freshPost.youtubeError = queueMsg; // 본편이 막힌 경우 안내 문구를 화면에 노출
-
     await env.POSTS.put(`post:${slug}`, JSON.stringify(freshPost));
   } catch (e) {
     console.log(`[youtube:${slug}] 업로드 처리 중 예외: ${e.message}`);
@@ -1576,40 +1449,6 @@ async function pollPendingRenderJobs(env, ctx) {
     }
 
     await finalizeRenderDone(job, keyInfo.name, env, ctx);
-  }
-}
-
-// [2026-08-31 07:05] 관리자 페이지(브라우저)가 안 열려있어도 생성이 진행되게 하는 크론 폴백 —
-// runGenerationStep(handleGenerateStep과 완전히 같은 함수)을 그대로 재사용해서 대기 중인 genJob마다
-// 딱 한 단계씩만 진행함. 실패 처리 규칙도 handleGenerateStep과 동일(에러 나면 job.failed=true로 표시해서
-// admin 페이지의 3분 정리 로직이 그대로 정리해줌 — 이 함수는 failed:true인 작업은 건드리지 않음).
-async function pollPendingGenJobs(env) {
-  const list = await env.POSTS.list({ prefix: 'genJob:' });
-  if (!list.keys.length) {
-    console.log('대기 중인 생성 작업 없음.');
-    return;
-  }
-  console.log(`대기 중인 생성 작업 ${list.keys.length}건 확인, 각각 한 단계씩 진행.`);
-
-  for (const keyInfo of list.keys) {
-    const raw = await env.POSTS.get(keyInfo.name);
-    if (!raw) continue;
-    let job = JSON.parse(raw);
-    if (job.failed) continue; // 이미 실패로 끝난 건 admin 페이지의 정리 타이머가 알아서 지움
-
-    try {
-      job = await runGenerationStep(job, env);
-      if (job.stage === 'done') {
-        await env.POSTS.delete(keyInfo.name);
-        console.log(`[${keyInfo.name}] 크론이 생성 완료시킴: ${job.slug}`);
-        continue;
-      }
-      job.startedAt = Date.now(); // 마지막 갱신 시각(admin 페이지의 "멈춤" 판정과 공유)
-      await env.POSTS.put(keyInfo.name, JSON.stringify(job));
-    } catch (e) {
-      await env.POSTS.put(keyInfo.name, JSON.stringify({ ...job, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() })).catch(() => {});
-      console.log(`[${keyInfo.name}] 크론 진행 중 실패: ${e.message}`);
-    }
   }
 }
 
@@ -1963,7 +1802,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
   if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && images.length) {
     const outputKey = `${slug}.mp4`;
-    const shortKeys = [`${slug}-short.mp4`]; // [2026-08-31 07:29] 3개→1개: 유튜브 일일 업로드 할당량(10,000유닛, 건당 1,600) 절약 위해 축소(사용자 요청)
+    const shortKeys = [`${slug}-short.mp4`, `${slug}-short2.mp4`, `${slug}-short3.mp4`]; // [2026-08-30 22:55] 숏츠 3개
     const render = await startRelayRender(images, audioKey, audioSegmentKeys, outputKey, shortKeys, captionWeights, captionBeats, captionFontKey, captionColor, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
@@ -2191,12 +2030,10 @@ async function renderPostPage(env, slug) {
   // [2026-08-30 22:20] 스레드 공유 링크 — 홍보문+글 링크가 미리 채워진 스레드 작성창을 엶
   const threadsShareHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(buildThreadsCaption(p))}`; // [2026-08-30 23:31] 예쁜 형식 공용 빌더 사용
   const youtubeStatusText = p.youtubeUrl
-    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>${(p.youtubeShortsUrls && p.youtubeShortsUrls.length) ? p.youtubeShortsUrls.map((u, si) => u ? ` · <a href="${escapeHtml(u)}" target="_blank" rel="noopener">🩳${si + 1}</a>` : ` · ⚠️ 숏츠${si + 1}실패`).join('') : p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank" rel="noopener">🩳 숏츠</a>` : ''} · <a href="${escapeHtml(threadsShareHref)}" target="_blank" rel="noopener">🧵 스레드 공유</a>`
-    : p.youtubeQuotaExceeded
-      ? `· ⏳ ${escapeHtml((p.youtubeError || '').slice(0, 200))}` // [2026-08-31] 할당량 초과 — 자동 재시도 예정이라는 게 명확히 보이게(⚠️ 대신 ⏳)
-      : p.youtubeError
-        ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 200))})`
-        : `· 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}`;
+    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>${(p.youtubeShortsUrls && p.youtubeShortsUrls.length) ? p.youtubeShortsUrls.map((u, si) => ` · <a href="${escapeHtml(u)}" target="_blank" rel="noopener">🩳${si + 1}</a>`).join('') : p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank" rel="noopener">🩳 숏츠</a>` : ''} · <a href="${escapeHtml(threadsShareHref)}" target="_blank" rel="noopener">🧵 스레드 공유</a>`
+    : p.youtubeError
+      ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 200))})`
+      : `· 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}`;
   const veoVideoBlock = p.video
     ? `<div style="margin:20px 0;">
         <video controls preload="metadata" style="width:100%;border-radius:10px;background:#000;" src="/media/${p.video}"></video>
@@ -2222,8 +2059,7 @@ async function renderPostPage(env, slug) {
               return;
             }
             if (data.youtubeError) {
-              // [2026-08-31] 할당량 초과면 ⏳(재시도 예정), 그 외 실패면 ⚠️로 구분 — 헷갈리지 않게
-              el.textContent = '· ' + (data.youtubeQuotaExceeded ? '⏳ ' : '⚠️ 유튜브 업로드 실패(') + String(data.youtubeError).slice(0, 200) + (data.youtubeQuotaExceeded ? '' : ')');
+              el.textContent = '· ⚠️ 유튜브 업로드 실패(' + String(data.youtubeError).slice(0, 200) + ')';
               if (timer) clearInterval(timer);
               return;
             }
@@ -2277,9 +2113,6 @@ async function renderAdminPage(env, requestUrl) {
   const pendingVeoSlugs = new Set(pendingVideoJobs.keys.map((k) => k.name.split(':')[1]));
   const pendingRenderJobs = await env.POSTS.list({ prefix: 'renderJob:' });
   const pendingRenderSlugs = new Set(pendingRenderJobs.keys.map((k) => k.name.split(':')[1]));
-  // [2026-08-31] 유튜브 할당량 대기열 — 슬러그별 순번(1부터)을 미리 맵으로 만들어둠(목록 렌더링 중 매번 KV 조회하지 않도록)
-  const ytQueue = await getYoutubeQueue(env);
-  const ytQueuePos = new Map(ytQueue.items.map((it, i) => [it.slug, i + 1]));
 
   // 생성 중인(글+이미지+음성 아직 안 끝난) 작업들 — 완료되면 post로 바뀌면서 이 목록에서 빠짐
   const pendingGenJobsRaw = await env.POSTS.list({ prefix: 'genJob:' });
@@ -2369,30 +2202,7 @@ async function renderAdminPage(env, requestUrl) {
               ...((p.videoShorts && p.videoShorts.length ? p.videoShorts : (p.videoShort ? [p.videoShort] : [])).map((k, si) => `<a href="/media/${escapeHtml(k)}" download>⬇️ 인스타${si + 1}</a>`)),
               `<button type="button" class="copy-cap" data-cap="${escapeHtml(shareCaption)}" style="font-size:11px;padding:2px 8px;">📋 캡션</button>`,
             ].filter(Boolean).join(' · ');
-            // [2026-08-31] 본편 결과 — 할당량 초과일 땐 아이콘을 따로 써서(⏳) 다른 실패(❌)랑 눈으로 바로 구분되고, 대기열 순번도 보여줌
-            const qPos = ytQueuePos.get(p.slug);
-            const mainLine = p.youtubeUrl
-              ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 본편</a>${p.youtubeUploadSec ? ` (업로드 ${fmtDurSec(p.youtubeUploadSec)})` : ''}`
-              : p.youtubeQuotaExceeded
-                ? `· ⏳ 본편(할당량 초과 · 대기열 ${qPos || '?'}번째, 자동 재시도 예약됨)`
-                : `· ❌ 본편 실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`;
-            // 숏츠 — 성공/실패를 항목별로 각각 보여줌(예전엔 첫 번째 것만 실패 이유가 남아서 헷갈렸음)
-            const shortsUrls = p.youtubeShortsUrls && p.youtubeShortsUrls.length ? p.youtubeShortsUrls : (p.youtubeShortsUrl ? [p.youtubeShortsUrl] : []);
-            const shortsErrors = p.youtubeShortsErrors && p.youtubeShortsErrors.length ? p.youtubeShortsErrors : (p.youtubeShortsError ? [p.youtubeShortsError] : []);
-            const shortsCount = Math.max(shortsUrls.length, shortsErrors.length);
-            let shortsLine = '';
-            if (p.youtubeShortsSkippedReason) {
-              shortsLine = ` · ⏳ 숏츠(${escapeHtml(p.youtubeShortsSkippedReason)})`;
-            } else if (shortsCount) {
-              shortsLine = Array.from({ length: shortsCount }, (_, si) => {
-                if (shortsUrls[si]) return ` · <a href="${escapeHtml(shortsUrls[si])}" target="_blank">🩳${si + 1}</a>`;
-                const errText = shortsErrors[si] || '';
-                return errText.includes('할당량')
-                  ? ` · ⏳ 숏츠${si + 1}(대기열 ${qPos || '?'}번째)`
-                  : ` · ❌ 숏츠${si + 1}실패(${escapeHtml(errText.slice(0, 80))})`;
-              }).join('');
-            }
-            return `🎬 mp4 완료 ${mainLine}${shortsLine}<br>${shareBits}`;
+            return `🎬 mp4 완료${p.youtubeUrl ? ` · <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 유튜브</a>${p.youtubeUploadSec ? ` (업로드 ${fmtDurSec(p.youtubeUploadSec)})` : ''}` : ` · ⚠️ 유튜브실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`}${(p.youtubeShortsUrls && p.youtubeShortsUrls.length) ? p.youtubeShortsUrls.map((u, si) => ` · <a href="${escapeHtml(u)}" target="_blank">🩳${si + 1}</a>`).join('') : p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank">🩳 숏츠</a>` : p.youtubeShortsError ? ' · ⚠️ 숏츠실패' : ''}<br>${shareBits}`;
           })())
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
@@ -2476,29 +2286,14 @@ async function renderAdminPage(env, requestUrl) {
                     el.appendChild(document.createTextNode(' (업로드 ' + (us >= 60 ? Math.floor(us / 60) + '분 ' + (us % 60) + '초' : us + '초') + ')'));
                   }
                   var shortsUrls = data.youtubeShortsUrls || (data.youtubeShortsUrl ? [data.youtubeShortsUrl] : []); // [2026-08-30 22:55] 숏츠 여러 개
-                  var shortsErrors = data.youtubeShortsErrors || [];
-                  var shortsCount = Math.max(shortsUrls.length, shortsErrors.length);
-                  var shortsStillQueued = false;
-                  for (var si = 0; si < shortsCount; si++) {
+                  shortsUrls.forEach(function(u, si){
                     el.appendChild(document.createTextNode(' · '));
-                    if (shortsUrls[si]) {
-                      var sa = document.createElement('a'); sa.href = shortsUrls[si]; sa.target = '_blank'; sa.textContent = '🩳' + (si + 1);
-                      el.appendChild(sa);
-                    } else if (shortsErrors[si] && shortsErrors[si].indexOf('할당량') !== -1) {
-                      shortsStillQueued = true;
-                      el.appendChild(document.createTextNode('⏳ 숏츠' + (si + 1) + '(대기열 ' + (data.youtubeQueuePosition || '?') + '번째)'));
-                    } else {
-                      el.appendChild(document.createTextNode('❌ 숏츠' + (si + 1) + '실패' + (shortsErrors[si] ? '(' + String(shortsErrors[si]).slice(0, 80) + ')' : '')));
-                    }
-                  }
-                  if (data.youtubeShortsSkippedReason) {
-                    shortsStillQueued = true;
-                    el.appendChild(document.createTextNode(' · ⏳ 숏츠(' + data.youtubeShortsSkippedReason + ')'));
-                  }
-                  el.dataset.terminal = shortsStillQueued ? '0' : '1'; // 숏츠가 아직 대기열에 있으면 계속 폴링해서 나중에 성공하면 갱신되게 함
+                    var sa = document.createElement('a'); sa.href = u; sa.target = '_blank'; sa.textContent = '🩳' + (si + 1);
+                    el.appendChild(sa);
+                  });
+                  el.dataset.terminal = '1';
                 } else if (data.youtubeError) {
-                  // [2026-08-31] 할당량 초과면 ⏳(자동 재시도 예정)로, 그 외 실패면 ❌로 구분
-                  el.textContent = '🎬 mp4 완료 · ' + (data.youtubeQuotaExceeded ? ('⏳ 본편(할당량 초과 · 대기열 ' + (data.youtubeQueuePosition || '?') + '번째)') : ('❌ 본편실패(' + String(data.youtubeError).slice(0, 150) + ')'));
+                  el.textContent = '🎬 mp4 완료 · ⚠️ 유튜브실패(' + String(data.youtubeError).slice(0, 150) + ')';
                   el.dataset.terminal = '1';
                 } else {
                   var pct = (typeof data.youtubeUploadPercent === 'number') ? data.youtubeUploadPercent : null;
@@ -2590,7 +2385,7 @@ async function renderAdminPage(env, requestUrl) {
 
   const body = `${siteHeader()}<div class="wrap" style="padding:32px 0;">
     <h2>관리자 (총 ${idx.length}건)</h2>
-    <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아와요. 이 페이지를 열어두면 1.5초마다 빠르게 진행되고, 닫아도 1분마다 크론이 대신 이어서 진행해요(다만 느려요).</p>
+    <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아오고, 진행률은 아래에서 실시간으로 확인할 수 있어요.</p>
     <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;" onsubmit="this.querySelector('button').disabled=true; this.querySelector('button').textContent='생성 중...';">
       <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;" required>
       <button type="submit">글+슬라이드쇼 생성</button>
@@ -2758,8 +2553,8 @@ async function runGenerationStep(job, env) {
   if (job.stage === 'render') {
     if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && job.images.length) {
       const outputKey = `${job.slug}.mp4`;
-      // [2026-08-31 07:29] 3개→1개: 유튜브 일일 업로드 할당량(10,000유닛, 건당 1,600) 절약 위해 축소(사용자 요청)
-      const shortKeys = [`${job.slug}-short.mp4`];
+      // [2026-08-30 22:55] 숏츠 3개(도입/중간/결론) — 노출 시도 3배(본편이 짧으면 릴레이가 겹치는 구간은 알아서 줄임)
+      const shortKeys = [`${job.slug}-short.mp4`, `${job.slug}-short2.mp4`, `${job.slug}-short3.mp4`];
       const render = await startRelayRender(job.images, job.audioKey, job.audioSegmentKeys, outputKey, shortKeys, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env);
       if (render.ok) {
         await env.POSTS.put(`renderJob:${job.slug}`, JSON.stringify({
@@ -2874,14 +2669,10 @@ async function handleRenderProgress(request, env, ctx) {
     // 릴레이가 done/failed라고 하면 여기서 바로 post에 반영 — 5분 크론까지 기다리게 하지 않음
     let youtubeUrl = null;
     let youtubeError = null;
-    let youtubeQuotaExceeded = false;
     let youtubeUploadPercent = null;
     let youtubeUploadSec = null;
     let youtubeShortsUrl = null;
     let youtubeShortsUrls = null;
-    let youtubeShortsErrors = null;
-    let youtubeShortsSkippedReason = null;
-    let youtubeQueuePosition = null;
     if (data.status === 'done') {
       await finalizeRenderDone(job, `renderJob:${slug}`, env, ctx);
       // finalizeRenderDone 안의 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행돼서 이 시점엔 보통 아직 안 끝남 —
@@ -2890,20 +2681,14 @@ async function handleRenderProgress(request, env, ctx) {
       const freshPost = freshPostRaw ? JSON.parse(freshPostRaw) : null;
       youtubeUrl = freshPost?.youtubeUrl || null;
       youtubeError = freshPost?.youtubeError || null;
-      youtubeQuotaExceeded = !!freshPost?.youtubeQuotaExceeded;
       youtubeUploadPercent = freshPost?.youtubeUploadPercent ?? null;
       youtubeUploadSec = freshPost?.youtubeUploadSec ?? null;
       youtubeShortsUrl = freshPost?.youtubeShortsUrl || null;
       youtubeShortsUrls = freshPost?.youtubeShortsUrls || null;
-      youtubeShortsErrors = freshPost?.youtubeShortsErrors || null;
-      youtubeShortsSkippedReason = freshPost?.youtubeShortsSkippedReason || null;
-      if (youtubeQuotaExceeded || (youtubeShortsErrors || []).some((e) => e && e.includes('할당량'))) {
-        youtubeQueuePosition = await getYoutubeQueuePosition(slug, env); // [2026-08-31] 대기열 순번
-      }
     } else if (data.status === 'failed') {
       await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
     }
-    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, youtubeUrl, youtubeError, youtubeQuotaExceeded, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl, youtubeShortsUrls, youtubeShortsErrors, youtubeShortsSkippedReason, youtubeQueuePosition }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, youtubeUrl, youtubeError, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl, youtubeShortsUrls }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
   }
