@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-08-31 19:50 (KST)
+ * 생성(마지막 작업): 2026-08-31 20:22 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2159,13 +2159,23 @@ async function renderAdminPage(env, requestUrl) {
     </td>
   </tr>`).join('');
 
-  const genJobRows = genJobs.map((j) => {
+  const genJobRows = genJobs.map((j, idx) => {
     const isStale = !j.failed && (Date.now() - (j.startedAt || 0) > STALE_MS);
+    const queueNum = idx + 1; // [2026-08-31 19:50] 큐 순서 번호
+    // [2026-08-31 20:21] 작업 완성 시간 표시 — completedAt이 있으면(done/failed 후) 언제 완료됐는지 보여줌
+    const fmtCompletedTime = (completedAt) => {
+      if (!completedAt) return '';
+      const now = Date.now();
+      const elapsed = Math.floor((now - completedAt) / 1000);
+      if (elapsed < 60) return `완료 ${elapsed}초 전`;
+      if (elapsed < 3600) return `완료 ${Math.floor(elapsed / 60)}분 전`;
+      return `완료 ${new Date(completedAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit' })}`;
+    };
     const label = j.failed
-      ? `❌ 생성 실패: ${escapeHtml(truncErrText(j.error))}` // [2026-08-30 21:17] 앞+뒤 표시로 변경(마지막 폴백 결과까지 보이게)
+      ? `❌ 생성 실패: ${escapeHtml(truncErrText(j.error))} ${fmtCompletedTime(j.startedAt)}` // [2026-08-31 20:21] 실패 시간도 표시
       : isStale
         ? `⚠️ 응답 없음(멈춤) — ${escapeHtml(j.topic)} · 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (10분 지나면 자동으로 정리돼요)`
-        : `${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
+        : `#${queueNum} ${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
     return `<tr>
     <td colspan="7" class="mono" style="background:#FEE2E2;color:#B91C1C;font-weight:700;border-left:4px solid #DC2626;">
       <span class="gen-progress" data-id="${j.id}" data-stale="${isStale ? '1' : '0'}">${label}</span>
