@@ -145,6 +145,16 @@ export default {
         return new Response(null, { status: 302, headers: { Location: '/admin' } });
       }
       if (path === '/admin/render-progress') return await handleRenderProgress(request, env, ctx);
+      // [2026-08-31] relay VM이 20초마다 이걸 호출 — 1분 Cloudflare Cron 대신(또는 같이) 훨씬 자주
+      // 폴링 로직을 실행시켜서 탭 안 열어놔도 생성/렌더/유튜브 재시도가 빠르게 진행되게 함.
+      // x-relay-secret으로 인증(기존 RELAY_SECRET 재사용, 별도 시크릿 안 만듦).
+      if (path === '/admin/cron-tick' && request.method === 'POST') {
+        if (!env.RELAY_SECRET || request.headers.get('x-relay-secret') !== env.RELAY_SECRET) {
+          return new Response('unauthorized', { status: 401 });
+        }
+        await runVideoPollTick(env, ctx);
+        return new Response(JSON.stringify({ ok: true, at: new Date().toISOString() }), { headers: { 'Content-Type': 'application/json' } });
+      }
       if (path === '/admin/generate-step' && request.method === 'POST') return await handleGenerateStep(request, env);
       if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
       const rootSlugMatch = path.match(/^\/([^\/]+)$/);
@@ -159,16 +169,22 @@ export default {
       (async () => {
         console.log(`=== 크론 실행: ${new Date().toISOString()} (cron: ${event.cron}) ===`);
         if (event.cron === VIDEO_POLL_CRON) {
-          await checkRelayHealth(env); // 1분마다 relay 헬스 체크
-          await pollPendingGenJobs(env); // [2026-08-31 07:05] 탭이 안 열려있어도 생성이 이어지도록 한 단계씩 진행
-          await pollYoutubeQuotaRetries(env); // [2026-08-31] 유튜브 할당량 초과로 막혔던 업로드, 리셋 시각 지나면 자동 재시도
-          await pollPendingVideoJobs(env);
-          await pollPendingRenderJobs(env, ctx);
+          await runVideoPollTick(env, ctx);
         }
       })()
     );
   },
 };
+
+// [2026-08-31] 1분 Cloudflare Cron과, relay VM에서 5초마다 호출하는 /admin/cron-tick 둘 다 이 함수를 씀 —
+// 로직 하나로 통일해서 두 경로가 어긋나지 않게 함.
+async function runVideoPollTick(env, ctx) {
+  await checkRelayHealth(env);
+  await pollPendingGenJobs(env); // [2026-08-31 07:05] 탭이 안 열려있어도 생성이 이어지도록 한 단계씩 진행
+  await pollYoutubeQuotaRetries(env); // [2026-08-31] 유튜브 할당량 초과로 막혔던 업로드, 리셋 시각 지나면 자동 재시도
+  await pollPendingVideoJobs(env);
+  await pollPendingRenderJobs(env, ctx);
+}
 
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
