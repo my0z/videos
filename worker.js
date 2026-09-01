@@ -205,6 +205,11 @@ function stripHtml(html) {
   return (html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+// [2026-09-01] 초 단위 시간을 "N분 M초"/"N초"로 표시 — admin 목록, 글 페이지 등 여러 곳에서 공용으로 씀
+function fmtDurSec(sec) {
+  return (typeof sec === 'number' && sec >= 0) ? (sec >= 60 ? `${Math.floor(sec / 60)}분 ${sec % 60}초` : `${sec}초`) : '';
+}
+
 function page(title, body, options = {}) {
   const { description = '생활 속 다양한 주제를 다루는 글과 영상', noindex = false } = options;
   const meta = `<meta name="description" content="${escapeHtml(description)}">
@@ -1109,6 +1114,7 @@ async function finalizeRenderDone(job, renderJobKeyName, env, ctx) {
   if (postRaw) {
     const post = JSON.parse(postRaw);
     post.video = job.r2Key;
+    if (job.durationSec) post.videoDurationSec = job.durationSec; // [2026-09-01] 관리자 목록에 "몇 분짜리"로 표시
     // [2026-08-30 22:14] 숏츠가 실제로 R2에 있는지 확인해 기록(릴레이가 조건에 따라 건너뛸 수 있어 head로 검증)
     const shortKeyList = Array.isArray(job.shortKeys) ? job.shortKeys : (job.shortKey ? [job.shortKey] : []); // [2026-08-30 22:55] 숏츠 3개 지원
     const existingShorts = [];
@@ -1642,7 +1648,7 @@ async function pollPendingRenderJobs(env, ctx) {
       continue;
     }
 
-    await finalizeRenderDone(job, keyInfo.name, env, ctx);
+    await finalizeRenderDone({ ...job, durationSec: data.durationSec }, keyInfo.name, env, ctx);
   }
 }
 
@@ -2337,7 +2343,7 @@ async function renderPostPage(env, slug) {
   const body = `${siteHeader()}
     <div class="wrap post-body">
       <h1>${escapeHtml(p.title)}</h1>
-      <div class="meta">${escapeHtml(p.topic)} · ${new Date(p.createdAt).toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul' })} · 제로지</div>
+      <div class="meta">${escapeHtml(p.topic)} · ${new Date(p.createdAt).toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul' })} · 제로지${p.videoDurationSec ? ` · ${fmtDurSec(p.videoDurationSec)}` : ''}</div>
       ${veoVideoBlock}
       ${slideshow}
       ${p.intro}
@@ -2433,8 +2439,6 @@ async function renderAdminPage(env, requestUrl) {
   const rows = posts.map((p) => {
     // [2026-08-30 19:58] 긴 에러는 앞 100자 + … + 뒤 150자 — ffmpeg류 에러는 핵심 원인이 끝부분에 있음
     const truncErr = (msg) => { const s = String(msg || ''); return s.length <= 260 ? s : s.slice(0, 100) + ' … ' + s.slice(-150); };
-    // [2026-08-30 19:45] 소요시간 표시용 — 초를 "M분 S초"/"S초"로
-    const fmtDurSec = (sec) => (typeof sec === 'number' && sec >= 0 ? (sec >= 60 ? `${Math.floor(sec / 60)}분 ${sec % 60}초` : `${sec}초`) : '');
     // [2026-08-30 19:10] 클립(mp4)이 섞이면 "🎞️N·🖼️M장"으로 구분 표시
     const clipN = (p.images || []).filter((k) => k.endsWith('.mp4')).length;
     const photoN = (p.images || []).length - clipN;
@@ -2486,7 +2490,8 @@ async function renderAdminPage(env, requestUrl) {
                   : ` · ❌ 숏츠${si + 1}실패(${escapeHtml(errText.slice(0, 80))})`;
               }).join('');
             }
-            return `🎬 mp4 완료 ${mainLine}${shortsLine}<br>${shareBits}`;
+            const durText = p.videoDurationSec ? ` (${fmtDurSec(p.videoDurationSec)})` : ''; // [2026-09-01] 몇 분짜리 영상인지 표시
+            return `🎬 mp4 완료${durText} ${mainLine}${shortsLine}<br>${shareBits}`;
           })())
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
@@ -2497,7 +2502,7 @@ async function renderAdminPage(env, requestUrl) {
       <td>${escapeHtml(p.title)}</td>
       <td class="mono">${escapeHtml(p.topic)}</td>
       <td class="mono">${mediaStatus}</td>
-      <td class="mono">${videoStatus}</td>
+      <td class="mono">${videoStatus}${p.videoDurationSec && p.video ? ` · ${fmtDurSec(p.videoDurationSec)}` : ''}</td>
       <td class="mono">${new Date(p.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}${p.generationSec ? `<br>⏱ 생성 ${fmtDurSec(p.generationSec)}` : ''}</td>
       <td><a href="/${p.slug}" target="_blank">보기</a></td>
       <td><form method="POST" action="/admin/delete" style="margin:0;"><input type="hidden" name="slug" value="${p.slug}"><button class="danger" type="submit">삭제</button></form></td>
@@ -3009,7 +3014,7 @@ async function handleRenderProgress(request, env, ctx) {
     let youtubeShortsSkippedReason = null;
     let youtubeQueuePosition = null;
     if (data.status === 'done') {
-      await finalizeRenderDone(job, `renderJob:${slug}`, env, ctx);
+      await finalizeRenderDone({ ...job, durationSec: data.durationSec }, `renderJob:${slug}`, env, ctx);
       // finalizeRenderDone 안의 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행돼서 이 시점엔 보통 아직 안 끝남 —
       // 그래도 혹시 바로 끝났으면 즉시 링크를 내려주고, 아니면 클라이언트가 계속 폴링하며 기다림.
       const freshPostRaw = await env.POSTS.get(`post:${slug}`);
