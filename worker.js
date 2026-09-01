@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-02 06:06 (KST)
+ * 생성(마지막 작업): 2026-09-02 06:46 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2425,10 +2425,11 @@ async function renderAdminPage(env, requestUrl) {
   const genJobRows = genJobs.map((j) => {
     const isStale = !j.failed && (Date.now() - (j.startedAt || 0) > STALE_MS);
     const label = j.failed
-      ? `❌ 생성 실패: ${escapeHtml(truncErrText(j.error))}` // [2026-08-30 21:17] 앞+뒤 표시로 변경(마지막 폴백 결과까지 보이게)
+      ? `❌ 생성 실패: ${escapeHtml(truncErrText(j.error))}`
       : isStale
         ? `⚠️ 응답 없음(멈춤) — ${escapeHtml(j.topic)} · 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (10분 지나면 자동으로 정리돼요)`
-        : `${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
+        : `📝 텍스트/이미지 생성 중: ${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
+
     return `<tr>
     <td colspan="7" class="mono" style="background:#FEE2E2;color:#B91C1C;font-weight:700;border-left:4px solid #DC2626;">
       <span class="gen-progress" data-id="${j.id}" data-stale="${isStale ? '1' : '0'}">${label}</span>
