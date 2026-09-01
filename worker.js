@@ -2244,8 +2244,10 @@ async function renderPostPage(env, slug) {
   const needsYoutubePoll = p.video && !p.youtubeUrl && !p.youtubeError;
   // [2026-08-30 22:20] 스레드 공유 링크 — 홍보문+글 링크가 미리 채워진 스레드 작성창을 엶
   const threadsShareHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(buildThreadsCaption(p))}`; // [2026-08-30 23:31] 예쁜 형식 공용 빌더 사용
+  // [2026-08-31] 스레드 웹 공유창은 이미지 자동 첨부가 안 돼서(메타 앱 심사 필요) 대표 이미지 다운로드 링크를 따로 둠
+  const threadsImageDlHref = p.images?.[0] ? `/media/${escapeHtml(p.images[0])}` : null;
   const youtubeStatusText = p.youtubeUrl
-    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>${(p.youtubeShortsUrls && p.youtubeShortsUrls.length) ? p.youtubeShortsUrls.map((u, si) => u ? ` · <a href="${escapeHtml(u)}" target="_blank" rel="noopener">🩳${si + 1}</a>` : ` · ⚠️ 숏츠${si + 1}실패`).join('') : p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank" rel="noopener">🩳 숏츠</a>` : ''} · <a href="${escapeHtml(threadsShareHref)}" target="_blank" rel="noopener">🧵 스레드 공유</a>`
+    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>${(p.youtubeShortsUrls && p.youtubeShortsUrls.length) ? p.youtubeShortsUrls.map((u, si) => u ? ` · <a href="${escapeHtml(u)}" target="_blank" rel="noopener">🩳${si + 1}</a>` : ` · ⚠️ 숏츠${si + 1}실패`).join('') : p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank" rel="noopener">🩳 숏츠</a>` : ''} · <a href="${escapeHtml(threadsShareHref)}" target="_blank" rel="noopener">🧵 스레드 공유</a>${threadsImageDlHref ? ` · <a href="${threadsImageDlHref}" download>⬇️ 스레드이미지</a>` : ''}`
     : p.youtubeQuotaExceeded
       ? `· ⏳ ${escapeHtml((p.youtubeError || '').slice(0, 200))}` // [2026-08-31] 할당량 초과 — 자동 재시도 예정이라는 게 명확히 보이게(⚠️ 대신 ⏳)
       : p.youtubeError
@@ -2418,8 +2420,12 @@ async function renderAdminPage(env, requestUrl) {
             // Meta 앱 심사를 요구해서 릴스 규격(세로 숏츠) 영상 다운로드 + 캡션 복사 방식으로 제공.
             const shareCaption = buildThreadsCaption(p); // [2026-08-30 23:31] 예쁜 형식(훅/요약/태그/링크 구분)
             const threadsHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(shareCaption)}`;
+            // [2026-08-31] 스레드 웹 공유창은 텍스트만 미리 채워주고 이미지는 자동 첨부가 안 됨(메타 앱 심사
+            // 없이는 불가) — 대신 대표 이미지(첫 장면)를 바로 다운받을 수 있게 해서, "다운로드 → 스레드 공유
+            // → 첨부" 흐름을 최대한 짧게 만듦.
             const shareBits = [
               `<a href="${escapeHtml(threadsHref)}" target="_blank">🧵 스레드</a>`,
+              p.images?.[0] ? `<a href="/media/${escapeHtml(p.images[0])}" download>⬇️ 스레드이미지</a>` : '',
               ...((p.videoShorts && p.videoShorts.length ? p.videoShorts : (p.videoShort ? [p.videoShort] : [])).map((k, si) => `<a href="/media/${escapeHtml(k)}" download>⬇️ 인스타${si + 1}</a>`)),
               `<button type="button" class="copy-cap" data-cap="${escapeHtml(shareCaption)}" style="font-size:11px;padding:2px 8px;">📋 캡션</button>`,
             ].filter(Boolean).join(' · ');
