@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-02 05:56 (KST)
+ * 생성(마지막 작업): 2026-09-02 06:06 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2502,7 +2502,8 @@ async function renderAdminPage(env, requestUrl) {
       <td>${escapeHtml(p.title)}</td>
       <td class="mono">${escapeHtml(p.topic)}</td>
       <td class="mono">${mediaStatus}</td>
-      <td class="mono">${videoStatus}${p.videoDurationSec ? ` · 🎬 ${fmtDurSec(p.videoDurationSec)}` : ''}</td>
+      <td class="mono">${p.videoDurationSec && p.video ? `🎬 ${fmtDurSec(p.videoDurationSec)}` : '—'}</td>
+      <td class="mono">${videoStatus}</td>
       <td class="mono">${new Date(p.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}${p.generationSec ? `<br>⏱ 생성 ${fmtDurSec(p.generationSec)}` : ''}</td>
       <td><a href="/${p.slug}" target="_blank">보기</a></td>
       <td><form method="POST" action="/admin/delete" style="margin:0;"><input type="hidden" name="slug" value="${p.slug}"><button class="danger" type="submit">삭제</button></form></td>
@@ -2700,7 +2701,7 @@ async function renderAdminPage(env, requestUrl) {
       <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;" required>
       <button type="submit">글+슬라이드쇼 생성</button>
     </form>
-    <div class="table-scroll"><table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>작성일</th><th></th><th></th></tr></thead>
+    <div class="table-scroll"><table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>유튜브</th><th>작성일</th><th></th><th></th></tr></thead>
     <tbody id="admin-tbody">${renderFailRows}${genJobRows}<tr id="posts-anchor" style="display:none;"><td colspan="7"></td></tr>${rows || '<tr id="empty-row"><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table></div>
   </div><script>
     // [2026-08-30 22:20] 캡션 복사 버튼 — 클립보드에 스레드/인스타 공유문을 복사(성공하면 잠깐 ✅ 표시)
