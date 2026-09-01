@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-02 05:53 (KST)
+ * 생성(마지막 작업): 2026-09-02 05:56 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2494,7 +2494,7 @@ async function renderAdminPage(env, requestUrl) {
             return `🎬 mp4 완료${durText} ${mainLine}${shortsLine}<br>${shareBits}`;
           })())
       : isRendering
-        ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
+        ? `<span class="render-progress" data-slug="${p.slug}">⏳ 렌더링 대기 중(자동 진행됨)</span>`
         : p.videoError
           ? `❌ 실패: ${escapeHtml(truncErr(p.videoError))}`
           : '—';
@@ -2535,7 +2535,7 @@ async function renderAdminPage(env, requestUrl) {
         tr.appendChild(tdMedia);
 
         var tdVideo = document.createElement('td'); tdVideo.className = 'mono';
-        var span = document.createElement('span'); span.className = 'render-progress'; span.dataset.slug = p.slug; span.textContent = '대기 중 · 0%';
+        var span = document.createElement('span'); span.className = 'render-progress'; span.dataset.slug = p.slug; span.textContent = '⏳ 렌더링 대기 중(자동 진행됨)';
         tdVideo.appendChild(span); tr.appendChild(tdVideo);
 
         var tdDate = document.createElement('td'); tdDate.className = 'mono'; tdDate.textContent = esc(p.createdAtText); tr.appendChild(tdDate);
