@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-01 15:15 (KST)
+ * 생성(마지막 작업): 2026-09-01 18:49 (KST)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2577,10 +2577,12 @@ async function renderAdminPage(env, requestUrl) {
                     el.appendChild(document.createTextNode(' · ⏳ 숏츠(' + data.youtubeShortsSkippedReason + ')'));
                   }
                   el.dataset.terminal = shortsStillQueued ? '0' : '1'; // 숏츠가 아직 대기열에 있으면 계속 폴링해서 나중에 성공하면 갱신되게 함
+                  if (!shortsStillQueued) refreshAdminList();
                 } else if (data.youtubeError) {
                   // [2026-08-31] 할당량 초과면 ⏳(자동 재시도 예정)로, 그 외 실패면 ❌로 구분
                   el.textContent = '🎬 mp4 완료 · ' + (data.youtubeQuotaExceeded ? ('⏳ 본편(할당량 초과 · 대기열 ' + (data.youtubeQueuePosition || '?') + '번째)') : ('❌ 본편실패(' + String(data.youtubeError).slice(0, 150) + ')'));
                   el.dataset.terminal = '1';
+                  refreshAdminList();
                 } else {
                   var pct = (typeof data.youtubeUploadPercent === 'number') ? data.youtubeUploadPercent : null;
                   el.textContent = '🎬 mp4 완료 · 유튜브 업로드 중' + (pct !== null ? ' ' + pct + '%' : '…');
@@ -2591,9 +2593,9 @@ async function renderAdminPage(env, requestUrl) {
                   el.dataset.ytLastPct = pct === null ? '-1' : String(pct);
                   var stallTries = stalled ? (parseInt(el.dataset.ytStallTries || '0', 10) + 1) : 0;
                   el.dataset.ytStallTries = String(stallTries);
-                  if (stallTries >= 20) { // 3초 간격 * 20회 ≈ 1분간 진행률이 그대로면 포기하고 새로고침 안내
-                    el.textContent = '🎬 mp4 완료 · 유튜브 업로드 확인은 새로고침 후 봐주세요';
+                  if (stallTries >= 20) { // 3초 간격 * 20회 ≈ 1분간 진행률이 그대로면 포기하고 목록을 다시 받아와 최종 상태 반영
                     el.dataset.terminal = '1';
+                    refreshAdminList();
                   }
                 }
                 return;
@@ -2602,6 +2604,7 @@ async function renderAdminPage(env, requestUrl) {
                 // [2026-08-30 19:52] 이유 없이 "렌더링 실패"만 뜨던 것 → 서버가 보내주는 이유까지 표시
                 el.textContent = '❌ 렌더링 실패' + (data.error ? ': ' + String(data.error).slice(0, 200) : '');
                 el.dataset.terminal = '1';
+                refreshAdminList(); // [2026-09-01] 작업 끝나면(성공/실패 불문) 새로고침 없이 목록 자동 갱신
                 return;
               }
               el.textContent = (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
@@ -2642,16 +2645,19 @@ async function renderAdminPage(env, requestUrl) {
                 if (tr) tr.remove(); // 진행률 줄 없애고, 실제 글 행으로 교체
                 if (data.post) insertPostRow(data.post);
                 bumpCount(1);
+                refreshAdminList(); // [2026-09-01] 렌더링 대기열 등록 여부까지 정확히 반영되도록 목록도 한 번 더 동기화
                 return;
               }
               if (data.status === 'not_found') {
                 el.textContent = '(사라진 작업)';
                 el.dataset.terminal = '1';
+                refreshAdminList();
                 return;
               }
               if (data.status === 'failed') {
                 el.textContent = '❌ 생성 실패: ' + (function(s){ s = String(s || ''); return s.length <= 443 ? s : s.slice(0, 220) + ' … ' + s.slice(-220); })(data.error); // [2026-08-30 21:17] 앞+뒤 표시
                 el.dataset.terminal = '1';
+                refreshAdminList();
                 return;
               }
               el.textContent = (data.topic || '') + ' — ' + (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
@@ -2677,7 +2683,7 @@ async function renderAdminPage(env, requestUrl) {
       <button type="submit">글+슬라이드쇼 생성</button>
     </form>
     <div class="table-scroll"><table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>작성일</th><th></th><th></th></tr></thead>
-    <tbody>${renderFailRows}${genJobRows}<tr id="posts-anchor" style="display:none;"><td colspan="7"></td></tr>${rows || '<tr id="empty-row"><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table></div>
+    <tbody id="admin-tbody">${renderFailRows}${genJobRows}<tr id="posts-anchor" style="display:none;"><td colspan="7"></td></tr>${rows || '<tr id="empty-row"><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table></div>
   </div><script>
     // [2026-08-30 22:20] 캡션 복사 버튼 — 클립보드에 스레드/인스타 공유문을 복사(성공하면 잠깐 ✅ 표시)
     document.addEventListener('click', function(e){
@@ -2689,6 +2695,24 @@ async function renderAdminPage(env, requestUrl) {
         setTimeout(function(){ btn.textContent = orig; }, 1500);
       });
     });
+    // [2026-09-01] 생성/렌더링/유튜브 업로드 등 "작업이 끝났을 때" 페이지 전체 새로고침 없이 목록만
+    // 다시 받아와서(AJAX) 바꿔치기 — 완료된 항목이 정상적인 글 행으로 정확히 반영되게 함.
+    // 클릭 이벤트는 document에 위임돼 있어서(위 캡션 복사 버튼처럼) tbody를 통째로 갈아끼워도 안 끊김.
+    var refreshingList = false;
+    function refreshAdminList() {
+      if (refreshingList) return;
+      refreshingList = true;
+      fetch(location.pathname + location.search)
+        .then(function(r){ return r.text(); })
+        .then(function(html){
+          var doc = new DOMParser().parseFromString(html, 'text/html');
+          var freshTbody = doc.getElementById('admin-tbody');
+          var curTbody = document.getElementById('admin-tbody');
+          if (freshTbody && curTbody) curTbody.innerHTML = freshTbody.innerHTML;
+        })
+        .catch(function(){})
+        .finally(function(){ refreshingList = false; });
+    }
   </script>${progressScript}`;
 
   return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
