@@ -1037,7 +1037,7 @@ function buildThreadsCaption(p) {
   }
   if (!bodyText) bodyText = `${p.title || ''}\n${p.topic || ''}`.trim();
   const link = p.youtubeUrl || `${SITE_ORIGIN}/${p.slug}`;
-  return `${bodyText}\n\n🎬 영상 보기 👉 ${link}`;
+  return `${bodyText}\n\n🎬 영상 보기 👉 ${link}\n\n— 제로지`;
 }
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
@@ -1164,7 +1164,7 @@ async function uploadVideoToYoutube(post, videoBuffer, env, onProgress, opts = {
   }
   try {
     const accessToken = await getYoutubeAccessToken(env);
-    const description = `${stripHtml(post.intro).slice(0, 400)}\n\n원문: ${SITE_ORIGIN}/${post.slug}`;
+    const description = `${stripHtml(post.intro).slice(0, 400)}\n\n작성자: 제로지\n원문: ${SITE_ORIGIN}/${post.slug}`;
     const shortsSuffix = opts.shorts ? `${opts.partTotal > 1 ? ` (${opts.partNo}/${opts.partTotal})` : ''} #Shorts` : ''; // [2026-08-30 22:55] 숏츠 여러 개면 (1/3) 식으로 제목 구분
     // 유튜브 tags 정제: 빈 문자열/null 제거, 개수 제한(≤10), 각 태그 50자 이하
     const sanitizeTag = (t) => (typeof t === 'string' ? t.trim().replace(/[<>"{}|\\^`\[\]]/g, '').slice(0, 50) : '');
@@ -2303,7 +2303,7 @@ async function renderPostPage(env, slug) {
   const body = `${siteHeader()}
     <div class="wrap post-body">
       <h1>${escapeHtml(p.title)}</h1>
-      <div class="meta">${escapeHtml(p.topic)} · ${new Date(p.createdAt).toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul' })}</div>
+      <div class="meta">${escapeHtml(p.topic)} · ${new Date(p.createdAt).toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul' })} · 제로지</div>
       ${veoVideoBlock}
       ${slideshow}
       ${p.intro}
