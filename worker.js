@@ -1806,6 +1806,27 @@ function splitTextIntoNChunks(sentenceInfos, n) {
     chunks.push(overflow);
   }
 
+  // [2026-08-31] 실제 버그였음: 위 while(빈 배열 채우기)이나 문장 분포가 치우치는 경우, 어떤 이미지는
+  // 문장이 0개로 남을 수 있었음 — relay.js의 computeSegmentBeatTimeline은 문장 0개인 이미지가 하나라도
+  // 있으면 "폴백 모드"(부정확한 무음구간 추정)로 빠지는데, 이게 자막 씽크 드리프트의 원인이었고, 숏츠는
+  // 폴백 모드에선 segmentCount가 없어서 아예 생성 자체가 스킵됐음(본편만 만들어지던 원인).
+  // → 빈 청크가 있으면 문장이 2개 이상인 이웃(가까운 순서)한테서 하나씩 빌려와 반드시 채움.
+  // 이미지 수(n)보다 문장 수가 항상 훨씬 많으므로(현재 나레이션 기준 100문장 이상 vs 이미지 20장)
+  // 이 보정으로 빈 이미지를 완전히 없앨 수 있음.
+  for (let i = 0; i < chunks.length; i++) {
+    if (chunks[i].length > 0) continue;
+    let donorIdx = -1;
+    for (let d = 1; d < chunks.length; d++) {
+      const left = i - d, right = i + d;
+      if (left >= 0 && chunks[left].length > 1) { donorIdx = left; break; }
+      if (right < chunks.length && chunks[right].length > 1) { donorIdx = right; break; }
+    }
+    if (donorIdx === -1) continue; // 문장이 극단적으로 적은 경우(거의 없음) — 그냥 빈 채로 둠, 폴백이 안전망
+    // 빌려주는 청크가 앞쪽이면 그 청크의 마지막 문장을(순서상 더 가까움), 뒤쪽이면 첫 문장을 넘겨줌
+    const donor = chunks[donorIdx];
+    chunks[i].push(donorIdx < i ? donor.pop() : donor.shift());
+  }
+
   // 문장이 끝날 때마다 TTS가 짧게 쉬는 시간(정지)이 있는데, 글자수만 세면 이게 빠져서
   // 문장이 여러 개 들어간 컷일수록 실제보다 더 짧게 잡히는 문제가 있었음.
   // → 문장 하나당 "정지시간에 해당하는 글자수"를 가상으로 더해서 가중치를 보정.
