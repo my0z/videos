@@ -145,6 +145,7 @@ export default {
         return new Response(null, { status: 302, headers: { Location: '/admin' } });
       }
       if (path === '/admin/render-progress') return await handleRenderProgress(request, env, ctx);
+      if (path === '/admin/retry-render' && request.method === 'POST') return await handleRetryRender(request, env);
       // [2026-08-31] relay VM이 20초마다 이걸 호출 — 1분 Cloudflare Cron 대신(또는 같이) 훨씬 자주
       // 폴링 로직을 실행시켜서 탭 안 열어놔도 생성/렌더/유튜브 재시도가 빠르게 진행되게 함.
       // x-relay-secret으로 인증(기존 RELAY_SECRET 재사용, 별도 시크릿 안 만듦).
@@ -156,6 +157,7 @@ export default {
         return new Response(JSON.stringify({ ok: true, at: new Date().toISOString() }), { headers: { 'Content-Type': 'application/json' } });
       }
       if (path === '/admin/generate-step' && request.method === 'POST') return await handleGenerateStep(request, env);
+      if (path === '/admin/cancel-gen' && request.method === 'POST') return await handleCancelGen(request, env);
       if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
       const rootSlugMatch = path.match(/^\/([^\/]+)$/);
       if (rootSlugMatch) return await renderPostPage(env, decodeURIComponent(rootSlugMatch[1]));
@@ -390,11 +392,11 @@ async function generateArticle(topic, newsResults, env) {
     const referenceText = newsResults
       .map((n, i) => `[참고자료 ${i + 1}] ${n.title}\n${n.description}`)
       .join('\n\n');
-    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 7~8분 분량이 되도록 공백 포함 최소 3,500자 이상, 3,500~4,200자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 8~10개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 350자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
+    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 전혀 쓰지 않는다. 쉼표를 쓸 자리는 문장을 끊어서 짧은 문장 두 개로 나눈다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 7~8분 분량이 되도록 공백 포함 최소 3,500자 이상, 3,500~4,200자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 8~10개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 350자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
     userPrompt = `주제: ${topic}\n\n${referenceText}`;
   } else {
     console.log('네이버 뉴스검색 결과 없음(또는 키 미설정), 참고자료 없이 작성');
-    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 꼭 필요할 때만 쓴다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 7~8분 분량이 되도록 공백 포함 최소 3,500자 이상, 3,500~4,200자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 8~10개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 350자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
+    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 전혀 쓰지 않는다. 쉼표를 쓸 자리는 문장을 끊어서 짧은 문장 두 개로 나눈다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 7~8분 분량이 되도록 공백 포함 최소 3,500자 이상, 3,500~4,200자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 8~10개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 350자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
     userPrompt = `주제: ${topic}`;
   }
 
@@ -1144,6 +1146,13 @@ async function finalizeRenderDone(job, renderJobKeyName, env, ctx) {
     const uploadPromise = triggerYoutubeUpload(job.slug, job.r2Key, env);
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(uploadPromise);
     else await uploadPromise;
+  } else {
+    // [2026-09-02 18:45] 고아 mp4 자동청소 — post가 삭제/취소된 상태로 렌더가 끝나면 결과물을 R2에서 지운다
+    const orphanKeys = [job.r2Key, ...(Array.isArray(job.shortKeys) ? job.shortKeys : (job.shortKey ? [job.shortKey] : []))].filter(Boolean);
+    if (orphanKeys.length && env.MEDIA) {
+      await Promise.all(orphanKeys.map((k) => env.MEDIA.delete(k).catch(() => {})));
+      console.log(`[${renderJobKeyName}] post 없음 — 고아 렌더 결과물 삭제: ${orphanKeys.join(', ')}`);
+    }
   }
   await env.POSTS.delete(renderJobKeyName);
   console.log(`[${renderJobKeyName}] 릴레이 렌더링 완료 및 저장: ${job.r2Key}`);
@@ -2430,9 +2439,10 @@ async function renderAdminPage(env, requestUrl) {
         ? `⚠️ 응답 없음(멈춤) — ${escapeHtml(j.topic)} · 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (10분 지나면 자동으로 정리돼요)`
         : `📝 텍스트/이미지 생성 중: ${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
 
+    const cancelBtn = j.failed ? '' : `<form method="POST" action="/admin/cancel-gen" style="display:inline;margin-left:8px;" onsubmit="return confirm('생성 취소할까요? 지금까지 만든 이미지·음성이 삭제됩니다.');"><input type="hidden" name="id" value="${j.id}"><button type="submit" style="font-size:11px;padding:2px 8px;">🛑 취소</button></form>`;
     return `<tr>
     <td colspan="7" class="mono" style="background:#FEE2E2;color:#B91C1C;font-weight:700;border-left:4px solid #DC2626;">
-      <span class="gen-progress" data-id="${j.id}" data-stale="${isStale ? '1' : '0'}">${label}</span>
+      <span class="gen-progress" data-id="${j.id}" data-stale="${isStale ? '1' : '0'}">${label}</span>${cancelBtn}
     </td>
   </tr>`;
   }).join('');
@@ -2497,7 +2507,7 @@ async function renderAdminPage(env, requestUrl) {
       : isRendering
         ? `<span class="render-progress" data-slug="${p.slug}">⏳ 렌더링 대기 중(자동 진행됨)</span>`
         : p.videoError
-          ? `❌ 실패: ${escapeHtml(truncErr(p.videoError))}`
+          ? `❌ 실패: ${escapeHtml(truncErr(p.videoError))}<br><form method="POST" action="/admin/retry-render" style="display:inline;margin-top:4px;"><input type="hidden" name="slug" value="${escapeHtml(p.slug)}"><button type="submit" style="font-size:11px;padding:2px 8px;">🔁 재시도</button></form>`
           : '—';
     return `<tr>
       <td>${escapeHtml(p.title)}</td>
@@ -3042,6 +3052,58 @@ async function handleRenderProgress(request, env, ctx) {
   }
 }
 
+async function handleRetryRender(request, env) {
+  // [2026-09-02 18:45] 실패한 렌더를 원본 이미지·오디오로 재시도
+  const form = await request.formData();
+  const slug = (form.get('slug') || '').toString();
+  if (!slug) return new Response('slug 필요', { status: 400 });
+  const postRaw = await env.POSTS.get(`post:${slug}`);
+  if (!postRaw) return new Response(null, { status: 302, headers: { Location: '/admin' } });
+  const post = JSON.parse(postRaw);
+  if (post.video || !post.images?.length) return new Response(null, { status: 302, headers: { Location: '/admin' } });
+  const existingJobRaw = await env.POSTS.get(`renderJob:${slug}`);
+  if (existingJobRaw) return new Response(null, { status: 302, headers: { Location: '/admin' } });
+  const outputKey = `${slug}.mp4`;
+  const shortKeys = [`${slug}-short.mp4`];
+  const render = await startRelayRender(post.images, post.audio, post.audioSegments, outputKey, shortKeys, post.captionWeights, post.captionBeats, post.captionFontKey, post.captionColor, env);
+  if (render.ok) {
+    post.videoError = null;
+    await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
+    await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
+      jobId: render.jobId, slug, r2Key: outputKey, shortKeys, startedAt: Date.now(),
+    }));
+  } else {
+    post.videoError = render.error;
+    await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
+  }
+  return new Response(null, { status: 302, headers: { Location: '/admin' } });
+}
+
+async function handleCancelGen(request, env) {
+  // [2026-09-02 18:45] 생성 중 취소 — 지금까지 쌓인 R2 미디어와 genJob 정리
+  const form = await request.formData();
+  const id = (form.get('id') || '').toString();
+  if (id) {
+    const raw = await env.POSTS.get(`genJob:${id}`);
+    if (raw) {
+      const job = JSON.parse(raw);
+      const toDelete = [...(job.images || []), ...(job.audioSegmentKeys || [])];
+      if (job.audioKey) toDelete.push(job.audioKey);
+      if (toDelete.length && env.MEDIA) {
+        await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
+      }
+      await env.POSTS.delete(`genJob:${id}`);
+      // renderJob은 일부러 안 지움 — relay에 이미 제출됐다면 끝까지 돌게 두고,
+      // finalizeRenderDone의 고아청소 로직이 post 없는 걸 보고 결과물을 알아서 지운다
+      if (job.slug) {
+        const postRaw = await env.POSTS.get(`post:${job.slug}`);
+        if (postRaw) await deletePostCompletely(job.slug, env);
+      }
+    }
+  }
+  return new Response(null, { status: 302, headers: { Location: '/admin' } });
+}
+
 async function handleGenerate(request, env) {
   const form = await request.formData();
   const topic = (form.get('topic') || '').toString().trim().slice(0, 100);
@@ -3109,11 +3171,9 @@ async function handleApiGenerate(request, env) {
 }
 
 async function handleDelete(request, env) {
+  // [2026-09-02 18:45] deletePostCompletely로 교체 — 기존 코드는 KV만 지우고 R2 미디어를 안 지워서 고아 파일이 계속 쌓이던 버그
   const form = await request.formData();
-  const slug = form.get('slug');
-  await env.POSTS.delete(`post:${slug}`);
-  const idxRaw = await env.POSTS.get('index');
-  const idx = idxRaw ? JSON.parse(idxRaw) : [];
-  await env.POSTS.put('index', JSON.stringify(idx.filter((s) => s !== slug)));
+  const slug = (form.get('slug') || '').toString();
+  if (slug) await deletePostCompletely(slug, env);
   return new Response(null, { status: 302, headers: { Location: '/admin' } });
 }
