@@ -1,5 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-02 20:21 (KST) — genJob 동시실행 방지 락 + index 중복 방지 추가
+ * 생성(마지막 작업): 2026-09-02 20:45 (KST) — 생성 폼에 사용자 미디어 첨부 기능 추가(사진 리사이즈 업로드,
+ * 동영상 원본 업로드, 장면 맨 앞에 배치하고 AI는 나머지만 생성)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -136,6 +137,28 @@ const STYLE = `
     text-shadow:-6px -6px 0 #000, 6px -6px 0 #000, -6px 6px 0 #000, 6px 6px 0 #000, 0 -6px 0 #000, 0 6px 0 #000, -6px 0 0 #000, 6px 0 0 #000;
   }
   .slideshow .caption-box:empty{ display:none; }
+
+  /* [2026-09-02 20:30] 관리자 페이지 카드 그리드 — 인스타그램 피드처럼 정사각형 썸네일 그리드로 표시 */
+  .admin-grid{ display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:14px; margin-top:18px; }
+  .admin-card{ border:1px solid var(--border); border-radius:12px; overflow:hidden; background:#fff; display:flex; flex-direction:column; }
+  .admin-card.is-pending{ border-color:#F59E0B; }
+  .admin-card.is-failed{ border-color:#DC2626; }
+  .admin-card .thumb{ position:relative; aspect-ratio:1/1; width:100%; background:#11151A; overflow:hidden; }
+  .admin-card .thumb img, .admin-card .thumb video{ width:100%; height:100%; object-fit:cover; display:block; }
+  .admin-card .thumb .placeholder{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:34px; color:#3A4048; }
+  .admin-card .thumb .dur-badge{ position:absolute; right:6px; bottom:6px; background:rgba(0,0,0,0.65); color:#fff; font-size:10px; padding:2px 6px; border-radius:4px; font-family:'IBM Plex Mono',monospace; }
+  .admin-card .body{ padding:10px 11px 11px; display:flex; flex-direction:column; gap:6px; flex:1; }
+  .admin-card .title{ font-size:12.5px; font-weight:600; line-height:1.35; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .admin-card .topic{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--teal-text); }
+  .admin-card .status-line{ font-size:11px; color:var(--muted); line-height:1.5; }
+  .admin-card .progress-track{ height:5px; border-radius:3px; background:var(--surface); overflow:hidden; }
+  .admin-card .progress-fill{ height:100%; width:0%; background:var(--teal); transition:width 0.5s ease; }
+  .admin-card.is-failed .progress-fill{ background:#DC2626; }
+  .admin-card .date{ font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--muted); margin-top:auto; }
+  .admin-card .actions{ display:flex; flex-wrap:wrap; gap:5px; }
+  .admin-card .actions a, .admin-card .actions button{ font-size:10.5px; padding:4px 8px; border-radius:5px; }
+  .admin-card .actions a{ background:var(--surface); color:var(--text); border:1px solid var(--border); }
+  .admin-card .actions form{ margin:0; display:inline; }
 `;
 
 const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&family=Nanum+Pen+Script&family=Gowun+Batang&family=Song+Myung&family=Gaegu&family=Hi+Melody&family=Poor+Story&family=Gamja+Flower&family=Single+Day&family=Cute+Font&family=Stylish&family=Yeon+Sung&family=Gugi&family=Nanum+Brush+Script&family=Sunflower:wght@300&display=swap" rel="stylesheet">`;
@@ -170,6 +193,7 @@ export default {
       }
       if (path === '/admin/generate-step' && request.method === 'POST') return await handleGenerateStep(request, env);
       if (path === '/admin/cancel-gen' && request.method === 'POST') return await handleCancelGen(request, env);
+      if (path === '/admin/upload-media' && request.method === 'POST') return await handleUploadMedia(request, env);
       if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
       const rootSlugMatch = path.match(/^\/([^\/]+)$/);
       if (rootSlugMatch) return await renderPostPage(env, decodeURIComponent(rootSlugMatch[1]));
@@ -422,17 +446,19 @@ function isUsableImage(buffer) {
   return !!buffer && buffer.byteLength >= MIN_USABLE_IMAGE_BYTES;
 }
 
-async function generateScenePrompts(topic, articleTitle, env) {
-  const systemPrompt = `너는 짧은 슬라이드쇼 영상을 위한 아트 디렉터다. 주어진 주제와 글 제목을 참고해서, 정지 이미지로 표현할 장면 ${SCENE_COUNT}개를 구상한다. 각 장면은 서로 다른 각도/구도로 주제를 시각화하며, 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 각 장면마다 두 가지를 만든다: 1) keyword — 실제 스톡사진 사이트(Pexels)에서 진짜로 검색될 만한, 실존하는 사물/장소/상황을 나타내는 짧은 영어 키워드(2~4단어). 너무 추상적이거나 상상 속 장면이 아니라, 사진작가가 실제로 찍었을 법한 평범하고 구체적인 소재로 만든다(예: "laptop office desk", "grocery shopping supermarket", "family dinner table"). 2) prompt — 만약 실사진이 없을 경우에 대비한 AI 이미지 생성용 상세한 장면 묘사. 이 프롬프트는 반드시 영어로만 작성한다(한국어 절대 금지) — 이미지 생성 모델이 영어 캡션으로 학습되어 있어서 한국어를 넣으면 엉뚱한 결과가 나옴. 사진처럼 사실적인 스타일, 카메라 앵글/조명까지 구체적으로 묘사. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"scenes": [{"keyword": "영어 검색어", "prompt": "영어로만 작성된 상세 장면 묘사"}, ...]} (배열 길이는 정확히 ${SCENE_COUNT}개)`;
+// [2026-09-02 20:45] wantCount 파라미터 추가 — 사용자가 미디어를 직접 첨부한 만큼 AI가 생성할 장면 수를
+// SCENE_COUNT에서 빼서 요청함(전체 장면 수는 항상 SCENE_COUNT로 유지, 첨부분 + AI생성분 = SCENE_COUNT)
+async function generateScenePrompts(topic, articleTitle, env, wantCount = SCENE_COUNT) {
+  const systemPrompt = `너는 짧은 슬라이드쇼 영상을 위한 아트 디렉터다. 주어진 주제와 글 제목을 참고해서, 정지 이미지로 표현할 장면 ${wantCount}개를 구상한다. 각 장면은 서로 다른 각도/구도로 주제를 시각화하며, 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 각 장면마다 두 가지를 만든다: 1) keyword — 실제 스톡사진 사이트(Pexels)에서 진짜로 검색될 만한, 실존하는 사물/장소/상황을 나타내는 짧은 영어 키워드(2~4단어). 너무 추상적이거나 상상 속 장면이 아니라, 사진작가가 실제로 찍었을 법한 평범하고 구체적인 소재로 만든다(예: "laptop office desk", "grocery shopping supermarket", "family dinner table"). 2) prompt — 만약 실사진이 없을 경우에 대비한 AI 이미지 생성용 상세한 장면 묘사. 이 프롬프트는 반드시 영어로만 작성한다(한국어 절대 금지) — 이미지 생성 모델이 영어 캡션으로 학습되어 있어서 한국어를 넣으면 엉뚱한 결과가 나옴. 사진처럼 사실적인 스타일, 카메라 앵글/조명까지 구체적으로 묘사. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"scenes": [{"keyword": "영어 검색어", "prompt": "영어로만 작성된 상세 장면 묘사"}, ...]} (배열 길이는 정확히 ${wantCount}개)`;
   const userPrompt = `주제: ${topic}\n글 제목: ${articleTitle}`;
   const { result } = await callAiChain(systemPrompt, userPrompt, env);
   if (Array.isArray(result?.scenes) && result.scenes.length) {
-    return result.scenes.slice(0, SCENE_COUNT).map((s) => ({
+    return result.scenes.slice(0, wantCount).map((s) => ({
       keyword: typeof s === 'string' ? topic : (s.keyword || topic),
       prompt: typeof s === 'string' ? s : (s.prompt || `A realistic photo representing: ${topic}`),
     }));
   }
-  return Array.from({ length: SCENE_COUNT }, (_, i) => ({
+  return Array.from({ length: wantCount }, (_, i) => ({
     keyword: topic,
     prompt: `A realistic photo representing: ${topic}, scene ${i + 1}`,
   }));
@@ -2438,102 +2464,134 @@ async function renderAdminPage(env, requestUrl) {
     if (raw) renderFails.push(JSON.parse(raw));
   }
   renderFails.sort((a, b) => new Date(b.at) - new Date(a.at));
-  const renderFailRows = renderFails.map((f) => `<tr>
-    <td colspan="7" class="mono" style="background:#FEF3C7;color:#92400E;border-left:4px solid #F59E0B;">
-      🎬❌ 렌더링 실패(${new Date(f.at).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}) — ${escapeHtml(f.title || f.slug)}${f.postDeleted ? ' · 글 자동삭제됨(오디오 검증)' : ''}<br>
-      사유: ${escapeHtml(f.error || '기록 없음')}
-      <form method="POST" action="/admin/dismiss-fail" style="display:inline;margin-left:8px;"><input type="hidden" name="slug" value="${escapeHtml(f.slug)}"><button type="submit" style="font-size:11px;padding:2px 8px;">확인(지우기)</button></form>
-    </td>
-  </tr>`).join('');
+  const renderFailCards = renderFails.map((f) => `<div class="admin-card is-failed" style="grid-column:1/-1;display:block;">
+    <div class="body">
+      <div class="status-line" style="color:#92400E;">🎬❌ 렌더링 실패(${new Date(f.at).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}) — ${escapeHtml(f.title || f.slug)}${f.postDeleted ? ' · 글 자동삭제됨(오디오 검증)' : ''}<br>
+      사유: ${escapeHtml(f.error || '기록 없음')}</div>
+      <div class="actions"><form method="POST" action="/admin/dismiss-fail"><input type="hidden" name="slug" value="${escapeHtml(f.slug)}"><button type="submit">확인(지우기)</button></form></div>
+    </div>
+  </div>`).join('');
 
-  const genJobRows = genJobs.map((j) => {
+  // [2026-09-02 20:30] 전체진행률(0~100)을 하나의 바로 계산 — 글쓰기/음성/이미지(0~50%) → mp4 렌더링(50~80%) →
+  // 유튜브 업로드(80~100%) 세 단계를 이어붙여서 보여줌. 서버 렌더링 시점의 초기값이고, 이후엔 클라이언트
+  // 폴링(pollRender/stepGen)이 실측값으로 계속 갱신함.
+  function genOverallPercent(genPercent) { return Math.round((genPercent || 0) * 0.5); }
+
+  const genJobCards = genJobs.map((j) => {
     const isStale = !j.failed && (Date.now() - (j.startedAt || 0) > STALE_MS);
     const label = j.failed
       ? `❌ 생성 실패 — ${escapeHtml(truncErrText(j.error))}`
       : isStale
-        ? `⚠️ 응답 없음(멈춤) — ${escapeHtml(j.topic)} · 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (10분 지나면 자동으로 정리돼요)`
-        : `📝 텍스트/이미지 생성 중: ${escapeHtml(j.topic)} — ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
-
-    const cancelBtn = j.failed ? '' : `<form method="POST" action="/admin/cancel-gen" style="display:inline;margin-left:8px;" onsubmit="return confirm('생성 취소할까요? 지금까지 만든 이미지·음성이 삭제됩니다.');"><input type="hidden" name="id" value="${j.id}"><button type="submit" style="font-size:11px;padding:2px 8px;">🛑 취소</button></form>`;
-    return `<tr>
-    <td colspan="7" class="mono" style="background:#FEE2E2;color:#B91C1C;font-weight:700;border-left:4px solid #DC2626;">
-      <span class="gen-progress" data-id="${j.id}" data-stale="${isStale ? '1' : '0'}">${label}</span>${cancelBtn}
-    </td>
-  </tr>`;
+        ? `⚠️ 응답 없음(멈춤) — 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (10분 지나면 자동 정리)`
+        : `📝 ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
+    const cancelBtn = j.failed ? '' : `<form method="POST" action="/admin/cancel-gen" onsubmit="return confirm('생성 취소할까요? 지금까지 만든 이미지·음성이 삭제됩니다.');"><input type="hidden" name="id" value="${j.id}"><button type="submit">🛑 취소</button></form>`;
+    const thumb = j.images?.[0]
+      ? `<img src="/media/${escapeHtml(j.images[0])}" alt="">`
+      : `<div class="placeholder">📝</div>`;
+    return `<div class="admin-card ${j.failed ? 'is-failed' : 'is-pending'}">
+    <div class="thumb">${thumb}</div>
+    <div class="body">
+      <div class="title">${escapeHtml(j.topic)}</div>
+      <span class="gen-progress status-line" data-id="${j.id}" data-stale="${isStale ? '1' : '0'}">${label}</span>
+      ${j.failed ? '' : `<div class="progress-track"><div class="progress-fill" style="width:${genOverallPercent(j.percent)}%"></div></div>`}
+      <div class="actions">${cancelBtn}</div>
+    </div>
+  </div>`;
   }).join('');
 
-  const rows = posts.map((p) => {
-    // [2026-08-30 19:58] 긴 에러는 앞 100자 + … + 뒤 150자 — ffmpeg류 에러는 핵심 원인이 끝부분에 있음
+  const postCards = posts.map((p) => {
     const truncErr = (msg) => { const s = String(msg || ''); return s.length <= 260 ? s : s.slice(0, 100) + ' … ' + s.slice(-150); };
-    // [2026-08-30 19:10] 클립(mp4)이 섞이면 "🎞️N·🖼️M장"으로 구분 표시
     const clipN = (p.images || []).filter((k) => k.endsWith('.mp4')).length;
     const photoN = (p.images || []).length - clipN;
     const mediaLabel = p.images?.length ? (clipN ? `🎞️ ${clipN}·🖼️ ${photoN}장` : `🖼️ ${photoN}장`) : '이미지 없음';
     const mediaStatus = p.video
-      ? `✅ 이미지·음성 사용 완료(mp4로 통합됨)${p.usedNews ? ' · 📰 뉴스참고' : ''}`
-      : `${mediaLabel}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패(${escapeHtml(p.audioError.slice(0, 40))})` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
+      ? `✅ mp4로 통합됨${p.usedNews ? ' · 📰 뉴스참고' : ''}`
+      : `${mediaLabel}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
     const isRendering = pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug);
-    // mp4는 끝났는데 유튜브 업로드 결과(성공 링크/실패)가 아직 없으면 — 백그라운드 업로드가 진행 중이라는 뜻이므로
-    // render-progress와 같은 폴링 span으로 띄워서, 새로고침 없이도 진행률이 실시간으로 갱신되게 함.
     const needsYoutubePoll = p.video && !p.youtubeUrl && !p.youtubeError;
-    const videoStatus = p.video
-      ? (needsYoutubePoll
-          ? `<span class="render-progress" data-slug="${p.slug}">🎬 mp4 완료 · 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}</span>`
-          : (() => {
-            // [2026-08-30 22:20] SNS 공유 도구 — 스레드는 웹 공유창(intent)으로 바로, 인스타는 자동 업로드가
-            // Meta 앱 심사를 요구해서 릴스 규격(세로 숏츠) 영상 다운로드 + 캡션 복사 방식으로 제공.
-            const shareCaption = buildThreadsCaption(p); // [2026-08-30 23:31] 예쁜 형식(훅/요약/태그/링크 구분)
-            const threadsHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(shareCaption)}`;
-            // [2026-08-31] 스레드 웹 공유창은 텍스트만 미리 채워주고 이미지는 자동 첨부가 안 됨(메타 앱 심사
-            // 없이는 불가) — 대신 대표 이미지(첫 장면)를 바로 다운받을 수 있게 해서, "다운로드 → 스레드 공유
-            // → 첨부" 흐름을 최대한 짧게 만듦.
-            const shareBits = [
-              `<a href="${escapeHtml(threadsHref)}" target="_blank">🧵 스레드</a>`,
-              p.images?.[0] ? `<a href="/media/${escapeHtml(p.images[0])}" download>⬇️ 스레드이미지</a>` : '',
-              ...((p.videoShorts && p.videoShorts.length ? p.videoShorts : (p.videoShort ? [p.videoShort] : [])).map((k, si) => `<a href="/media/${escapeHtml(k)}" download>⬇️ 인스타${si + 1}</a>`)),
-              `<button type="button" class="copy-cap" data-cap="${escapeHtml(shareCaption)}" style="font-size:11px;padding:2px 8px;">📋 캡션</button>`,
-            ].filter(Boolean).join(' · ');
-            // [2026-08-31] 본편 결과 — 할당량 초과일 땐 아이콘을 따로 써서(⏳) 다른 실패(❌)랑 눈으로 바로 구분되고, 대기열 순번도 보여줌
-            const qPos = ytQueuePos.get(p.slug);
-            const mainLine = p.youtubeUrl
-              ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 본편</a>${p.youtubeUploadSec ? ` (업로드 ${fmtDurSec(p.youtubeUploadSec)})` : ''}`
-              : p.youtubeQuotaExceeded
-                ? `· ⏳ 본편(할당량 초과 · 대기열 ${qPos || '?'}번째, 자동 재시도 예약됨)`
-                : `· ❌ 본편 실패(${escapeHtml((p.youtubeError || '').slice(0, 150))})`;
-            // 숏츠 — 성공/실패를 항목별로 각각 보여줌(예전엔 첫 번째 것만 실패 이유가 남아서 헷갈렸음)
-            const shortsUrls = p.youtubeShortsUrls && p.youtubeShortsUrls.length ? p.youtubeShortsUrls : (p.youtubeShortsUrl ? [p.youtubeShortsUrl] : []);
-            const shortsErrors = p.youtubeShortsErrors && p.youtubeShortsErrors.length ? p.youtubeShortsErrors : (p.youtubeShortsError ? [p.youtubeShortsError] : []);
-            const shortsCount = Math.max(shortsUrls.length, shortsErrors.length);
-            let shortsLine = '';
-            if (p.youtubeShortsSkippedReason) {
-              shortsLine = ` · ⏳ 숏츠(${escapeHtml(p.youtubeShortsSkippedReason)})`;
-            } else if (shortsCount) {
-              shortsLine = Array.from({ length: shortsCount }, (_, si) => {
-                if (shortsUrls[si]) return ` · <a href="${escapeHtml(shortsUrls[si])}" target="_blank">🩳${si + 1}</a>`;
-                const errText = shortsErrors[si] || '';
-                return errText.includes('할당량')
-                  ? ` · ⏳ 숏츠${si + 1}(대기열 ${qPos || '?'}번째)`
-                  : ` · ❌ 숏츠${si + 1}실패(${escapeHtml(errText.slice(0, 80))})`;
-              }).join('');
-            }
-            const durText = p.videoDurationSec ? ` (${fmtDurSec(p.videoDurationSec)})` : ''; // [2026-09-01] 몇 분짜리 영상인지 표시
-            return `🎬 mp4 완료${durText} ${mainLine}${shortsLine}<br>${shareBits}`;
-          })())
-      : isRendering
-        ? `<span class="render-progress" data-slug="${p.slug}">⏳ 렌더링 대기 중(자동 진행됨)</span>`
-        : p.videoError
-          ? `❌ 실패: ${escapeHtml(truncErr(p.videoError))}<br><form method="POST" action="/admin/retry-render" style="display:inline;margin-top:4px;"><input type="hidden" name="slug" value="${escapeHtml(p.slug)}"><button type="submit" style="font-size:11px;padding:2px 8px;">🔁 재시도</button></form>`
-          : '—';
-    return `<tr>
-      <td>${escapeHtml(p.title)}</td>
-      <td class="mono">${escapeHtml(p.topic)}</td>
-      <td class="mono">${mediaStatus}</td>
-      <td class="mono">${p.videoDurationSec && p.video ? `🎬 ${fmtDurSec(p.videoDurationSec)}` : '—'}</td>
-      <td class="mono">${videoStatus}</td>
-      <td class="mono">${new Date(p.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}${p.generationSec ? `<br>⏱ 생성 ${fmtDurSec(p.generationSec)}` : ''}</td>
-      <td><a href="/${p.slug}" target="_blank">보기</a></td>
-      <td><form method="POST" action="/admin/delete" style="margin:0;"><input type="hidden" name="slug" value="${p.slug}"><button class="danger" type="submit">삭제</button></form></td>
-    </tr>`;
+    const shortsCountNum = (p.videoShorts && p.videoShorts.length) ? p.videoShorts.length : (p.videoShort ? 1 : 0);
+
+    let statusLine, progressPct, isFailedCard, isPendingCard;
+    if (p.video) {
+      if (needsYoutubePoll) {
+        statusLine = `<span class="render-progress" data-slug="${p.slug}">🎬 mp4 완료 · 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}</span>`;
+        progressPct = 80 + Math.round((p.youtubeUploadPercent || 0) * 0.2);
+        isPendingCard = true;
+      } else {
+        const shareCaption = buildThreadsCaption(p);
+        const threadsHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(shareCaption)}`;
+        const qPos = ytQueuePos.get(p.slug);
+        const mainLine = p.youtubeUrl
+          ? `<a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 본편</a>${p.youtubeUploadSec ? ` (${fmtDurSec(p.youtubeUploadSec)})` : ''}`
+          : p.youtubeQuotaExceeded
+            ? `⏳ 본편(할당량 초과·대기열 ${qPos || '?'}번째)`
+            : `❌ 본편 실패(${escapeHtml((p.youtubeError || '').slice(0, 100))})`;
+        const shortsUrls = p.youtubeShortsUrls && p.youtubeShortsUrls.length ? p.youtubeShortsUrls : (p.youtubeShortsUrl ? [p.youtubeShortsUrl] : []);
+        const shortsErrors = p.youtubeShortsErrors && p.youtubeShortsErrors.length ? p.youtubeShortsErrors : (p.youtubeShortsError ? [p.youtubeShortsError] : []);
+        const shortsCount = Math.max(shortsUrls.length, shortsErrors.length);
+        let shortsLine = '';
+        if (p.youtubeShortsSkippedReason) {
+          shortsLine = ` · ⏳ 숏츠`;
+        } else if (shortsCount) {
+          shortsLine = Array.from({ length: shortsCount }, (_, si) => {
+            if (shortsUrls[si]) return ` · <a href="${escapeHtml(shortsUrls[si])}" target="_blank">🩳${si + 1}</a>`;
+            const errText = shortsErrors[si] || '';
+            return errText.includes('할당량') ? ` · ⏳ 숏츠${si + 1}` : ` · ❌ 숏츠${si + 1}실패`;
+          }).join('');
+        }
+        const shareBits = [
+          `<a href="${escapeHtml(threadsHref)}" target="_blank">🧵</a>`,
+          p.images?.[0] ? `<a href="/media/${escapeHtml(p.images[0])}" download>⬇️이미지</a>` : '',
+          ...((p.videoShorts && p.videoShorts.length ? p.videoShorts : (p.videoShort ? [p.videoShort] : [])).map((k, si) => `<a href="/media/${escapeHtml(k)}" download>⬇️쇼츠${si + 1}</a>`)),
+          `<button type="button" class="copy-cap" data-cap="${escapeHtml(shareCaption)}">📋</button>`,
+        ].filter(Boolean).join('');
+        statusLine = `${mainLine}${shortsLine}`;
+        progressPct = 100;
+      }
+    } else if (isRendering) {
+      statusLine = `<span class="render-progress" data-slug="${p.slug}">⏳ 렌더링 대기 중</span>`;
+      progressPct = 50;
+      isPendingCard = true;
+    } else if (p.videoError) {
+      statusLine = `❌ 실패: ${escapeHtml(truncErr(p.videoError))}`;
+      progressPct = 0;
+      isFailedCard = true;
+    } else {
+      statusLine = '—';
+      progressPct = 0;
+    }
+
+    const thumb = p.video
+      ? `<video muted preload="metadata" src="/media/${p.video}#t=0.1"></video>`
+      : p.images?.[0]
+        ? (p.images[0].endsWith('.mp4') ? `<video muted preload="metadata" src="/media/${p.images[0]}#t=0.1"></video>` : `<img src="/media/${p.images[0]}" alt="">`)
+        : `<div class="placeholder">📄</div>`;
+    const durBadge = p.videoDurationSec && p.video ? `<span class="dur-badge">${fmtDurSec(p.videoDurationSec)}${shortsCountNum ? ` · 🩳${shortsCountNum}` : ''}</span>` : '';
+
+    const retryBtn = (!p.video && !isRendering && p.videoError) ? `<form method="POST" action="/admin/retry-render"><input type="hidden" name="slug" value="${escapeHtml(p.slug)}"><button type="submit">🔁재시도</button></form>` : '';
+    const shareBtnsHtml = (p.video && !needsYoutubePoll) ? (() => {
+      const shareCaption = buildThreadsCaption(p);
+      const threadsHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(shareCaption)}`;
+      return `<a href="${escapeHtml(threadsHref)}" target="_blank">🧵</a><button type="button" class="copy-cap" data-cap="${escapeHtml(shareCaption)}">📋</button>`;
+    })() : '';
+
+    return `<div class="admin-card ${isFailedCard ? 'is-failed' : isPendingCard ? 'is-pending' : ''}" data-post-slug="${escapeHtml(p.slug)}">
+    <div class="thumb">${thumb}${durBadge}</div>
+    <div class="body">
+      <div class="title">${escapeHtml(p.title)}</div>
+      <div class="topic">${escapeHtml(p.topic)}</div>
+      <div class="status-line media-status">${mediaStatus}</div>
+      <div class="status-line yt-status">${statusLine}</div>
+      ${(isPendingCard || isFailedCard) ? `<div class="progress-track"><div class="progress-fill" style="width:${progressPct}%"></div></div>` : ''}
+      <div class="date">${new Date(p.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}</div>
+      <div class="actions">
+        <a href="/${p.slug}" target="_blank">보기</a>
+        ${shareBtnsHtml}
+        ${retryBtn}
+        <form method="POST" action="/admin/delete"><input type="hidden" name="slug" value="${p.slug}"><button class="danger" type="submit">삭제</button></form>
+      </div>
+    </div>
+  </div>`;
   }).join('');
 
   const hasPending = posts.some((p) => (!p.video && (pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug))) || (p.video && !p.youtubeUrl && !p.youtubeError));
@@ -2547,61 +2605,52 @@ async function renderAdminPage(env, requestUrl) {
         if (m) h2.textContent = h2.textContent.replace(/\\d+/, (parseInt(m[0], 10) + delta));
       }
       function esc(s){ return (s == null ? '' : String(s)); }
-      function insertPostRow(p){
-        var emptyRow = document.getElementById('empty-row');
-        if (emptyRow) emptyRow.remove();
+      function setBar(card, pct){
+        if (!card) return;
+        var bar = card.querySelector('.progress-fill');
+        if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+      }
+      function insertPostCard(p){
+        var emptyMsg = document.getElementById('empty-row');
+        if (emptyMsg) emptyMsg.remove();
         var anchor = document.getElementById('posts-anchor');
         if (!anchor) return;
-        var tr = document.createElement('tr');
-
-        var tdTitle = document.createElement('td'); tdTitle.textContent = esc(p.title); tr.appendChild(tdTitle);
-        var tdTopic = document.createElement('td'); tdTopic.className = 'mono'; tdTopic.textContent = esc(p.topic); tr.appendChild(tdTopic);
-
-        var tdMedia = document.createElement('td'); tdMedia.className = 'mono';
-        tdMedia.textContent = (p.imageCount ? ('🖼️ ' + p.imageCount + '장') : '이미지 없음') + (p.audio ? ' · 🔊 음성' : (p.audioError ? ' · ⚠️ 음성실패' : ' · 🔇 음성없음')) + (p.usedNews ? ' · 📰 뉴스참고' : '');
-        tr.appendChild(tdMedia);
-
-        var tdVideo = document.createElement('td'); tdVideo.className = 'mono';
-        var span = document.createElement('span'); span.className = 'render-progress'; span.dataset.slug = p.slug; span.textContent = '⏳ 렌더링 대기 중(자동 진행됨)';
-        tdVideo.appendChild(span); tr.appendChild(tdVideo);
-
-        var tdDate = document.createElement('td'); tdDate.className = 'mono'; tdDate.textContent = esc(p.createdAtText); tr.appendChild(tdDate);
-
-        var tdView = document.createElement('td');
-        var a = document.createElement('a'); a.href = '/' + p.slug; a.target = '_blank'; a.textContent = '보기';
-        tdView.appendChild(a); tr.appendChild(tdView);
-
-        var tdDel = document.createElement('td');
-        var form = document.createElement('form'); form.method = 'POST'; form.action = '/admin/delete'; form.style.margin = '0';
-        var inp = document.createElement('input'); inp.type = 'hidden'; inp.name = 'slug'; inp.value = p.slug; form.appendChild(inp);
-        var btn = document.createElement('button'); btn.className = 'danger'; btn.type = 'submit'; btn.textContent = '삭제'; form.appendChild(btn);
-        tdDel.appendChild(form); tr.appendChild(tdDel);
-
-        anchor.insertAdjacentElement('afterend', tr); // 매번 앵커 바로 뒤에 꽂으면 최신순 유지됨
+        var card = document.createElement('div');
+        card.className = 'admin-card is-pending';
+        card.dataset.postSlug = p.slug;
+        card.innerHTML = '<div class="thumb"><div class="placeholder">🎬</div></div>' +
+          '<div class="body">' +
+          '<div class="title"></div>' +
+          '<div class="topic"></div>' +
+          '<div class="status-line media-status">' + ((p.imageCount ? ('🖼️ ' + p.imageCount + '장') : '이미지 없음') + (p.audio ? ' · 🔊 음성' : (p.audioError ? ' · ⚠️ 음성실패' : ' · 🔇 음성없음')) + (p.usedNews ? ' · 📰 뉴스참고' : '')) + '</div>' +
+          '<div class="status-line yt-status"><span class="render-progress" data-slug="' + p.slug + '">⏳ 렌더링 대기 중</span></div>' +
+          '<div class="progress-track"><div class="progress-fill" style="width:50%"></div></div>' +
+          '<div class="date"></div>' +
+          '<div class="actions"><a href="/' + p.slug + '" target="_blank">보기</a>' +
+          '<form method="POST" action="/admin/delete"><input type="hidden" name="slug" value="' + p.slug + '"><button class="danger" type="submit">삭제</button></form></div>' +
+          '</div>';
+        card.querySelector('.title').textContent = esc(p.title);
+        card.querySelector('.topic').textContent = esc(p.topic);
+        card.querySelector('.date').textContent = esc(p.createdAtText);
+        anchor.insertAdjacentElement('afterend', card);
       }
       function pollRender(){
         var renderEls = document.querySelectorAll('.render-progress');
         renderEls.forEach(function(el){
-          if (el.dataset.terminal === '1') return; // 이미 끝난 건 더 조회 안 함(화면은 그대로 유지)
+          if (el.dataset.terminal === '1') return;
           var slug = el.dataset.slug;
+          var card = el.closest('.admin-card');
           fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
             .then(function(r){ return r.json(); })
             .then(function(data){
               if (data.status === 'done') {
-                var mediaCell = el.closest('tr') ? el.closest('tr').children[2] : null;
-                if (mediaCell) mediaCell.textContent = '✅ 이미지·음성 사용 완료(mp4로 통합됨)';
-                // mp4는 끝났지만, 유튜브 업로드는 서버에서 백그라운드로 진행돼서 이 시점엔 아직 결과가 없을 수 있음 —
-                // 링크나 실패가 뜰 때까지(또는 일정 횟수까지) 계속 폴링해서, 새로고침 없이 업로드 결과를 보여줌.
+                var mediaEl = card ? card.querySelector('.media-status') : null;
+                if (mediaEl) mediaEl.textContent = '✅ mp4로 통합됨';
                 if (data.youtubeUrl) {
                   el.textContent = '';
-                  el.appendChild(document.createTextNode('🎬 mp4 완료 · '));
-                  var a = document.createElement('a'); a.href = data.youtubeUrl; a.target = '_blank'; a.textContent = '▶ 유튜브';
+                  var a = document.createElement('a'); a.href = data.youtubeUrl; a.target = '_blank'; a.textContent = '▶ 본편';
                   el.appendChild(a);
-                  if (typeof data.youtubeUploadSec === 'number') { // [2026-08-30 19:45] 업로드 소요시간 표시
-                    var us = data.youtubeUploadSec;
-                    el.appendChild(document.createTextNode(' (업로드 ' + (us >= 60 ? Math.floor(us / 60) + '분 ' + (us % 60) + '초' : us + '초') + ')'));
-                  }
-                  var shortsUrls = data.youtubeShortsUrls || (data.youtubeShortsUrl ? [data.youtubeShortsUrl] : []); // [2026-08-30 22:55] 숏츠 여러 개
+                  var shortsUrls = data.youtubeShortsUrls || (data.youtubeShortsUrl ? [data.youtubeShortsUrl] : []);
                   var shortsErrors = data.youtubeShortsErrors || [];
                   var shortsCount = Math.max(shortsUrls.length, shortsErrors.length);
                   var shortsStillQueued = false;
@@ -2612,67 +2661,62 @@ async function renderAdminPage(env, requestUrl) {
                       el.appendChild(sa);
                     } else if (shortsErrors[si] && shortsErrors[si].indexOf('할당량') !== -1) {
                       shortsStillQueued = true;
-                      el.appendChild(document.createTextNode('⏳ 숏츠' + (si + 1) + '(대기열 ' + (data.youtubeQueuePosition || '?') + '번째)'));
+                      el.appendChild(document.createTextNode('⏳숏츠' + (si + 1)));
                     } else {
-                      el.appendChild(document.createTextNode('❌ 숏츠' + (si + 1) + '실패' + (shortsErrors[si] ? '(' + String(shortsErrors[si]).slice(0, 80) + ')' : '')));
+                      el.appendChild(document.createTextNode('❌숏츠' + (si + 1) + '실패'));
                     }
                   }
-                  if (data.youtubeShortsSkippedReason) {
-                    shortsStillQueued = true;
-                    el.appendChild(document.createTextNode(' · ⏳ 숏츠(' + data.youtubeShortsSkippedReason + ')'));
-                  }
-                  el.dataset.terminal = shortsStillQueued ? '0' : '1'; // 숏츠가 아직 대기열에 있으면 계속 폴링해서 나중에 성공하면 갱신되게 함
+                  if (data.youtubeShortsSkippedReason) { shortsStillQueued = true; el.appendChild(document.createTextNode(' · ⏳숏츠')); }
+                  el.dataset.terminal = shortsStillQueued ? '0' : '1';
+                  setBar(card, 100);
+                  if (card) card.classList.remove('is-pending');
                   if (!shortsStillQueued) refreshAdminList();
                 } else if (data.youtubeError) {
-                  // [2026-08-31] 할당량 초과면 ⏳(자동 재시도 예정)로, 그 외 실패면 ❌로 구분
-                  el.textContent = '🎬 mp4 완료 · ' + (data.youtubeQuotaExceeded ? ('⏳ 본편(할당량 초과 · 대기열 ' + (data.youtubeQueuePosition || '?') + '번째)') : ('❌ 본편실패(' + String(data.youtubeError).slice(0, 150) + ')'));
+                  el.textContent = data.youtubeQuotaExceeded ? '⏳ 본편(할당량 초과)' : ('❌ 본편실패(' + String(data.youtubeError).slice(0, 100) + ')');
                   el.dataset.terminal = '1';
+                  setBar(card, 100);
                   refreshAdminList();
                 } else {
                   var pct = (typeof data.youtubeUploadPercent === 'number') ? data.youtubeUploadPercent : null;
                   el.textContent = '🎬 mp4 완료 · 유튜브 업로드 중' + (pct !== null ? ' ' + pct + '%' : '…');
-                  // 진행률이 실제로 움직이는 동안엔(대용량 영상이라 오래 걸려도) 절대 포기하지 않고,
-                  // 값이 이전 폴링과 똑같이 멈춰있을 때만 "멈춤" 횟수를 세서 일정 시간 뒤 포기함.
+                  setBar(card, 80 + (pct || 0) * 0.2);
                   var lastPct = el.dataset.ytLastPct !== undefined ? parseInt(el.dataset.ytLastPct, 10) : -1;
                   var stalled = (pct !== null && pct === lastPct);
                   el.dataset.ytLastPct = pct === null ? '-1' : String(pct);
                   var stallTries = stalled ? (parseInt(el.dataset.ytStallTries || '0', 10) + 1) : 0;
                   el.dataset.ytStallTries = String(stallTries);
-                  if (stallTries >= 20) { // 3초 간격 * 20회 ≈ 1분간 진행률이 그대로면 포기하고 목록을 다시 받아와 최종 상태 반영
-                    el.dataset.terminal = '1';
-                    refreshAdminList();
-                  }
+                  if (stallTries >= 20) { el.dataset.terminal = '1'; refreshAdminList(); }
                 }
                 return;
               }
               if (data.status === 'failed') {
-                // [2026-08-30 19:52] 이유 없이 "렌더링 실패"만 뜨던 것 → 서버가 보내주는 이유까지 표시
-                el.textContent = '❌ 렌더링 실패' + (data.error ? ': ' + String(data.error).slice(0, 200) : '');
+                el.textContent = '❌ 렌더링 실패' + (data.error ? ': ' + String(data.error).slice(0, 150) : '');
                 el.dataset.terminal = '1';
-                refreshAdminList(); // [2026-09-01] 작업 끝나면(성공/실패 불문) 새로고침 없이 목록 자동 갱신
+                if (card) { card.classList.remove('is-pending'); card.classList.add('is-failed'); }
+                setBar(card, 0);
+                refreshAdminList();
                 return;
               }
-              el.textContent = (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
+              // relay가 주는 자체 percent(0~100)를 50~80% 구간으로 매핑
+              var relayPct = typeof data.percent === 'number' ? data.percent : 0;
+              el.textContent = (data.stage || '렌더링 중') + ' · ' + relayPct + '%';
+              setBar(card, 50 + relayPct * 0.3);
             })
             .catch(function(){});
         });
       }
-      // gen-progress는 폴링 자체가 "다음 한 단계 진행시켜줘"라는 뜻 — 이 탭이 열려있는 동안만 진행됨.
-      // 화면 전체를 다시 그리지 않고, 이 메시지 한 줄만 그때그때 바뀜(페이지 리로드 없음).
       function stepGen(){
         var genEls = document.querySelectorAll('.gen-progress');
         genEls.forEach(function(el){
           if (el.dataset.terminal === '1') return;
-          if (el.dataset.inflight === '1') return; // 이전 요청이 아직 응답 안 왔으면 중복 발사 안 함
+          if (el.dataset.inflight === '1') return;
           el.dataset.inflight = '1';
-
-          // 서버 응답 오기 전까지, 로컬에서 "N초째 처리 중"만 계속 갱신 — FLUX처럼 이미지 한 장에
-          // 몇 초씩 걸릴 때도 화면이 죽은 것처럼 안 보이고 계속 움직이는 걸 보여줌
+          var card = el.closest('.admin-card');
           var baseText = el.textContent;
           var waitStarted = Date.now();
           var tickId = setInterval(function(){
             var sec = Math.floor((Date.now() - waitStarted) / 1000);
-            el.textContent = baseText + ' · 처리 중… ' + sec + '초';
+            el.textContent = baseText + ' · ' + sec + '초';
           }, 500);
 
           var id = el.dataset.id;
@@ -2686,11 +2730,10 @@ async function renderAdminPage(env, requestUrl) {
               el.dataset.inflight = '0';
               if (data.status === 'done') {
                 el.dataset.terminal = '1';
-                var tr = el.closest('tr');
-                if (tr) tr.remove(); // 진행률 줄 없애고, 실제 글 행으로 교체
-                if (data.post) insertPostRow(data.post);
+                if (card) card.remove();
+                if (data.post) insertPostCard(data.post);
                 bumpCount(1);
-                refreshAdminList(); // [2026-09-01] 렌더링 대기열 등록 여부까지 정확히 반영되도록 목록도 한 번 더 동기화
+                refreshAdminList();
                 return;
               }
               if (data.status === 'not_found') {
@@ -2700,12 +2743,15 @@ async function renderAdminPage(env, requestUrl) {
                 return;
               }
               if (data.status === 'failed') {
-                el.textContent = '❌ 생성 실패: ' + (function(s){ s = String(s || ''); return s.length <= 443 ? s : s.slice(0, 220) + ' … ' + s.slice(-220); })(data.error); // [2026-08-30 21:17] 앞+뒤 표시
+                el.textContent = '❌ 생성 실패: ' + (function(s){ s = String(s || ''); return s.length <= 300 ? s : s.slice(0, 150) + ' … ' + s.slice(-150); })(data.error);
                 el.dataset.terminal = '1';
+                if (card) { card.classList.remove('is-pending'); card.classList.add('is-failed'); }
+                setBar(card, 0);
                 refreshAdminList();
                 return;
               }
-              el.textContent = (data.topic || '') + ' — ' + (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
+              el.textContent = (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
+              setBar(card, (data.percent || 0) * 0.5);
             })
             .catch(function(){
               clearInterval(tickId);
@@ -2723,26 +2769,112 @@ async function renderAdminPage(env, requestUrl) {
   const body = `${siteHeader()}<div class="wrap" style="padding:32px 0;">
     <h2>관리자 (총 ${idx.length}건)</h2>
     <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아와요. 이 페이지를 열어두면 1.5초마다 빠르게 진행되고, 닫아도 1분마다 크론이 대신 이어서 진행해요(다만 느려요).</p>
-    <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;" onsubmit="this.querySelector('button').disabled=true; this.querySelector('button').textContent='생성 중...';">
-      <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;" required>
+    <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;flex-wrap:wrap;" id="gen-form" onsubmit="this.querySelector('button[type=submit]').disabled=true; this.querySelector('button[type=submit]').textContent='생성 중...';">
+      <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;min-width:200px;" required>
+      <button type="button" id="media-upload-btn">📎 미디어 추가</button>
       <button type="submit">글+슬라이드쇼 생성</button>
+      <input type="hidden" name="userMediaKeys" id="user-media-keys-input" value="[]">
+      <input type="file" id="media-upload-input" accept="image/*,video/*" multiple style="display:none;">
+      <div id="media-upload-list" style="width:100%;"></div>
     </form>
-    <div class="table-scroll"><table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>유튜브</th><th>작성일</th><th></th><th></th></tr></thead>
-    <tbody id="admin-tbody">${renderFailRows}${genJobRows}<tr id="posts-anchor" style="display:none;"><td colspan="7"></td></tr>${rows || '<tr id="empty-row"><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table></div>
+    <div class="admin-grid" id="admin-tbody">${renderFailCards}${genJobCards}<div id="posts-anchor" style="display:none;"></div>${postCards || '<p id="empty-row" style="grid-column:1/-1;color:var(--muted);">글이 없습니다.</p>'}</div>
   </div><script>
-    // [2026-08-30 22:20] 캡션 복사 버튼 — 클립보드에 스레드/인스타 공유문을 복사(성공하면 잠깐 ✅ 표시)
+    // [2026-09-02 20:45] 첨부 미디어 업로드 — 사진은 canvas로 리사이즈(전송 용이)해서 보내고,
+    // 동영상은 어차피 relay가 최종 렌더링 때 다시 인코딩하므로 원본 그대로 올림.
+    (function(){
+      var uploadBtn = document.getElementById('media-upload-btn');
+      var fileInput = document.getElementById('media-upload-input');
+      var listEl = document.getElementById('media-upload-list');
+      var keysInput = document.getElementById('user-media-keys-input');
+      if (!uploadBtn || !fileInput) return;
+      var uploadedFiles = []; // {key, isVideo, name}
+      var UPLOAD_MAX = 10;
+
+      function resizeImageFile(file, maxDim){
+        return new Promise(function(resolve){
+          var img = new Image();
+          var url = URL.createObjectURL(file);
+          img.onload = function(){
+            var w = img.width, h = img.height;
+            var scale = Math.min(1, maxDim / Math.max(w, h));
+            var cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+            var canvas = document.createElement('canvas');
+            canvas.width = cw; canvas.height = ch;
+            var ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, cw, ch);
+            canvas.toBlob(function(blob){ URL.revokeObjectURL(url); resolve(blob || file); }, 'image/jpeg', 0.85);
+          };
+          img.onerror = function(){ URL.revokeObjectURL(url); resolve(file); };
+          img.src = url;
+        });
+      }
+
+      function renderList(){
+        listEl.innerHTML = '';
+        keysInput.value = JSON.stringify(uploadedFiles.map(function(f){ return f.key; }));
+        uploadedFiles.forEach(function(f, idx){
+          var chip = document.createElement('span');
+          chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:3px 8px;margin:4px 4px 0 0;font-size:11px;';
+          var label = document.createElement('span');
+          label.textContent = (f.isVideo ? '🎞️ ' : '🖼️ ') + (f.name || '').slice(0, 14);
+          chip.appendChild(label);
+          var rm = document.createElement('button');
+          rm.type = 'button'; rm.textContent = '✕';
+          rm.style.cssText = 'border:none;background:none;cursor:pointer;font-size:11px;padding:0;margin-left:2px;color:var(--muted);';
+          rm.addEventListener('click', function(){ uploadedFiles.splice(idx, 1); renderList(); });
+          chip.appendChild(rm);
+          listEl.appendChild(chip);
+        });
+      }
+
+      uploadBtn.addEventListener('click', function(){ fileInput.click(); });
+      fileInput.addEventListener('change', async function(e){
+        var files = Array.prototype.slice.call(e.target.files || []);
+        if (!files.length) return;
+        if (uploadedFiles.length + files.length > UPLOAD_MAX) {
+          alert('최대 ' + UPLOAD_MAX + '개까지 첨부할 수 있어요');
+          fileInput.value = '';
+          return;
+        }
+        uploadBtn.disabled = true;
+        var origText = uploadBtn.textContent;
+        uploadBtn.textContent = '업로드 중...';
+        try {
+          var fd = new FormData();
+          for (var i = 0; i < files.length; i++) {
+            var f = files[i];
+            if (f.type.indexOf('image/') === 0) {
+              var blob = await resizeImageFile(f, 1600);
+              fd.append('files', blob, (f.name || 'image').replace(/\\.[^.]+$/, '') + '.jpg');
+            } else {
+              fd.append('files', f, f.name);
+            }
+          }
+          var res = await fetch('/admin/upload-media', { method: 'POST', body: fd });
+          var data = await res.json();
+          if (data.ok && data.files) {
+            uploadedFiles = uploadedFiles.concat(data.files);
+            renderList();
+          } else {
+            alert(data.error || '업로드 실패');
+          }
+        } catch (err) {
+          alert('업로드 실패');
+        }
+        uploadBtn.disabled = false;
+        uploadBtn.textContent = origText;
+        fileInput.value = '';
+      });
+    })();
     document.addEventListener('click', function(e){
       var btn = e.target.closest('.copy-cap');
       if (!btn) return;
       navigator.clipboard.writeText(btn.dataset.cap || '').then(function(){
         var orig = btn.textContent;
-        btn.textContent = '✅ 복사됨';
+        btn.textContent = '✅';
         setTimeout(function(){ btn.textContent = orig; }, 1500);
       });
     });
-    // [2026-09-01] 생성/렌더링/유튜브 업로드 등 "작업이 끝났을 때" 페이지 전체 새로고침 없이 목록만
-    // 다시 받아와서(AJAX) 바꿔치기 — 완료된 항목이 정상적인 글 행으로 정확히 반영되게 함.
-    // 클릭 이벤트는 document에 위임돼 있어서(위 캡션 복사 버튼처럼) tbody를 통째로 갈아끼워도 안 끊김.
     var refreshingList = false;
     function refreshAdminList() {
       if (refreshingList) return;
@@ -2751,9 +2883,9 @@ async function renderAdminPage(env, requestUrl) {
         .then(function(r){ return r.text(); })
         .then(function(html){
           var doc = new DOMParser().parseFromString(html, 'text/html');
-          var freshTbody = doc.getElementById('admin-tbody');
-          var curTbody = document.getElementById('admin-tbody');
-          if (freshTbody && curTbody) curTbody.innerHTML = freshTbody.innerHTML;
+          var freshGrid = doc.getElementById('admin-tbody');
+          var curGrid = document.getElementById('admin-tbody');
+          if (freshGrid && curGrid) curGrid.innerHTML = freshGrid.innerHTML;
         })
         .catch(function(){})
         .finally(function(){ refreshingList = false; });
@@ -2797,6 +2929,11 @@ async function runGenerationStep(job, env) {
       const { buffer, error } = await generateNarrationAudioWithRetry(job.segTexts[segDone], env, 2, job.ttsVoices);
       if (!buffer) {
         await Promise.all(keys.map((k) => env.MEDIA.delete(k).catch(() => {})));
+        // [2026-09-02 20:45] 사용자가 첨부한 미디어는 이 시점엔 아직 job.images에 안 들어가 있어서
+        // (audio-concat 단계에서 시딩됨) 여기서 따로 지워줘야 고아 파일이 안 남음
+        if (job.userMediaKeys?.length) {
+          await Promise.all(job.userMediaKeys.map((k) => env.MEDIA.delete(k).catch(() => {})));
+        }
         throw new Error(`음성 세그먼트 ${segDone + 1}/${job.segTexts.length} 합성 최종 실패로 발행 중단 — ${error || '알 수 없는 오류'}`);
       }
       const key = `${job.slug}-narr-${segDone}.mp3`;
@@ -2822,8 +2959,12 @@ async function runGenerationStep(job, env) {
     }
     const audioKey = `${job.slug}-narration.mp3`;
     await env.MEDIA.put(audioKey, concatAudioBuffers(buffers), { httpMetadata: { contentType: 'audio/mpeg' } });
-    const scenes = await generateScenePrompts(topic, job.article.title, env);
-    return { ...job, audioKey, audioError: null, scenes, sceneIndex: 0, images: [], stage: scenes.length ? 'images' : 'finalize', percent: 30 };
+    // [2026-09-02 20:45] 사용자가 직접 첨부한 미디어(job.userMediaKeys)를 images 맨 앞에 그대로 배치하고,
+    // AI는 나머지 자리(SCENE_COUNT - 첨부 개수)만 생성하도록 요청 장면 수를 줄임
+    const userMediaKeys = Array.isArray(job.userMediaKeys) ? job.userMediaKeys : [];
+    const wantAiScenes = Math.max(0, SCENE_COUNT - userMediaKeys.length);
+    const scenes = wantAiScenes ? await generateScenePrompts(topic, job.article.title, env, wantAiScenes) : [];
+    return { ...job, audioKey, audioError: null, scenes, sceneIndex: 0, images: userMediaKeys.slice(), stage: scenes.length ? 'images' : 'finalize', percent: 30 };
   }
 
   if (job.stage === 'images') {
@@ -3111,7 +3252,9 @@ async function handleCancelGen(request, env) {
     const raw = await env.POSTS.get(`genJob:${id}`);
     if (raw) {
       const job = JSON.parse(raw);
-      const toDelete = [...(job.images || []), ...(job.audioSegmentKeys || [])];
+      // [2026-09-02 20:45] job.images엔 이미 반영된 첨부 미디어도 있고(images 단계 이후) 아직 안 들어간
+      // 경우(start/audio 단계에서 취소)도 있어서, userMediaKeys도 같이 지워야 고아 파일이 안 남음
+      const toDelete = [...(job.images || []), ...(job.audioSegmentKeys || []), ...(job.userMediaKeys || [])];
       if (job.audioKey) toDelete.push(job.audioKey);
       if (toDelete.length && env.MEDIA) {
         await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
@@ -3126,6 +3269,39 @@ async function handleCancelGen(request, env) {
     }
   }
   return new Response(null, { status: 302, headers: { Location: '/admin' } });
+}
+
+// [2026-09-02 20:45] 생성 시작 전에 사용자가 직접 첨부한 사진/동영상을 R2에 올려둠 — 실제 생성은 나중에
+// genJob이 만들어질 때 이 키 목록(userMediaKeys)을 넘겨받아 장면 맨 앞에 그대로 씀. 사진은 클라이언트에서
+// canvas로 리사이즈해서 보내지만(전송 용이), 동영상은 어차피 relay가 최종 렌더링 때 다시 인코딩하므로
+// 브라우저 단에서 변환하지 않고 원본 그대로 받음.
+const UPLOAD_MEDIA_MAX_FILES = 10; // 전체 장면이 20장이라 AI 생성분도 남겨둬야 함
+async function handleUploadMedia(request, env) {
+  if (!env.MEDIA) return new Response(JSON.stringify({ ok: false, error: 'MEDIA(R2) 바인딩 없음' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  let form;
+  try {
+    form = await request.formData();
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: '요청을 읽을 수 없음' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  }
+  const files = form.getAll('files').filter((f) => f && typeof f === 'object' && typeof f.arrayBuffer === 'function');
+  if (!files.length) return new Response(JSON.stringify({ ok: false, error: '파일 없음' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  if (files.length > UPLOAD_MEDIA_MAX_FILES) return new Response(JSON.stringify({ ok: false, error: `한 번에 최대 ${UPLOAD_MEDIA_MAX_FILES}개까지` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+
+  const uploaded = [];
+  for (const f of files) {
+    const type = f.type || '';
+    const isVideo = type.startsWith('video/');
+    if (!isVideo && !type.startsWith('image/')) continue; // 사진/동영상 외 파일 타입은 건너뜀
+    const buf = await f.arrayBuffer();
+    if (!buf || !buf.byteLength) continue;
+    const ext = isVideo ? 'mp4' : (type === 'image/png' ? 'png' : 'jpg');
+    const key = `upload-${crypto.randomUUID()}.${ext}`;
+    await env.MEDIA.put(key, buf, { httpMetadata: { contentType: type || (isVideo ? 'video/mp4' : 'image/jpeg') } });
+    uploaded.push({ key, isVideo, name: (f.name || '').slice(0, 60) });
+  }
+  if (!uploaded.length) return new Response(JSON.stringify({ ok: false, error: '올릴 수 있는 사진/동영상이 없음' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  return new Response(JSON.stringify({ ok: true, files: uploaded }), { headers: { 'Content-Type': 'application/json' } });
 }
 
 async function handleGenerate(request, env) {
@@ -3157,11 +3333,26 @@ async function handleGenerate(request, env) {
     }
   }
 
+  // [2026-09-02 20:45] 사용자가 미리 업로드해둔 첨부 미디어 키(JSON 문자열 배열) — 실제로 R2에 있는지
+  // head()로 확인해서 유령 키는 걸러냄(업로드 실패했는데 목록에만 남아있던 경우 등 방어)
+  let userMediaKeys = [];
+  try {
+    const raw = (form.get('userMediaKeys') || '').toString();
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) {
+      const candidates = parsed.filter((k) => typeof k === 'string' && k.startsWith('upload-')).slice(0, UPLOAD_MEDIA_MAX_FILES);
+      const checks = await Promise.all(candidates.map((k) => (env.MEDIA ? env.MEDIA.head(k).then((h) => (h ? k : null)).catch(() => null) : Promise.resolve(null))));
+      userMediaKeys = checks.filter(Boolean);
+    }
+  } catch (e) {
+    userMediaKeys = [];
+  }
+
   // ctx.waitUntil()은 응답 보낸 뒤 최대 30초까지만 보장돼서, 전체 생성(몇십 초~1분 이상)엔 부족함 —
   // 여기선 작업 "등록"만 하고, 실제 진행은 관리자 페이지가 /admin/generate-step을 반복 호출하며
   // 한 단계씩(글쓰기/음성/이미지 1장씩/저장/렌더링등록) 진행시킴. 각 단계는 몇 초 안에 끝나서 시간제한에 안 걸림.
   const jobId = crypto.randomUUID();
-  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: 'start', percent: 0, startedAt: Date.now(), createdAt: Date.now() /* [2026-08-30 19:45] 생성 소요시간 측정용(startedAt은 스텝마다 갱신됨) */ }));
+  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: 'start', percent: 0, startedAt: Date.now(), createdAt: Date.now(), userMediaKeys /* [2026-08-30 19:45] 생성 소요시간 측정용(startedAt은 스텝마다 갱신됨) */ }));
 
   return new Response(null, { status: 302, headers: { Location: '/admin?genId=' + jobId + '&msg=' + encodeURIComponent(`생성 시작됨: ${topic} (진행률은 아래 목록에서 확인)`) } });
 }
