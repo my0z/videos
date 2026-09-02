@@ -1,5 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-02 20:21 (KST)
+ * 생성(마지막 작업): 2026-09-02 20:21 (KST) — genJob 동시실행 방지 락 + index 중복 방지 추가
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -31,6 +31,17 @@ const VIDEO_POLL_CRON = '* * * * *'; // 이 크론이 실행되면 콘텐츠 발
 const CF_AI_GATEWAY = 'yzusb';
 const VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
 const SCENE_COUNT = 20; // 슬라이드쇼에 쓸 장면 이미지 개수 — 4분 분량 영상 기준 20장(장당 평균 12초 내외)
+// [2026-09-02 20:21] genJob 동시실행 방지 락 — 원인: 관리자 탭의 1.5초 폴링(stepGen) + 1분 크론
+// (pollPendingGenJobs) + relay의 cron-tick(약 20초마다, runVideoPollTick)이 전부 서로 모른 채 같은
+// genJob을 동시에 runGenerationStep()으로 처리할 수 있었음. Cloudflare KV는 원자적 CAS가 없어서, 세
+// 경로가 거의 동시에 같은 job을 읽으면 finalize 단계(post 저장 + index에 slug 추가)가 여러 번 실행돼
+// 같은 글이 index에 중복으로 쌓이고 관리자 목록에 똑같은 글이 여러 줄로 보이는 원인이 됐음(실제 발생 사례:
+// "면역·유전 치료가 바꾸는 암과..." 글이 완전히 같은 내용/시각으로 4줄 중복). 진짜 원자적 락은 KV로는
+// 못 만들지만, job을 읽자마자(무거운 작업 시작 전에) lockedAt을 바로 기록해 다른 경로가 곧바로 이어서
+// 같은 job을 읽더라도 "방금 누가 막 잠갔다"를 보고 건너뛰게 함 — 경쟁 창을 수 초~수십 초에서 KV
+// 왕복시간(수십 ms) 수준으로 좁힘. finalize의 index 중복 방지(idx.includes 체크)는 그래도 혹시 겹치면
+// 최후의 안전장치로 같이 넣음.
+const GEN_JOB_LOCK_MS = 20000; // 이 시간 안에 다시 같은 job이 잡히면 "이미 처리 중"으로 보고 건너뜀
 // 나레이션 길이 안전 상한(공백 포함) — 글 생성 프롬프트가 목표 분량을 쓰지만, 모델이 초과해서 쓸 경우를
 // 대비해 문장 경계에서 잘라 상한을 넘지 않게 함(한국어 TTS ≈ 분당 400자).
 // [2026-08-31] 실제 영상이 2분 남짓밖에 안 나온다는 피드백 — AI가 목표 분량(2,000~2,500자)을 못 채우고
@@ -1679,6 +1690,9 @@ async function pollPendingGenJobs(env) {
     if (!raw) continue;
     let job = JSON.parse(raw);
     if (job.failed) continue; // 이미 실패로 끝난 건 admin 페이지의 정리 타이머가 알아서 지움
+    // [2026-09-02 20:21] 동시실행 방지 — 방금 다른 경로(탭 폴링/relay tick)가 이 job을 잡았으면 건너뜀
+    if (job.lockedAt && Date.now() - job.lockedAt < GEN_JOB_LOCK_MS) continue;
+    await env.POSTS.put(keyInfo.name, JSON.stringify({ ...job, lockedAt: Date.now() })).catch(() => {});
 
     try {
       job = await runGenerationStep(job, env);
@@ -2886,7 +2900,9 @@ async function runGenerationStep(job, env) {
     await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
     const idxRaw = await env.POSTS.get('index');
     const idx = idxRaw ? JSON.parse(idxRaw) : [];
-    idx.unshift(job.slug);
+    // [2026-09-02 20:21] 최후의 안전장치 — 위 락으로 거의 다 막히지만 KV 왕복시간만큼의 아주 좁은 경쟁
+    // 창이 여전히 이론상 남아있어서, finalize가 혹시 겹쳐 실행돼도 같은 slug가 index에 두 번 안 쌓이게 함
+    if (!idx.includes(job.slug)) idx.unshift(job.slug);
     await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
     return { ...job, captionWeights, captionBeats, captionFontKey, captionColor, stage: 'render', percent: 90 };
   }
@@ -2937,6 +2953,13 @@ async function handleGenerateStep(request, env) {
   if (job.failed) {
     return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: job.error }), { headers: { 'Content-Type': 'application/json' } });
   }
+
+  // [2026-09-02 20:21] 동시실행 방지 — 방금 다른 경로(1분 크론/relay tick)가 이 job을 잡았으면
+  // 이번 호출은 아무것도 안 하고 현재 상태만 그대로 돌려줌(진행률 표시는 계속 자연스럽게 보임)
+  if (job.lockedAt && Date.now() - job.lockedAt < GEN_JOB_LOCK_MS) {
+    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent }), { headers: { 'Content-Type': 'application/json' } });
+  }
+  await env.POSTS.put(`genJob:${id}`, JSON.stringify({ ...job, lockedAt: Date.now() })).catch(() => {});
 
   try {
     job = await runGenerationStep(job, env);
