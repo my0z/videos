@@ -1,6 +1,5 @@
 /**
- * 생성(마지막 작업): 2026-09-02 21:20 (KST) — 글 생성 후 문장을 5초 단위로 자연스럽게 재편집하는 AI
- * 패스(reeditForTtsPacing) 추가 — TTS가 자연스럽게 읽도록 문장 길이를 다시 다듬음
+ * 생성(마지막 작업): 2026-09-02 21:30 (KST) — 관리자 카드 썸네일에 글 보기 링크 추가
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -143,7 +142,7 @@ const STYLE = `
   .admin-card{ border:1px solid var(--border); border-radius:12px; overflow:hidden; background:#fff; display:flex; flex-direction:column; }
   .admin-card.is-pending{ border-color:#F59E0B; }
   .admin-card.is-failed{ border-color:#DC2626; }
-  .admin-card .thumb{ position:relative; aspect-ratio:1/1; width:100%; background:#11151A; overflow:hidden; }
+  .admin-card .thumb{ display:block; position:relative; aspect-ratio:1/1; width:100%; background:#11151A; overflow:hidden; }
   .admin-card .thumb img, .admin-card .thumb video{ width:100%; height:100%; object-fit:cover; display:block; }
   .admin-card .thumb .placeholder{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:34px; color:#3A4048; }
   .admin-card .thumb .dur-badge{ position:absolute; right:6px; bottom:6px; background:rgba(0,0,0,0.65); color:#fff; font-size:10px; padding:2px 6px; border-radius:4px; font-family:'IBM Plex Mono',monospace; }
@@ -2620,7 +2619,7 @@ async function renderAdminPage(env, requestUrl) {
     })() : '';
 
     return `<div class="admin-card ${isFailedCard ? 'is-failed' : isPendingCard ? 'is-pending' : ''}" data-post-slug="${escapeHtml(p.slug)}">
-    <div class="thumb">${thumb}${durBadge}</div>
+    <a class="thumb" href="/${p.slug}" target="_blank">${thumb}${durBadge}</a>
     <div class="body">
       <div class="title">${escapeHtml(p.title)}</div>
       <div class="topic">${escapeHtml(p.topic)}</div>
@@ -2662,7 +2661,7 @@ async function renderAdminPage(env, requestUrl) {
         var card = document.createElement('div');
         card.className = 'admin-card is-pending';
         card.dataset.postSlug = p.slug;
-        card.innerHTML = '<div class="thumb"><div class="placeholder">🎬</div></div>' +
+        card.innerHTML = '<a class="thumb" href="/' + p.slug + '" target="_blank"><div class="placeholder">🎬</div></a>' +
           '<div class="body">' +
           '<div class="title"></div>' +
           '<div class="topic"></div>' +
