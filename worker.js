@@ -1,6 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-02 20:45 (KST) — 생성 폼에 사용자 미디어 첨부 기능 추가(사진 리사이즈 업로드,
- * 동영상 원본 업로드, 장면 맨 앞에 배치하고 AI는 나머지만 생성)
+ * 생성(마지막 작업): 2026-09-02 21:05 (KST) — 쇼츠 하이라이트 구간 AI 판단 기능 추가(pickHighlightRange,
+ * highlightSegRange를 relay.js에 전달)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -462,6 +462,27 @@ async function generateScenePrompts(topic, articleTitle, env, wantCount = SCENE_
     keyword: topic,
     prompt: `A realistic photo representing: ${topic}, scene ${i + 1}`,
   }));
+}
+
+// [2026-09-02 21:05] 쇼츠(하이라이트) 구간 선정 — 문장(=음성 세그먼트) 번호가 매겨진 목록을 AI에게
+// 보여주고, 소리 내어 읽었을 때 약 35~45초가 되는 연속 구간 중 가장 하이라이트가 될 만한 곳을 고르게 함.
+// relay.js가 이 구간(문장 인덱스)을 실측 세그먼트 시각으로 변환해서 그 부분만 쇼츠로 잘라냄.
+// 실패하면 null 반환 — relay.js는 null이면 예전처럼 도입/중간/결론 후보 로직으로 폴백함.
+async function pickHighlightRange(sentences, topic, env) {
+  if (!sentences?.length) return null;
+  if (sentences.length === 1) return { start: 0, end: 0 };
+  const numbered = sentences.map((s, i) => `${i}: ${s}`).join('\n');
+  const systemPrompt = '너는 짧은 하이라이트 클립(쇼츠)을 만들기 위해 나레이션 문장들 중 가장 흥미롭고 핵심적인 구간을 고르는 편집자다. 아래에 번호가 매겨진 문장 목록이 주어진다. 이 중 연속된 문장 구간 하나를 고른다 — 시청자의 관심을 가장 끌만한 핵심 정보나 임팩트 있는 내용이 담긴 구간이어야 한다. 고른 구간을 소리 내어 읽었을 때 총 길이가 약 35~45초(대략 230~300자)가 되도록 문장 개수를 조절한다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"startIndex": 시작문장번호, "endIndex": 끝문장번호}';
+  const userPrompt = `주제: ${topic}\n\n문장 목록:\n${numbered}`;
+  try {
+    const { result } = await callAiChain(systemPrompt, userPrompt, env);
+    const start = Number(result?.startIndex);
+    const end = Number(result?.endIndex);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= sentences.length) return null;
+    return { start, end };
+  } catch (e) {
+    return null;
+  }
 }
 
 function sleep(ms) {
@@ -1100,7 +1121,7 @@ function buildThreadsCaption(p) {
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
 // 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
-async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, env) {
+async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, env, highlightSegRange) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
   if (!imageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
@@ -1131,7 +1152,9 @@ async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey
       // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
       // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림; 비트마다 segIndex로 음성 세그먼트 매핑)
       // captionFontKey/captionColor: 이 영상 전체에 고정으로 쓸 폰트 키/색 하나(위치도 영상당 하나로 고정 — captionBeats의 styleIndex가 이미 전부 동일한 값으로 옴)
-      body: JSON.stringify({ images: imageUrls, audioUrl, audioSegments, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor }), // [2026-08-30 22:55] 숏츠 3개(도입/중간/결론) 동시 렌더링
+      // [2026-09-02 21:05] highlightSegRange: 쇼츠를 잘라낼 하이라이트 문장 구간(있으면 relay가 이 구간만
+      // 사용, 없으면 예전처럼 도입/중간/결론 후보 로직으로 폴백)
+      body: JSON.stringify({ images: imageUrls, audioUrl, audioSegments, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange: highlightSegRange || null }),
       signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) {
@@ -1632,7 +1655,7 @@ async function resubmitLostRenderJob(job, keyInfoName, env) {
     return;
   }
   console.log(`[${keyInfoName}] relay가 job(${job.jobId})을 모름 — post 원본으로 렌더링 재제출 시도 (${resubmitCount + 1}/2)`);
-  const render = await startRelayRender(post.images, post.audio, post.audioSegments, job.r2Key, job.shortKeys, post.captionWeights, post.captionBeats, post.captionFontKey, post.captionColor, env);
+  const render = await startRelayRender(post.images, post.audio, post.audioSegments, job.r2Key, job.shortKeys, post.captionWeights, post.captionBeats, post.captionFontKey, post.captionColor, env, post.highlightSegRange);
   if (render.ok) {
     await env.POSTS.put(keyInfoName, JSON.stringify({ ...job, jobId: render.jobId, resubmitCount: resubmitCount + 1, startedAt: Date.now() }));
     console.log(`[${keyInfoName}] 재제출 성공, 새 jobId: ${render.jobId}`);
@@ -2090,10 +2113,12 @@ async function generateAndSavePost(topic, env, onProgress) {
   }
 
   report('글 저장 중', 80);
+  // [2026-09-02 21:05] 쇼츠용 하이라이트 구간 — 실패해도 발행은 막지 않음
+  const highlightSegRange = await pickHighlightRange(segSentencesList.flat(), topic, env);
   const post = {
     slug, topic, title: article.title, createdAt: new Date().toISOString(),
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
-    images, audio: audioKey, audioSegments: audioSegmentKeys, audioError, usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
+    images, audio: audioKey, audioSegments: audioSegmentKeys, audioError, usedNews, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange,
     generationSec: Math.round((Date.now() - genStartMs) / 1000), // [2026-08-30 19:45] 생성 소요시간(관리자 표시용)
     threadsText: (article.threads_text || '').toString().slice(0, 450), // [2026-08-30 22:20] 스레드 공유용 홍보문
   };
@@ -2108,7 +2133,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && images.length) {
     const outputKey = `${slug}.mp4`;
     const shortKeys = [`${slug}-short.mp4`]; // [2026-08-31 07:29] 3개→1개: 유튜브 일일 업로드 할당량(10,000유닛, 건당 1,600) 절약 위해 축소(사용자 요청)
-    const render = await startRelayRender(images, audioKey, audioSegmentKeys, outputKey, shortKeys, captionWeights, captionBeats, captionFontKey, captionColor, env);
+    const render = await startRelayRender(images, audioKey, audioSegmentKeys, outputKey, shortKeys, captionWeights, captionBeats, captionFontKey, captionColor, env, highlightSegRange);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
         jobId: render.jobId, slug, r2Key: outputKey, shortKeys, imageKeys: images, startedAt: Date.now(),
@@ -3031,10 +3056,12 @@ async function runGenerationStep(job, env) {
       const beats = buildCaptionBeats(chunk.sentences, captionPositionIndex);
       captionBeats.push(beats);
     }
+    // [2026-09-02 21:05] 쇼츠용 하이라이트 구간 — 실패해도 발행은 막지 않음(null이면 relay가 예전 로직으로 폴백)
+    const highlightSegRange = await pickHighlightRange(job.segTexts || [], topic, env);
     const post = {
       slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
       intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
-      images: job.images, audio: job.audioKey, audioSegments: job.audioSegmentKeys, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor,
+      images: job.images, audio: job.audioKey, audioSegments: job.audioSegmentKeys, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange,
       generationSec: job.createdAt ? Math.round((Date.now() - job.createdAt) / 1000) : null, // [2026-08-30 19:45] 생성 버튼 → 글 저장까지 걸린 시간(관리자 표시용)
       threadsText: (job.article.threads_text || '').toString().slice(0, 450), // [2026-08-30 22:20] 스레드 공유용 홍보문(글 생성 때 같이 만들어짐)
     };
@@ -3045,7 +3072,7 @@ async function runGenerationStep(job, env) {
     // 창이 여전히 이론상 남아있어서, finalize가 혹시 겹쳐 실행돼도 같은 slug가 index에 두 번 안 쌓이게 함
     if (!idx.includes(job.slug)) idx.unshift(job.slug);
     await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
-    return { ...job, captionWeights, captionBeats, captionFontKey, captionColor, stage: 'render', percent: 90 };
+    return { ...job, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange, stage: 'render', percent: 90 };
   }
 
   if (job.stage === 'render') {
@@ -3053,7 +3080,7 @@ async function runGenerationStep(job, env) {
       const outputKey = `${job.slug}.mp4`;
       // [2026-08-31 07:29] 3개→1개: 유튜브 일일 업로드 할당량(10,000유닛, 건당 1,600) 절약 위해 축소(사용자 요청)
       const shortKeys = [`${job.slug}-short.mp4`];
-      const render = await startRelayRender(job.images, job.audioKey, job.audioSegmentKeys, outputKey, shortKeys, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env);
+      const render = await startRelayRender(job.images, job.audioKey, job.audioSegmentKeys, outputKey, shortKeys, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env, job.highlightSegRange);
       if (render.ok) {
         await env.POSTS.put(`renderJob:${job.slug}`, JSON.stringify({
           jobId: render.jobId, slug: job.slug, r2Key: outputKey, shortKeys, startedAt: Date.now(),
@@ -3230,7 +3257,7 @@ async function handleRetryRender(request, env) {
   if (existingJobRaw) return new Response(null, { status: 302, headers: { Location: '/admin' } });
   const outputKey = `${slug}.mp4`;
   const shortKeys = [`${slug}-short.mp4`];
-  const render = await startRelayRender(post.images, post.audio, post.audioSegments, outputKey, shortKeys, post.captionWeights, post.captionBeats, post.captionFontKey, post.captionColor, env);
+  const render = await startRelayRender(post.images, post.audio, post.audioSegments, outputKey, shortKeys, post.captionWeights, post.captionBeats, post.captionFontKey, post.captionColor, env, post.highlightSegRange);
   if (render.ok) {
     post.videoError = null;
     await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
