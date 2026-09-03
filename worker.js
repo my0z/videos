@@ -1,6 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-02 21:05 (KST) — 쇼츠 하이라이트 구간 AI 판단 기능 추가(pickHighlightRange,
- * highlightSegRange를 relay.js에 전달)
+ * 생성(마지막 작업): 2026-09-02 21:20 (KST) — 글 생성 후 문장을 5초 단위로 자연스럽게 재편집하는 AI
+ * 패스(reeditForTtsPacing) 추가 — TTS가 자연스럽게 읽도록 문장 길이를 다시 다듬음
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -438,6 +438,22 @@ async function generateArticle(topic, newsResults, env) {
 
   const { result, error, modelUsed } = await callAiChain(systemPrompt, userPrompt, env);
   return { article: result, error, modelUsed };
+}
+
+// [2026-09-02 21:20] 생성된 글을 다시 한 번 AI로 다듬어 TTS가 자연스럽게 읽도록 함 — 원래 글쓰기
+// 프롬프트의 20~45자 규칙만으로는 실제로 정확히 5초 분량이 되도록 맞추기 어려워서, 완성된 글을 놓고
+// "문장 하나 = 약 5초"를 유일한 목표로 삼아 다시 나누고 다듬는 전용 편집 패스를 추가함(의미는 그대로 유지).
+// 실패하거나 결과가 너무 짧으면(원문 절반 미만) 원문을 그대로 씀 — 발행 자체가 막히지 않게.
+async function reeditForTtsPacing(text, env) {
+  if (!text || text.length < 15) return text;
+  const systemPrompt = '너는 TTS(음성합성)가 자연스럽게 읽을 수 있도록 나레이션 글을 다시 다듬는 편집자다. 아래 글의 의미와 정보는 하나도 빠짐없이 그대로 유지하면서 모든 문장을 소리 내어 읽었을 때 각각 약 5초(공백 포함 28~35자) 분량이 되도록 문장을 다시 나누거나 다듬는다. 문장 하나에 한 가지 내용만 담고 너무 짧게 쪼개서 부자연스럽게 끊기지 않도록 자연스러운 구어체 흐름을 유지한다(-해요, -거든요, -그런데요 같은 말투 유지). 모든 문장은 마침표 물음표 느낌표로 끝낸다. 쉼표 괄호 따옴표 이모지 특수기호는 쓰지 않는다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"text": "재편집된 전체 글(문장 사이는 공백 하나로 구분)"}';
+  try {
+    const { result } = await callAiChain(systemPrompt, text, env);
+    const edited = typeof result?.text === 'string' ? result.text.trim() : '';
+    return edited.length >= text.length * 0.5 ? edited : text; // 결과가 너무 짧으면 뭔가 잘못된 것으로 보고 원문 사용
+  } catch (e) {
+    return text;
+  }
 }
 
 const MIN_USABLE_IMAGE_BYTES = 15 * 1024; // 15KB 미만이면 아이콘/로고/썸네일일 가능성이 높아 "못 쓰는 이미지"로 판단
@@ -2019,7 +2035,10 @@ async function generateAndSavePost(topic, env, onProgress) {
   const slug = String(Date.now());
 
   // 내레이션 텍스트(음성+자막 공용) — 실제 음성으로 변환되는 길이(3000자)로 맞춤
-  const narrationText = trimNarrationToSentence(normalizeNarrationSpacing([stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ')), NARRATION_MAX_CHARS);
+  // [2026-09-02 21:20] 문장을 5초 단위로 자연스럽게 재편집(reeditForTtsPacing)한 뒤 정규화/자름
+  const rawNarration = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ');
+  const pacedNarration = await reeditForTtsPacing(rawNarration, env);
+  const narrationText = trimNarrationToSentence(normalizeNarrationSpacing(pacedNarration), NARRATION_MAX_CHARS);
 
   report('음성 생성 중', 30);
   // 문장 몇 개씩 묶은 세그먼트 단위로 따로 합성 — 릴레이가 각 조각의 실제 길이를 재서 자막을 실측으로 맞춤.
@@ -2930,7 +2949,10 @@ async function runGenerationStep(job, env) {
     const newsResults = await searchNaverNews(topic, env);
     const { article, error: articleError } = await generateArticle(topic, newsResults, env);
     if (!article) throw new Error(`글 생성 실패 — ${articleError || '알 수 없는 오류'}`);
-    const narrationText = trimNarrationToSentence(normalizeNarrationSpacing([stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ')), NARRATION_MAX_CHARS);
+    // [2026-09-02 21:20] 문장을 5초 단위로 자연스럽게 재편집(reeditForTtsPacing)한 뒤 정규화/자름
+    const rawNarration = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ');
+    const pacedNarration = await reeditForTtsPacing(rawNarration, env);
+    const narrationText = trimNarrationToSentence(normalizeNarrationSpacing(pacedNarration), NARRATION_MAX_CHARS);
     // 음성은 문장 몇 개씩 묶은 "세그먼트" 단위로 따로 합성(자막-음성 싱크를 실측으로 맞추기 위함).
     // 목소리는 여기서 한 번 뽑아 영상 전체에 고정 — 세그먼트마다 목소리가 바뀌면 안 되니까.
     const segments = planAudioSegments(prepareNarrationSentences(narrationText), 1); // [2026-08-30 21:51] 문장 하나 = 조각 하나: 모든 문장 시작마다 타이밍이 실측값으로 리셋돼 싱크가 엉킬 수 없음(사용자 제안)
