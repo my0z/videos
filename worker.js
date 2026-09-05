@@ -1,6 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 00:30 (KST) — 자막 폰트 30% 확대(웹+mp4) + wrapCaptionLines 줄당
- * 글자수 20→15로 줄여서 큰 폰트로도 화면 밖으로 안 잘리게 함
+ * 생성(마지막 작업): 2026-09-06 01:00 (KST) — 관리자 페이지 최상단에 Oracle VM 사용량(CPU/네트워크,
+ * 최근 1시간) 표시 추가. OCI API 서명(RSA-SHA256, Web Crypto)을 직접 구현(ociSignedRequest 등),
+ * OCI_USER_OCID/OCI_TENANCY_OCID/OCI_FINGERPRINT/OCI_PRIVATE_KEY/OCI_REGION/OCI_INSTANCE_OCID
+ * 시크릿 필요(없으면 조용히 표시 생략). 비용은 Always Free라 "$0" 고정 문구로 표시
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1371,6 +1373,116 @@ async function updateYoutubeUploadPercent(slug, percent, env) {
 
 // [2026-08-31 00:07] relay.js health check — 주기적으로 폴링 → 3회 연속 실패 시 자동 재시작 시도
 let relayHealthFailCount = 0;
+// ---------- Oracle Cloud VM 사용량 표시 — 작업: 2026-09-06 01:00 ----------
+// OCI API는 요청마다 RSA-SHA256 서명이 필요함(https://docs.oracle.com/iaas/Content/API/Concepts/signingrequests.htm).
+// Workers엔 Node crypto가 없어서 Web Crypto(SubtleCrypto)로 직접 구현. 개인키는 PKCS8 PEM 형식이라
+// (-----BEGIN PRIVATE KEY-----) importKey('pkcs8', ...)에 바로 씀 — RSA PRIVATE KEY(PKCS1) 형식이면 이 방식이 안 통함.
+function pemToArrayBuffer(pem) {
+  const clean = pem.replace(/-----BEGIN [^-]+-----/, '').replace(/-----END [^-]+-----/, '').replace(/\s+/g, '');
+  const binary = atob(clean);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function importOciPrivateKey(pem) {
+  return crypto.subtle.importKey('pkcs8', pemToArrayBuffer(pem), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+}
+
+async function sha256Base64(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  let binary = '';
+  new Uint8Array(digest).forEach((b) => { binary += String.fromCharCode(b); });
+  return btoa(binary);
+}
+
+async function arrayBufferToBase64Async(buf) {
+  let binary = '';
+  new Uint8Array(buf).forEach((b) => { binary += String.fromCharCode(b); });
+  return btoa(binary);
+}
+
+// method: 'GET'|'POST', url: 전체 URL 문자열, bodyObj: POST일 때 JSON 바디(없으면 null)
+async function ociSignedRequest(env, method, url, bodyObj) {
+  const u = new URL(url);
+  const date = new Date().toUTCString(); // RFC 1123 형식 — OCI가 요구하는 date 헤더 형식과 일치
+  const keyId = `${env.OCI_TENANCY_OCID}/${env.OCI_USER_OCID}/${env.OCI_FINGERPRINT}`;
+  const requestTarget = `${method.toLowerCase()} ${u.pathname}${u.search}`;
+
+  let headersToSign = ['(request-target)', 'date', 'host'];
+  let signingLines = [`(request-target): ${requestTarget}`, `date: ${date}`, `host: ${u.host}`];
+  const fetchHeaders = { date, host: u.host };
+
+  let bodyStr = null;
+  if (bodyObj != null) {
+    bodyStr = JSON.stringify(bodyObj);
+    const contentSha256 = await sha256Base64(bodyStr);
+    headersToSign = [...headersToSign, 'content-length', 'content-type', 'x-content-sha256'];
+    signingLines = [...signingLines, `content-length: ${bodyStr.length}`, `content-type: application/json`, `x-content-sha256: ${contentSha256}`];
+    fetchHeaders['content-length'] = String(bodyStr.length);
+    fetchHeaders['content-type'] = 'application/json';
+    fetchHeaders['x-content-sha256'] = contentSha256;
+  }
+
+  const privateKey = await importOciPrivateKey(env.OCI_PRIVATE_KEY);
+  const signatureBuf = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', privateKey, new TextEncoder().encode(signingLines.join('\n')));
+  const signature = await arrayBufferToBase64Async(signatureBuf);
+
+  fetchHeaders.authorization = `Signature version="1",headers="${headersToSign.join(' ')}",keyId="${keyId}",algorithm="rsa-sha256",signature="${signature}"`;
+
+  return fetch(url, { method, headers: fetchHeaders, body: bodyStr });
+}
+
+// 지정 메트릭의 최근 1시간 평균값을 하나 가져옴(Monitoring API summarizeMetricsData) — 실패하면 null
+async function fetchOciMetricMean(env, mql) {
+  try {
+    const region = env.OCI_REGION;
+    const url = `https://telemetry.${region}.oraclecloud.com/20180401/metrics/actions/summarizeMetricsData?compartmentId=${encodeURIComponent(env.OCI_TENANCY_OCID)}`;
+    const res = await ociSignedRequest(env, 'POST', url, {
+      namespace: 'oci_computeagent',
+      query: mql,
+      resolution: '1m',
+      startTime: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      endTime: new Date().toISOString(),
+    });
+    if (!res.ok) {
+      await res.text().catch(() => {});
+      return null;
+    }
+    const data = await res.json();
+    const points = data?.[0]?.aggregatedDatapoints;
+    if (!Array.isArray(points) || !points.length) return null;
+    // 가장 최근 값을 씀 — mean()이라 이미 구간 평균이 들어있음
+    return points[points.length - 1].value;
+  } catch (e) {
+    console.log(`OCI 메트릭 조회 실패(${mql}): ${e.message}`);
+    return null;
+  }
+}
+
+// 관리자 페이지 상단에 표시할 값들을 한 번에 모음 — OCI 시크릿이 없으면(설정 전) 조용히 null 반환.
+async function getOracleVmStats(env) {
+  if (!env.OCI_USER_OCID || !env.OCI_TENANCY_OCID || !env.OCI_FINGERPRINT || !env.OCI_PRIVATE_KEY || !env.OCI_REGION || !env.OCI_INSTANCE_OCID) {
+    return null;
+  }
+  try {
+    const filter = `{resourceId = "${env.OCI_INSTANCE_OCID}"}`;
+    const [cpu, netIn, netOut] = await Promise.all([
+      fetchOciMetricMean(env, `CpuUtilization[1h]${filter}.mean()`),
+      fetchOciMetricMean(env, `NetworksBytesIn[1h]${filter}.sum()`),
+      fetchOciMetricMean(env, `NetworksBytesOut[1h]${filter}.sum()`),
+    ]);
+    return {
+      cpuPercent: typeof cpu === 'number' ? Math.round(cpu * 10) / 10 : null,
+      netInMb: typeof netIn === 'number' ? Math.round((netIn / 1024 / 1024) * 10) / 10 : null,
+      netOutMb: typeof netOut === 'number' ? Math.round((netOut / 1024 / 1024) * 10) / 10 : null,
+    };
+  } catch (e) {
+    console.log(`Oracle VM 사용량 조회 실패: ${e.message}`);
+    return null;
+  }
+}
+
 async function checkRelayHealth(env) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return; // env 미설정이면 체크 스킵
   try {
@@ -2472,6 +2584,7 @@ async function renderPostPage(env, slug) {
 }
 
 async function renderAdminPage(env, requestUrl) {
+  const oracleStats = await getOracleVmStats(env); // [2026-09-06 01:00] 관리자 페이지 최상단 표시용
   const idxRaw = await env.POSTS.get('index');
   const idx = idxRaw ? JSON.parse(idxRaw) : [];
   const posts = [];
@@ -2826,7 +2939,12 @@ async function renderAdminPage(env, requestUrl) {
     })();
   </script>` : '';
 
+  const oracleStatsBar = oracleStats ? `<div class="mono" style="font-size:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;margin-bottom:12px;">
+    🖥️ Oracle VM 최근 1시간 — CPU 평균 ${oracleStats.cpuPercent ?? '—'}%${oracleStats.netInMb != null ? ` · 📥 ${oracleStats.netInMb}MB` : ''}${oracleStats.netOutMb != null ? ` · 📤 ${oracleStats.netOutMb}MB` : ''} · 💰 Always Free 사용 중($0)
+  </div>` : '';
+
   const body = `${siteHeader()}<div class="wrap" style="padding:32px 0;">
+    ${oracleStatsBar}
     <h2>관리자 (총 ${idx.length}건)</h2>
     <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아와요. 이 페이지를 열어두면 1.5초마다 빠르게 진행되고, 닫아도 1분마다 크론이 대신 이어서 진행해요(다만 느려요).</p>
     <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;flex-wrap:wrap;" id="gen-form" onsubmit="this.querySelector('button[type=submit]').disabled=true; this.querySelector('button[type=submit]').textContent='생성 중...';">
