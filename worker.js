@@ -1,6 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-06 00:20 (KST) — 생성 폼에 "상세 내용" 입력란 추가(글쓰기 프롬프트에 반영)
- * + generateScenePrompts가 글 본문 요약(buildArticleDigestForScenes)까지 참고해서 이미지 검색어 정확도 향상
+ * 생성(마지막 작업): 2026-09-06 00:30 (KST) — 자막 폰트 30% 확대(웹+mp4) + wrapCaptionLines 줄당
+ * 글자수 20→15로 줄여서 큰 폰트로도 화면 밖으로 안 잘리게 함
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1987,7 +1987,10 @@ function buildCaptionBeats(sentences, positionIndex) {
   for (const s of sentences) {
     const text = typeof s === 'string' ? s : s.text; // 문자열(옛 형식)과 {text, segIndex} 둘 다 수용
     const segIndex = typeof s === 'string' ? null : s.segIndex;
-    const wrapped = wrapCaptionLines(text, 20, 5).join('\n'); // 문장 전체를 최대 5줄로 줄바꿈(20~45자 문장이면 보통 1~3줄)
+    // [2026-09-06 00:30] 폰트를 30% 키우면서 한 줄 글자수도 그만큼 줄임(20→15) — 안 그러면 큰 폰트로
+    // 20자를 다 채운 줄이 화면 가로 폭을 넘어가서 잘려 보이는 문제가 생김. 줄 수는 여유(5→6)로 늘려서
+    // 문장이 더 잘게 나뉘어도 전체 내용이 잘리지 않게 함.
+    const wrapped = wrapCaptionLines(text, 15, 6).join('\n');
     const weight = Math.max(text.length + PAUSE_EQUIVALENT_CHARS, 4);
     beats.push({ text: wrapped, weight, isSentenceEnd: true, segIndex });
   }
@@ -2219,13 +2222,13 @@ function renderSlideshow(post) {
       // 위치/폰트/색 전부 영상 하나당 하나로 고정(서버가 미리 뽑아서 내려줌, 비트마다 안 바뀜) — 위치는
       // captionBeats의 모든 styleIndex가 이미 같은 값으로 와서 자연히 고정됨. 폰트/색은 아래 FIXED_FONT/FIXED_COLOR로 고정.
       // relay.js(mp4)에도 같은 위치표 + 고정 폰트/색 규칙이 있음(POSITION_STYLES 인덱스 규칙 일치, styleIndex 그대로 재사용).
-      // [2026-08-30 20:13] 자막 크기 2/3로 축소(사용자 요청, mp4쪽 CAPTION_POSITIONS와 같은 비율)
+      // [2026-08-30 20:13] 자막 크기 2/3로 축소했었는데, [2026-09-06 00:30] 30% 다시 키움(사용자 요청)
       var POSITION_STYLES = [
-        { pos:'bottom', size:23 },
-        { pos:'top',    size:22 },
-        { pos:'bl',     size:29 },
-        { pos:'br',     size:27 },
-        { pos:'middle', size:28 }
+        { pos:'bottom', size:30 },
+        { pos:'top',    size:29 },
+        { pos:'bl',     size:38 },
+        { pos:'br',     size:35 },
+        { pos:'middle', size:36 }
       ];
       var FIXED_FONT = ${JSON.stringify(fixedFontCss)};
       var FIXED_COLOR = ${JSON.stringify(fixedColorCss)};
