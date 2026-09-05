@@ -1,5 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-02 21:42 (KST) — reeditForTtsPacing이 문장 순서를 바꾸지 않도록 프롬프트 강화
+ * 생성(마지막 작업): 2026-09-06 00:20 (KST) — 생성 폼에 "상세 내용" 입력란 추가(글쓰기 프롬프트에 반영)
+ * + generateScenePrompts가 글 본문 요약(buildArticleDigestForScenes)까지 참고해서 이미지 검색어 정확도 향상
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -420,19 +421,22 @@ async function searchNaverNews(topic, env) {
   }
 }
 
-async function generateArticle(topic, newsResults, env) {
+async function generateArticle(topic, newsResults, env, detail) {
   let systemPrompt, userPrompt;
+  // [2026-09-06 00:20] 사용자가 상세 내용을 적으면 프롬프트에 반드시 반영하도록 지시 한 줄 추가
+  const detailInstruction = detail ? ' 사용자가 다루고 싶은 세부 내용을 아래에 함께 제공하니 그 내용을 반드시 반영해서 글을 쓴다.' : '';
+  const detailBlock = detail ? `\n\n다룰 상세 내용: ${detail}` : '';
   if (newsResults.length) {
     console.log(`네이버 뉴스 ${newsResults.length}건 참고자료로 사용`);
     const referenceText = newsResults
       .map((n, i) => `[참고자료 ${i + 1}] ${n.title}\n${n.description}`)
       .join('\n\n');
-    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 전혀 쓰지 않는다. 쉼표를 쓸 자리는 문장을 끊어서 짧은 문장 두 개로 나눈다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 5분 분량이 되도록 공백 포함 최소 2,500자 이상, 2,500~3,000자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 5~7개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 250자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
-    userPrompt = `주제: ${topic}\n\n${referenceText}`;
+    systemPrompt = `너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다.${detailInstruction} 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 전혀 쓰지 않는다. 쉼표를 쓸 자리는 문장을 끊어서 짧은 문장 두 개로 나눈다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 5분 분량이 되도록 공백 포함 최소 2,500자 이상, 2,500~3,000자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 5~7개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 250자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}`;
+    userPrompt = `주제: ${topic}${detailBlock}\n\n${referenceText}`;
   } else {
     console.log('네이버 뉴스검색 결과 없음(또는 키 미설정), 참고자료 없이 작성');
-    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 전혀 쓰지 않는다. 쉼표를 쓸 자리는 문장을 끊어서 짧은 문장 두 개로 나눈다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 5분 분량이 되도록 공백 포함 최소 2,500자 이상, 2,500~3,000자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 5~7개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 250자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
-    userPrompt = `주제: ${topic}`;
+    systemPrompt = `너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다.${detailInstruction} 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 전혀 쓰지 않는다. 쉼표를 쓸 자리는 문장을 끊어서 짧은 문장 두 개로 나눈다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 5분 분량이 되도록 공백 포함 최소 2,500자 이상, 2,500~3,000자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 5~7개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 250자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}`;
+    userPrompt = `주제: ${topic}${detailBlock}`;
   }
 
   const { result, error, modelUsed } = await callAiChain(systemPrompt, userPrompt, env);
@@ -463,9 +467,19 @@ function isUsableImage(buffer) {
 
 // [2026-09-02 20:45] wantCount 파라미터 추가 — 사용자가 미디어를 직접 첨부한 만큼 AI가 생성할 장면 수를
 // SCENE_COUNT에서 빼서 요청함(전체 장면 수는 항상 SCENE_COUNT로 유지, 첨부분 + AI생성분 = SCENE_COUNT)
-async function generateScenePrompts(topic, articleTitle, env, wantCount = SCENE_COUNT) {
-  const systemPrompt = `너는 짧은 슬라이드쇼 영상을 위한 아트 디렉터다. 주어진 주제와 글 제목을 참고해서, 정지 이미지로 표현할 장면 ${wantCount}개를 구상한다. 각 장면은 서로 다른 각도/구도로 주제를 시각화하며, 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 각 장면마다 두 가지를 만든다: 1) keyword — 실제 스톡사진 사이트(Pexels)에서 진짜로 검색될 만한, 실존하는 사물/장소/상황을 나타내는 짧은 영어 키워드(2~4단어). 너무 추상적이거나 상상 속 장면이 아니라, 사진작가가 실제로 찍었을 법한 평범하고 구체적인 소재로 만든다(예: "laptop office desk", "grocery shopping supermarket", "family dinner table"). 2) prompt — 만약 실사진이 없을 경우에 대비한 AI 이미지 생성용 상세한 장면 묘사. 이 프롬프트는 반드시 영어로만 작성한다(한국어 절대 금지) — 이미지 생성 모델이 영어 캡션으로 학습되어 있어서 한국어를 넣으면 엉뚱한 결과가 나옴. 사진처럼 사실적인 스타일, 카메라 앵글/조명까지 구체적으로 묘사. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"scenes": [{"keyword": "영어 검색어", "prompt": "영어로만 작성된 상세 장면 묘사"}, ...]} (배열 길이는 정확히 ${wantCount}개)`;
-  const userPrompt = `주제: ${topic}\n글 제목: ${articleTitle}`;
+// [2026-09-06 00:20] 장면 키워드가 주제+제목만 보고 뭉뚱그려지던 문제 — 실제 글 본문에 나온 구체적
+// 소재/상황을 반영하도록 섹션별 짧은 요약을 만들어 generateScenePrompts에 같이 넘김. 전체를 다 넣으면
+// 프롬프트가 너무 커지니 섹션당 앞부분만 발췌(소제목 + 120자 내외)해서 총량을 적당히 유지.
+function buildArticleDigestForScenes(article) {
+  if (!article) return '';
+  const introBrief = stripHtml(article.intro_html).slice(0, 200);
+  const sectionBriefs = (article.sections || []).map((s) => `${s.heading}: ${stripHtml(s.body_html).slice(0, 120)}`).join('\n');
+  return [introBrief, sectionBriefs].filter(Boolean).join('\n').slice(0, 1200);
+}
+
+async function generateScenePrompts(topic, articleTitle, env, wantCount = SCENE_COUNT, articleDigest = '') {
+  const systemPrompt = `너는 짧은 슬라이드쇼 영상을 위한 아트 디렉터다. 주어진 주제와 글 제목, 그리고 글 본문 요약을 참고해서, 정지 이미지로 표현할 장면 ${wantCount}개를 구상한다. 본문 요약에 나온 구체적인 소재/상황/장소를 최대한 반영해서 장면을 고른다 — 주제만 보고 막연하게 고르지 않는다. 각 장면은 서로 다른 각도/구도로 시각화하며, 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 각 장면마다 두 가지를 만든다: 1) keyword — 실제 스톡사진 사이트(Pexels)에서 진짜로 검색될 만한, 실존하는 사물/장소/상황을 나타내는 짧은 영어 키워드(2~4단어). 너무 추상적이거나 상상 속 장면이 아니라, 사진작가가 실제로 찍었을 법한 평범하고 구체적인 소재로 만든다(예: "laptop office desk", "grocery shopping supermarket", "family dinner table"). 2) prompt — 만약 실사진이 없을 경우에 대비한 AI 이미지 생성용 상세한 장면 묘사. 이 프롬프트는 반드시 영어로만 작성한다(한국어 절대 금지) — 이미지 생성 모델이 영어 캡션으로 학습되어 있어서 한국어를 넣으면 엉뚱한 결과가 나옴. 사진처럼 사실적인 스타일, 카메라 앵글/조명까지 구체적으로 묘사. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"scenes": [{"keyword": "영어 검색어", "prompt": "영어로만 작성된 상세 장면 묘사"}, ...]} (배열 길이는 정확히 ${wantCount}개)`;
+  const userPrompt = `주제: ${topic}\n글 제목: ${articleTitle}${articleDigest ? `\n\n글 본문 요약:\n${articleDigest}` : ''}`;
   const { result } = await callAiChain(systemPrompt, userPrompt, env);
   if (Array.isArray(result?.scenes) && result.scenes.length) {
     return result.scenes.slice(0, wantCount).map((s) => ({
@@ -2014,7 +2028,7 @@ async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
-async function generateAndSavePost(topic, env, onProgress) {
+async function generateAndSavePost(topic, env, onProgress, detail) {
   const genStartMs = Date.now(); // [2026-08-30 19:45] 생성 소요시간 측정(관리자 표시용)
   const report = (stage, percent) => { if (onProgress) onProgress(stage, percent); };
   if (!env.POSTS) return { ok: false, reason: 'POSTS(KV) 바인딩 없음' };
@@ -2025,7 +2039,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   const usedNews = newsResults.length > 0;
 
   report('글 작성 중', 15);
-  const { article, error: articleError, modelUsed } = await generateArticle(topic, newsResults, env);
+  const { article, error: articleError, modelUsed } = await generateArticle(topic, newsResults, env, detail);
   if (!article) {
     return { ok: false, reason: `글 생성 실패 — ${articleError || '알 수 없는 오류'}` };
   }
@@ -2086,7 +2100,7 @@ async function generateAndSavePost(topic, env, onProgress) {
   let captionBeats = []; // 이미지별 자막 "비트" 배열 — 한 이미지에 문장 여러 개면 순서대로 갈아끼울 목록
   if (env.MEDIA) {
     // 이미지 소스는 저작권이 명확한 것만 사용: FLUX 우선 생성 → 실패시 Pixabay → Pexels
-    const scenes = await generateScenePrompts(topic, article.title, env);
+    const scenes = await generateScenePrompts(topic, article.title, env, SCENE_COUNT, buildArticleDigestForScenes(article));
     // [2026-08-30 19:10] 이 경로는 병렬 수집이라 "못 찾으면 다음 장면에서 재시도" 같은 순차 슬롯이 안 됨 —
     // 고정 슬롯(시작/중간/후반 장면)에서만 클립을 시도하고, 실패하면 그 장면은 사진으로 폴백.
     const clipSlotSet = new Set([0, Math.floor(scenes.length / 3), Math.floor((scenes.length * 2) / 3)].slice(0, CLIP_TARGET));
@@ -2529,7 +2543,7 @@ async function renderAdminPage(env, requestUrl) {
         : `📝 ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
     const cancelBtn = j.failed ? '' : `<form method="POST" action="/admin/cancel-gen" onsubmit="return confirm('생성 취소할까요? 지금까지 만든 이미지·음성이 삭제됩니다.');"><input type="hidden" name="id" value="${j.id}"><button type="submit">🛑 취소</button></form>`;
     const thumb = j.images?.[0]
-      ? `<img src="/media/${escapeHtml(j.images[0])}" alt="">`
+      ? (j.images[0].endsWith('.mp4') ? `<video muted preload="metadata" src="/media/${escapeHtml(j.images[0])}#t=0.1"></video>` : `<img src="/media/${escapeHtml(j.images[0])}" alt="">`)
       : `<div class="placeholder">📝</div>`;
     return `<div class="admin-card ${j.failed ? 'is-failed' : 'is-pending'}">
     <div class="thumb">${thumb}</div>
@@ -2816,6 +2830,7 @@ async function renderAdminPage(env, requestUrl) {
       <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;min-width:200px;" required>
       <button type="button" id="media-upload-btn">📎 미디어 추가</button>
       <button type="submit">글+슬라이드쇼 생성</button>
+      <textarea name="detail" placeholder="상세 내용(선택) — 다룰 내용을 자세히 적을수록 글과 이미지 정확도가 올라가요" maxlength="2000" rows="2" style="width:100%;resize:vertical;padding:9px 12px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;font-family:inherit;"></textarea>
       <input type="hidden" name="userMediaKeys" id="user-media-keys-input" value="[]">
       <input type="file" id="media-upload-input" accept="image/*,video/*" multiple style="display:none;">
       <div id="media-upload-list" style="width:100%;"></div>
@@ -2946,7 +2961,7 @@ async function runGenerationStep(job, env) {
   if (job.stage === 'start') {
     const slug = String(Date.now());
     const newsResults = await searchNaverNews(topic, env);
-    const { article, error: articleError } = await generateArticle(topic, newsResults, env);
+    const { article, error: articleError } = await generateArticle(topic, newsResults, env, job.detail);
     if (!article) throw new Error(`글 생성 실패 — ${articleError || '알 수 없는 오류'}`);
     // [2026-09-02 21:20] 문장을 5초 단위로 자연스럽게 재편집(reeditForTtsPacing)한 뒤 정규화/자름
     const rawNarration = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ');
@@ -3009,7 +3024,7 @@ async function runGenerationStep(job, env) {
     // AI는 나머지 자리(SCENE_COUNT - 첨부 개수)만 생성하도록 요청 장면 수를 줄임
     const userMediaKeys = Array.isArray(job.userMediaKeys) ? job.userMediaKeys : [];
     const wantAiScenes = Math.max(0, SCENE_COUNT - userMediaKeys.length);
-    const scenes = wantAiScenes ? await generateScenePrompts(topic, job.article.title, env, wantAiScenes) : [];
+    const scenes = wantAiScenes ? await generateScenePrompts(topic, job.article.title, env, wantAiScenes, buildArticleDigestForScenes(job.article)) : [];
     return { ...job, audioKey, audioError: null, scenes, sceneIndex: 0, images: userMediaKeys.slice(), stage: scenes.length ? 'images' : 'finalize', percent: 30 };
   }
 
@@ -3356,6 +3371,7 @@ async function handleGenerate(request, env) {
   const form = await request.formData();
   const topic = (form.get('topic') || '').toString().trim().slice(0, 100);
   if (!topic) return new Response('주제를 입력해주세요', { status: 400 });
+  const detail = (form.get('detail') || '').toString().trim().slice(0, 2000); // [2026-09-06 00:20] 상세 내용(선택) — 글쓰기/이미지 검색어 정확도용
 
   // 같은 주제로 최근에 이미 처리 중이거나 방금 만들어진 게 있으면 중복 생성 막음
   // (진행 상황이 안 보여서 여러 번 누르는 경우가 많았음 — 서버가 대신 걸러줌)
@@ -3400,7 +3416,7 @@ async function handleGenerate(request, env) {
   // 여기선 작업 "등록"만 하고, 실제 진행은 관리자 페이지가 /admin/generate-step을 반복 호출하며
   // 한 단계씩(글쓰기/음성/이미지 1장씩/저장/렌더링등록) 진행시킴. 각 단계는 몇 초 안에 끝나서 시간제한에 안 걸림.
   const jobId = crypto.randomUUID();
-  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: 'start', percent: 0, startedAt: Date.now(), createdAt: Date.now(), userMediaKeys /* [2026-08-30 19:45] 생성 소요시간 측정용(startedAt은 스텝마다 갱신됨) */ }));
+  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, detail, stage: 'start', percent: 0, startedAt: Date.now(), createdAt: Date.now(), userMediaKeys /* [2026-08-30 19:45] 생성 소요시간 측정용(startedAt은 스텝마다 갱신됨) */ }));
 
   return new Response(null, { status: 302, headers: { Location: '/admin?genId=' + jobId + '&msg=' + encodeURIComponent(`생성 시작됨: ${topic} (진행률은 아래 목록에서 확인)`) } });
 }
@@ -3421,8 +3437,9 @@ async function handleApiGenerate(request, env) {
   }
   const topic = (body.topic || '').toString().trim().slice(0, 100);
   if (!topic) return new Response(JSON.stringify({ ok: false, error: 'topic 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  const detail = (body.detail || '').toString().trim().slice(0, 2000); // [2026-09-06 00:20] 상세 내용(선택) — 글쓰기/이미지 검색어 정확도용
 
-  const result = await generateAndSavePost(topic, env);
+  const result = await generateAndSavePost(topic, env, null, detail);
   if (!result.ok) return new Response(JSON.stringify({ ok: false, error: result.reason }), { status: 500, headers: { 'Content-Type': 'application/json' } });
 
   return new Response(JSON.stringify({
