@@ -1,7 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-06 01:45 (KST) — wrapCaptionLines가 최대 줄 수를 넘으면 뒤 단어를
- * 버리던 버그 수정(문장이 중간에 잘려 보이던 원인) + generateScenePrompts에 "장면 배열 순서 = 글
- * 내용 순서(도입→섹션)" 지시 추가(영상 장면과 나레이션 내용이 어긋나던 문제 완화)
+ * 생성(마지막 작업): 2026-09-06 02:00 (KST) — Oracle VM 사용량 표시를 30초마다 자동 갱신되게 함
+ * (/admin/oracle-stats 라우트 추가 + 클라이언트 폴링 스크립트)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -182,6 +181,11 @@ export default {
       }
       if (path === '/admin/render-progress') return await handleRenderProgress(request, env, ctx);
       if (path === '/admin/retry-render' && request.method === 'POST') return await handleRetryRender(request, env);
+      // [2026-09-06 02:00] 관리자 페이지가 주기적으로 폴링해서 Oracle VM 사용량을 실시간처럼 갱신
+      if (path === '/admin/oracle-stats') {
+        const stats = await getOracleVmStats(env);
+        return new Response(JSON.stringify(stats || {}), { headers: { 'Content-Type': 'application/json' } });
+      }
       // [2026-08-31] relay VM이 20초마다 이걸 호출 — 1분 Cloudflare Cron 대신(또는 같이) 훨씬 자주
       // 폴링 로직을 실행시켜서 탭 안 열어놔도 생성/렌더/유튜브 재시도가 빠르게 진행되게 함.
       // x-relay-secret으로 인증(기존 RELAY_SECRET 재사용, 별도 시크릿 안 만듦).
@@ -2964,9 +2968,27 @@ async function renderAdminPage(env, requestUrl) {
     })();
   </script>` : '';
 
-  const oracleStatsBar = oracleStats ? `<div class="mono" style="font-size:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;margin-bottom:12px;">
-    🖥️ Oracle VM 최근 1시간 — CPU 평균 ${oracleStats.cpuPercent ?? '—'}%${oracleStats.netInMb != null ? ` · 📥 ${oracleStats.netInMb}MB` : ''}${oracleStats.netOutMb != null ? ` · 📤 ${oracleStats.netOutMb}MB` : ''} · 💰 Always Free 사용 중($0)
-  </div>` : '';
+  const oracleStatsBar = `<div class="mono" id="oracle-stats-bar" style="font-size:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;margin-bottom:12px;${oracleStats ? '' : 'display:none;'}">
+    🖥️ Oracle VM 최근 1시간 — CPU 평균 ${oracleStats?.cpuPercent ?? '—'}%${oracleStats?.netInMb != null ? ` · 📥 ${oracleStats.netInMb}MB` : ''}${oracleStats?.netOutMb != null ? ` · 📤 ${oracleStats.netOutMb}MB` : ''} · 💰 Always Free 사용 중($0)
+  </div>
+  <script>
+    // [2026-09-06 02:00] 30초마다 갱신 — OCI 메트릭은 1분 해상도라 이보다 더 자주 갱신해도 의미 없음
+    (function(){
+      var bar = document.getElementById('oracle-stats-bar');
+      if (!bar) return;
+      function poll(){
+        fetch('/admin/oracle-stats').then(function(r){ return r.json(); }).then(function(s){
+          if (!s || s.cpuPercent === undefined) return; // 시크릿 미설정 등 — 조용히 무시
+          bar.style.display = '';
+          bar.textContent = '🖥️ Oracle VM 최근 1시간 — CPU 평균 ' + (s.cpuPercent ?? '—') + '%'
+            + (s.netInMb != null ? ' · 📥 ' + s.netInMb + 'MB' : '')
+            + (s.netOutMb != null ? ' · 📤 ' + s.netOutMb + 'MB' : '')
+            + ' · 💰 Always Free 사용 중($0)';
+        }).catch(function(){});
+      }
+      setInterval(poll, 30000);
+    })();
+  </script>`;
 
   const body = `${siteHeader()}<div class="wrap" style="padding:32px 0;">
     ${oracleStatsBar}
