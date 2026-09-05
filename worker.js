@@ -1,7 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 01:30 (KST) — 네트워크 사용량이 여전히 비정상적으로 크게 나오던 문제
- * — NetworksBytesIn/Out이 분당 전송량이 아니라 누적 카운터로 보여서, 합계 대신 "마지막값-처음값"으로
- * 그 1시간 동안 실제로 늘어난 양만 계산하도록 수정
+ * 생성(마지막 작업): 2026-09-06 01:45 (KST) — wrapCaptionLines가 최대 줄 수를 넘으면 뒤 단어를
+ * 버리던 버그 수정(문장이 중간에 잘려 보이던 원인) + generateScenePrompts에 "장면 배열 순서 = 글
+ * 내용 순서(도입→섹션)" 지시 추가(영상 장면과 나레이션 내용이 어긋나던 문제 완화)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -479,8 +479,8 @@ function buildArticleDigestForScenes(article) {
 }
 
 async function generateScenePrompts(topic, articleTitle, env, wantCount = SCENE_COUNT, articleDigest = '') {
-  const systemPrompt = `너는 짧은 슬라이드쇼 영상을 위한 아트 디렉터다. 주어진 주제와 글 제목, 그리고 글 본문 요약을 참고해서, 정지 이미지로 표현할 장면 ${wantCount}개를 구상한다. 본문 요약에 나온 구체적인 소재/상황/장소를 최대한 반영해서 장면을 고른다 — 주제만 보고 막연하게 고르지 않는다. 각 장면은 서로 다른 각도/구도로 시각화하며, 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 각 장면마다 두 가지를 만든다: 1) keyword — 실제 스톡사진 사이트(Pexels)에서 진짜로 검색될 만한, 실존하는 사물/장소/상황을 나타내는 짧은 영어 키워드(2~4단어). 너무 추상적이거나 상상 속 장면이 아니라, 사진작가가 실제로 찍었을 법한 평범하고 구체적인 소재로 만든다(예: "laptop office desk", "grocery shopping supermarket", "family dinner table"). 2) prompt — 만약 실사진이 없을 경우에 대비한 AI 이미지 생성용 상세한 장면 묘사. 이 프롬프트는 반드시 영어로만 작성한다(한국어 절대 금지) — 이미지 생성 모델이 영어 캡션으로 학습되어 있어서 한국어를 넣으면 엉뚱한 결과가 나옴. 사진처럼 사실적인 스타일, 카메라 앵글/조명까지 구체적으로 묘사. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"scenes": [{"keyword": "영어 검색어", "prompt": "영어로만 작성된 상세 장면 묘사"}, ...]} (배열 길이는 정확히 ${wantCount}개)`;
-  const userPrompt = `주제: ${topic}\n글 제목: ${articleTitle}${articleDigest ? `\n\n글 본문 요약:\n${articleDigest}` : ''}`;
+  const systemPrompt = `너는 짧은 슬라이드쇼 영상을 위한 아트 디렉터다. 주어진 주제와 글 제목, 그리고 글 본문 요약을 참고해서, 정지 이미지로 표현할 장면 ${wantCount}개를 구상한다. 본문 요약에 나온 구체적인 소재/상황/장소를 최대한 반영해서 장면을 고른다 — 주제만 보고 막연하게 고르지 않는다. 순서(매우 중요): 글 본문 요약은 도입부 → 섹션들 → 순서 그대로 나열되어 있다. 장면 배열의 순서도 반드시 그 순서를 그대로 따라야 한다 — 배열 앞쪽 장면은 글 앞부분(도입부) 내용을, 뒤쪽 장면은 글 뒷부분(뒤쪽 섹션) 내용을 나타내야 한다. 이렇게 해야 영상이 재생될 때 화면 순서와 나레이션이 읽는 내용 순서가 서로 어긋나지 않는다. 각 장면은 서로 다른 각도/구도로 시각화하며, 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 각 장면마다 두 가지를 만든다: 1) keyword — 실제 스톡사진 사이트(Pexels)에서 진짜로 검색될 만한, 실존하는 사물/장소/상황을 나타내는 짧은 영어 키워드(2~4단어). 너무 추상적이거나 상상 속 장면이 아니라, 사진작가가 실제로 찍었을 법한 평범하고 구체적인 소재로 만든다(예: "laptop office desk", "grocery shopping supermarket", "family dinner table"). 2) prompt — 만약 실사진이 없을 경우에 대비한 AI 이미지 생성용 상세한 장면 묘사. 이 프롬프트는 반드시 영어로만 작성한다(한국어 절대 금지) — 이미지 생성 모델이 영어 캡션으로 학습되어 있어서 한국어를 넣으면 엉뚱한 결과가 나옴. 사진처럼 사실적인 스타일, 카메라 앵글/조명까지 구체적으로 묘사. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"scenes": [{"keyword": "영어 검색어", "prompt": "영어로만 작성된 상세 장면 묘사"}, ...]} (배열 길이는 정확히 ${wantCount}개, 배열 순서 = 글 내용 순서)`;
+  const userPrompt = `주제: ${topic}\n글 제목: ${articleTitle}${articleDigest ? `\n\n글 본문 요약(이 순서 그대로 도입부→섹션 순서임):\n${articleDigest}` : ''}`;
   const { result } = await callAiChain(systemPrompt, userPrompt, env);
   if (Array.isArray(result?.scenes) && result.scenes.length) {
     return result.scenes.slice(0, wantCount).map((s) => ({
@@ -2127,15 +2127,24 @@ function buildCaptionBeats(sentences, positionIndex) {
 }
 
 function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
+  // [2026-09-06 01:45] 버그 수정 — 예전엔 maxLines를 넘기면 break로 루프를 통째로 빠져나가서
+  // 그 뒤에 남은 단어들이 전부 사라졌음(문장이 중간에 잘려 보이던 원인). 이제 마지막 줄 한도에
+  // 도달하면 남은 단어를 전부 마지막 줄에 이어붙여서 내용이 아무리 길어도 절대 버려지지 않게 함
+  // (줄이 조금 길어질 수는 있지만, 내용이 통째로 사라지는 것보다 훨씬 안전함).
   const words = (text || '').split(/\s+/).filter(Boolean);
   const lines = [];
   let current = '';
-  for (const w of words) {
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
     const candidate = current ? current + ' ' + w : w;
     if (candidate.length > maxCharsPerLine && current) {
+      if (lines.length >= maxLines - 1) {
+        // 마지막 줄 한도 — 지금까지 모은 current + 남은 단어 전부를 마지막 줄로 합쳐서 절대 유실 없이 끝냄
+        lines.push([current, ...words.slice(i)].join(' '));
+        return lines;
+      }
       lines.push(current);
       current = w;
-      if (lines.length >= maxLines - 1) break;
     } else {
       current = candidate;
     }
