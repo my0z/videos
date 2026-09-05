@@ -1,6 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 02:00 (KST) — Oracle VM 사용량 표시를 30초마다 자동 갱신되게 함
- * (/admin/oracle-stats 라우트 추가 + 클라이언트 폴링 스크립트)
+ * 생성(마지막 작업): 2026-09-06 02:10 (KST) — 웹 자막의 왼쪽아래/오른쪽아래 위치가 화면 폭 55%로
+ * 갇혀있던 버그 수정(좁은 화면+커진 폰트에서 한 줄에 몇 글자만 보이고 나머지 잘리던 원인) — 폭 제한
+ * 풀고 정렬만 유지
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2383,8 +2384,11 @@ function renderSlideshow(post) {
         captionEl.style.transform = 'none';
         if (st.pos === 'bottom') { captionEl.style.bottom = '80px'; captionEl.style.left = '24px'; captionEl.style.right = '24px'; }
         else if (st.pos === 'top') { captionEl.style.top = '60px'; captionEl.style.left = '24px'; captionEl.style.right = '24px'; }
-        else if (st.pos === 'bl') { captionEl.style.bottom = '90px'; captionEl.style.left = '20px'; captionEl.style.right = '45%'; captionEl.style.textAlign = 'left'; }
-        else if (st.pos === 'br') { captionEl.style.bottom = '90px'; captionEl.style.right = '20px'; captionEl.style.left = '45%'; captionEl.style.textAlign = 'right'; }
+        // [2026-09-06 02:10] 버그 수정 — 예전엔 right:45%/left:45%로 폭을 절반 정도만 쓰게 가둬놔서
+        // 좁은 화면(휴대폰)+커진 폰트 조합에서 한 줄에 몇 글자만 들어가고 나머지가 넘쳐서 잘려 보였음.
+        // 좌우 정렬(text-align)만 유지하고 폭 제한은 풀어서 전체 가로폭을 다 쓰게 함.
+        else if (st.pos === 'bl') { captionEl.style.bottom = '90px'; captionEl.style.left = '20px'; captionEl.style.right = '20px'; captionEl.style.textAlign = 'left'; }
+        else if (st.pos === 'br') { captionEl.style.bottom = '90px'; captionEl.style.right = '20px'; captionEl.style.left = '20px'; captionEl.style.textAlign = 'right'; }
         else if (st.pos === 'middle') { captionEl.style.top = '42%'; captionEl.style.left = '24px'; captionEl.style.right = '24px'; }
       }
 
