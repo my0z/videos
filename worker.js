@@ -1,8 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 01:00 (KST) — 관리자 페이지 최상단에 Oracle VM 사용량(CPU/네트워크,
- * 최근 1시간) 표시 추가. OCI API 서명(RSA-SHA256, Web Crypto)을 직접 구현(ociSignedRequest 등),
- * OCI_USER_OCID/OCI_TENANCY_OCID/OCI_FINGERPRINT/OCI_PRIVATE_KEY/OCI_REGION/OCI_INSTANCE_OCID
- * 시크릿 필요(없으면 조용히 표시 생략). 비용은 Always Free라 "$0" 고정 문구로 표시
+ * 생성(마지막 작업): 2026-09-06 01:20 (KST) — OCI_PRIVATE_KEY 파싱 버그 수정(BEGIN/END 사이만 정확히
+ * 추출) + 네트워크 사용량이 200GB로 잘못 나오던 버그 수정([1h]+1분해상도 조합이 롤링합계를 계속
+ * 찍어서 과대계산됐음 → [1m]으로 분당 값 받아 CPU는 평균·네트워크는 합계로 직접 집계)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1437,7 +1436,11 @@ async function ociSignedRequest(env, method, url, bodyObj) {
 }
 
 // 지정 메트릭의 최근 1시간 평균값을 하나 가져옴(Monitoring API summarizeMetricsData) — 실패하면 null
-async function fetchOciMetricMean(env, mql) {
+// [2026-09-06 01:20] 버그 수정 — mql에 [1h] 구간을 쓰면서 resolution도 1m으로 요청하니 "1시간 롤링
+// 합계"가 1분마다 찍혀서 마지막 값 하나만 써도 실제보다 훨씬 크게 나왔음(네트워크가 200GB로 보이던 원인).
+// [1m] 구간으로 바꿔서 분당 값들을 받은 뒤, CPU는 평균(mean of means)·네트워크는 합계(총 전송량)로
+// 직접 집계함 — 이래야 진짜 "최근 1시간" 수치가 됨.
+async function fetchOciMetricSeries(env, mql) {
   try {
     const region = env.OCI_REGION;
     const url = `https://telemetry.${region}.oraclecloud.com/20180401/metrics/actions/summarizeMetricsData?compartmentId=${encodeURIComponent(env.OCI_TENANCY_OCID)}`;
@@ -1454,9 +1457,7 @@ async function fetchOciMetricMean(env, mql) {
     }
     const data = await res.json();
     const points = data?.[0]?.aggregatedDatapoints;
-    if (!Array.isArray(points) || !points.length) return null;
-    // 가장 최근 값을 씀 — mean()이라 이미 구간 평균이 들어있음
-    return points[points.length - 1].value;
+    return Array.isArray(points) && points.length ? points : null;
   } catch (e) {
     console.log(`OCI 메트릭 조회 실패(${mql}): ${e.message}`);
     return null;
@@ -1470,11 +1471,16 @@ async function getOracleVmStats(env) {
   }
   try {
     const filter = `{resourceId = "${env.OCI_INSTANCE_OCID}"}`;
-    const [cpu, netIn, netOut] = await Promise.all([
-      fetchOciMetricMean(env, `CpuUtilization[1h]${filter}.mean()`),
-      fetchOciMetricMean(env, `NetworksBytesIn[1h]${filter}.sum()`),
-      fetchOciMetricMean(env, `NetworksBytesOut[1h]${filter}.sum()`),
+    const [cpuPoints, netInPoints, netOutPoints] = await Promise.all([
+      fetchOciMetricSeries(env, `CpuUtilization[1m]${filter}.mean()`),
+      fetchOciMetricSeries(env, `NetworksBytesIn[1m]${filter}.sum()`),
+      fetchOciMetricSeries(env, `NetworksBytesOut[1m]${filter}.sum()`),
     ]);
+    const avgOf = (pts) => (pts && pts.length ? pts.reduce((a, b) => a + b.value, 0) / pts.length : null);
+    const sumOf = (pts) => (pts && pts.length ? pts.reduce((a, b) => a + b.value, 0) : null);
+    const cpu = avgOf(cpuPoints); // CPU는 분당 평균들의 평균 — 지난 1시간 평균 사용률
+    const netIn = sumOf(netInPoints); // 네트워크는 분당 전송량을 전부 더해서 1시간 총 전송량
+    const netOut = sumOf(netOutPoints);
     return {
       cpuPercent: typeof cpu === 'number' ? Math.round(cpu * 10) / 10 : null,
       netInMb: typeof netIn === 'number' ? Math.round((netIn / 1024 / 1024) * 10) / 10 : null,
