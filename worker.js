@@ -1378,7 +1378,10 @@ let relayHealthFailCount = 0;
 // Workers엔 Node crypto가 없어서 Web Crypto(SubtleCrypto)로 직접 구현. 개인키는 PKCS8 PEM 형식이라
 // (-----BEGIN PRIVATE KEY-----) importKey('pkcs8', ...)에 바로 씀 — RSA PRIVATE KEY(PKCS1) 형식이면 이 방식이 안 통함.
 function pemToArrayBuffer(pem) {
-  const clean = pem.replace(/-----BEGIN [^-]+-----/, '').replace(/-----END [^-]+-----/, '').replace(/\s+/g, '');
+  // [2026-09-06 01:10] BEGIN/END 마커 밖에 다른 텍스트가 붙어있어도(예: 파일 라벨 "OCI_API_KEY" 같은 게
+  // 끝에 같이 붙는 경우) 그건 무시하고 마커 "사이"의 내용만 정확히 뽑아냄 — atob 깨지던 원인
+  const match = pem.match(/-----BEGIN [^-]+-----([\s\S]*?)-----END [^-]+-----/);
+  const clean = (match ? match[1] : pem).replace(/\s+/g, '');
   const binary = atob(clean);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
