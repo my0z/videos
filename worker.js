@@ -1,3442 +1,2728 @@
 /**
- * 생성(마지막 작업): 2026-09-02 21:42 (KST) — reeditForTtsPacing이 문장 순서를 바꾸지 않도록 프롬프트 강화
- * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
- *
- * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
- * 미디어: 장면 20개 = 실사 클립 3개(Pixabay/Pexels 영상, 연관성 검사 통과분만) + 사진 17장
- *        (사진: Pixabay → Pexels → Unsplash → 다 실패하면 Workers AI(FLUX) 생성)
- * 음성: Google Cloud TTS(Chirp3-HD 우선, 실패시 Wavenet, 최후 Workers AI MeloTTS) — 목소리는 영상당 하나로 고정.
- *      문장 하나하나를 따로 합성해 relay.js가 실측 길이로 이어붙임 — 모든 문장 시작이 실측 리셋 지점(자막 싱크의 핵심).
- *      세그먼트 하나라도 끝내 실패하면 무음으로 발행하지 않고 발행 자체를 중단(올린 조각/이미지 정리 후 실패 처리).
- *      mp4까지 다 만들었는데 최종 파일에 오디오 트랙이 없는 경우(relay.js가 ffprobe로 검증)도 글째로 삭제.
- * 자막: 문장 하나를 통째(내부 줄바꿈)로 이미지별 "비트"에 배정 + 비트마다 음성 조각 번호(segIndex)를 실어 보내
- *      relay.js가 세그먼트 실측 시각으로 타이밍을 맞춤(추정 없음). 위치/폰트/색은 영상당 하나씩 랜덤 고정.
- * mp4 렌더링: Oracle VM의 relay.js(ffmpeg)에 비동기로 위임 — 자막 굽기/전환(xfade)/컬러그레이딩/loudnorm/
- *            청크 분할 렌더링(5장씩)까지 relay.js가 처리, 이 워커는 1분 크론 + 실시간 폴링으로 완료 감지
- * 유튜브: mp4 렌더링 확정되는 즉시 백그라운드로 자동 업로드(청크 업로드, 진행률 실시간 표시) + 숏츠 3개(도입/중간/결론, 세로 9:16, 각 ~57초, #Shorts)도 이어서 업로드,
- *        privacyStatus public. 실패해도 글은 유지하고 youtubeError만 기록(음성과 달리 발행을 막지 않음)
- * [2026-08-31 07:05] 생성 자체는 /admin/generate-step을 여러 번 호출해 단계별로 진행(Workers 30초 실행제한 회피).
- *   관리자 페이지가 열려있으면 1.5초마다 빠르게 진행되고, 페이지를 닫아도 1분 크론(scheduled)이 pollPendingGenJobs로
- *   같은 runGenerationStep을 대신 호출해 한 단계씩 이어서 진행함 — 더 이상 "탭을 보고 있어야만" 만들어지지 않음.
- *   다만 크론 주기가 느려서(1.5초 vs 1분) 탭 없이 완성되는 데는 몇십 분 걸릴 수 있음(1분마다 한 단계씩).
+ * 생성(마지막 작업): 2026-09-05 22:00 (KST) — 헤더 주석 서비스명 kiwoom-relay → relay로 갱신(폴더/서비스명 변경 반영)
+ * relay - Oracle VM에서 상시 실행되는 중계 서버. 두 역할을 겸함:
+ *   1) 키움 Real API 릴레이(주식 스크리너/자동매매용)
+ *   2) videos.usb.kr(life.news) 영상 렌더링 — ffmpeg로 이미지 슬라이드쇼+내레이션 합성, 자막 굽기,
+ *      xfade 전환, 숏츠(9:16) 컷, R2 업로드까지 처리. Worker가 /render로 작업을 맡기고 /render/status로 폴링.
+ * 포트 8787 하나로 두 역할 다 처리(같은 Node 프로세스).
  */
+const http = require("http");
+const https = require("https");
+const WebSocket = require("ws");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
-const CF_ACCOUNT_ID = '709dcc6af36c8ee7b6d3d99e7a9fe422';
-const VEO_MODEL = 'veo-3.1-fast-generate-preview';
-const VIDEO_JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30분 넘게 안 끝나면 포기
-// [2026-08-31 07:05] 5분 → 1분: Cloudflare Cron 트리거의 최소 단위가 1분이라 이보다 더 못 줄임.
-// wrangler.toml의 crons 배열도 이 값과 반드시 똑같이 '* * * * *'로 맞춰야 실제로 1분마다 실행됨(둘이 안 맞으면
-// event.cron이 이 상수와 달라서 아래 scheduled()의 if문을 그냥 건너뜀 — 배포 후 크론 안 도는 흔한 원인).
-const VIDEO_POLL_CRON = '* * * * *'; // 이 크론이 실행되면 콘텐츠 발행 대신 영상 작업 폴링 + 생성 작업 진행만 함
-const CF_AI_GATEWAY = 'yzusb';
-const VEO_BASE_URL = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/google-ai-studio/v1beta`;
-const SCENE_COUNT = 20; // 슬라이드쇼에 쓸 장면 이미지 개수 — 4분 분량 영상 기준 20장(장당 평균 12초 내외)
-// [2026-09-02 20:21] genJob 동시실행 방지 락 — 원인: 관리자 탭의 1.5초 폴링(stepGen) + 1분 크론
-// (pollPendingGenJobs) + relay의 cron-tick(약 20초마다, runVideoPollTick)이 전부 서로 모른 채 같은
-// genJob을 동시에 runGenerationStep()으로 처리할 수 있었음. Cloudflare KV는 원자적 CAS가 없어서, 세
-// 경로가 거의 동시에 같은 job을 읽으면 finalize 단계(post 저장 + index에 slug 추가)가 여러 번 실행돼
-// 같은 글이 index에 중복으로 쌓이고 관리자 목록에 똑같은 글이 여러 줄로 보이는 원인이 됐음(실제 발생 사례:
-// "면역·유전 치료가 바꾸는 암과..." 글이 완전히 같은 내용/시각으로 4줄 중복). 진짜 원자적 락은 KV로는
-// 못 만들지만, job을 읽자마자(무거운 작업 시작 전에) lockedAt을 바로 기록해 다른 경로가 곧바로 이어서
-// 같은 job을 읽더라도 "방금 누가 막 잠갔다"를 보고 건너뛰게 함 — 경쟁 창을 수 초~수십 초에서 KV
-// 왕복시간(수십 ms) 수준으로 좁힘. finalize의 index 중복 방지(idx.includes 체크)는 그래도 혹시 겹치면
-// 최후의 안전장치로 같이 넣음.
-const GEN_JOB_LOCK_MS = 20000; // 이 시간 안에 다시 같은 job이 잡히면 "이미 처리 중"으로 보고 건너뜀
-// 나레이션 길이 안전 상한(공백 포함) — 글 생성 프롬프트가 목표 분량을 쓰지만, 모델이 초과해서 쓸 경우를
-// 대비해 문장 경계에서 잘라 상한을 넘지 않게 함(한국어 TTS ≈ 분당 400자).
-// [2026-08-31] 실제 영상이 2분 남짓밖에 안 나온다는 피드백 — AI가 목표 분량(2,000~2,500자)을 못 채우고
-// 짧게 쓰고 있었던 것(undershoot). "약 N분" 대신 "최소 O자 이상" 문구로 강하게 못박아 목표를 정함.
-// [2026-09-02 19:56] 3,500~4,200자(7~8분)로 올렸더니 문장 수(=음성 세그먼트 수)가 너무 많아져서 relay
-// 렌더링이 실패하는 빈도가 늘어남(사용자 관찰) — 2,500~3,000자(약 5분)로 다시 낮춤. 상한도 그에 맞춰 축소.
-const NARRATION_MAX_CHARS = 3300;
-const CAPTION_STYLE_COUNT = 5; // 자막 "위치" 종류 개수 — 웹(CSS)과 mp4(relay.js drawtext) 둘 다 같은 인덱스 규칙을 씀
-// 자막 위치/폰트/색 전부 영상 하나당 하나씩만 랜덤 고정(비트마다 안 바뀜 — 계속 바뀌면 산만해서 전부 고정으로 변경).
-// font key는 relay.js가 실제로 서버에 설치해둔 폰트 파일과 매칭되는 키만 사용(웹/mp4 폰트 일치 보장).
-// [2026-08-30 20:46] 두꺼운 폰트(도현/검은고딕) 제거 + 예쁜 폰트 4종 추가(고운바탕/송명/개구/하이멜로디)
-// 전부 구글폰트 무료(OFL). relay.js의 CAPTION_FONT_PATHS와 key가 일치해야 하고, VM에 TTF 설치 필요(미설치면 있는 폰트로 폴백).
-const CAPTION_FONT_CHOICES = [
-  { key: 'gowun', css: "'Gowun Dodum','Noto Sans KR',sans-serif" },
-  { key: 'nanumpen', css: "'Nanum Pen Script','Gowun Dodum',cursive" },
-  { key: 'gowunbatang', css: "'Gowun Batang',serif" },
-  { key: 'songmyung', css: "'Song Myung',serif" },
-  { key: 'gaegu', css: "'Gaegu',cursive" },
-  { key: 'himelody', css: "'Hi Melody',cursive" },
-  // [2026-08-30 22:02] 아기자기한 폰트 4종 추가(사용자 요청) — 전부 구글폰트 무료(OFL), relay 키와 일치
-  { key: 'poorstory', css: "'Poor Story',cursive" },
-  { key: 'gamjaflower', css: "'Gamja Flower',cursive" },
-  { key: 'singleday', css: "'Single Day',cursive" },
-  { key: 'cutefont', css: "'Cute Font',cursive" },
-  // [2026-08-30 23:31] 예쁜 폰트 5종 추가(사용자 요청, 두꺼운 폰트 제외) — 전부 구글폰트 무료(OFL), relay 키와 일치
-  { key: 'stylish', css: "'Stylish',sans-serif" },
-  { key: 'yeonsung', css: "'Yeon Sung',cursive" },
-  { key: 'gugi', css: "'Gugi',cursive" },
-  { key: 'nanumbrush', css: "'Nanum Brush Script',cursive" },
-  { key: 'sunflower', css: "'Sunflower',sans-serif" }, // Light(300) 웨이트만 로드 — 얇고 깔끔
-];
-const CAPTION_COLOR_CHOICES = ['#ffffff', '#FFD93D', '#FF6FA5', '#4FC3F7', '#6EE7B7', '#FFA94D', '#B197FC', '#FF8787'];
-function pickCaptionStyle() {
-  const font = CAPTION_FONT_CHOICES[Math.floor(Math.random() * CAPTION_FONT_CHOICES.length)];
-  const color = CAPTION_COLOR_CHOICES[Math.floor(Math.random() * CAPTION_COLOR_CHOICES.length)];
-  const positionIndex = Math.floor(Math.random() * CAPTION_STYLE_COUNT);
-  return { captionFontKey: font.key, captionColor: color, captionPositionIndex: positionIndex };
+const PORT = process.env.PORT || 8787;
+const RELAY_SECRET = process.env.RELAY_SECRET;
+const KIWOOM_REAL_HOST = "api.kiwoom.com";
+
+// ---------- 영상 렌더링 (life.news용, ffmpeg 무료 대체) — 작업: 2026-08-30 20:46 ----------
+// Shotstack/Rendobar 같은 외부 유료 렌더링 서비스 대신, 이미 상시 가동 중인 이 VM에서
+// ffmpeg로 이미지+음성을 mp4로 합성 -> R2에 직접 업로드. R2 버킷은 Worker와 동일한 걸 써서
+// Worker는 그냥 자기 R2 바인딩으로 읽기만 하면 됨(중계 다운로드 불필요).
+// 렌더링 큐: 한 번에 하나씩만 처리(VM 메모리가 빠듯해서 동시 여러 개 돌리면 다 같이 느려짐/멈춤).
+// 자막: 이미지별 "비트"(줄 단위) 배열을 drawtext로 시간대별로 그림, 사진 전환은 xfade 크로스페이드
+// (전환마다 밀리지 않도록 이미지별로 그때그때 보정), 컬러그레이딩(eq)·업스케일(lanczos)도 여기서 적용.
+// 음성 있으면 loudnorm으로 볼륨 정규화, 없으면 사인파 3개로 만든 자체 배경음악(저작권 문제 없음)을 대신 깖.
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "709dcc6af36c8ee7b6d3d99e7a9fe422";
+
+// ffmpeg/ffprobe는 항상 낮은 CPU 우선순위(nice 15)로 실행 — 같은 VM에서 도는 키움 트레이딩 릴레이가
+// 장중에도 항상 CPU를 먼저 가져가게 함. 렌더링은 몇 초~몇 분 느려져도 되지만 시세 응답은 밀리면 안 됨.
+function spawnMedia(cmd, args) {
+  return spawn("nice", ["-n", "15", cmd, ...args]);
+}
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_BUCKET = process.env.R2_BUCKET || "usbkr-videos";
+const RENDER_IMAGE_DURATION_SEC = 4;
+
+const r2Client = (R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY)
+  ? new S3Client({
+      region: "auto",
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+    })
+  : null;
+
+// jobId -> { status: "processing"|"done"|"failed", error, r2Key, startedAt }
+const renderJobs = new Map();
+// 오래된 완료/실패 job은 메모리에서 주기적으로 정리 (30분 지나면 제거)
+setInterval(() => {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [id, job] of renderJobs) {
+    if (job.status !== "processing" && (job.completedAt || job.startedAt) < cutoff) renderJobs.delete(id);
+  }
+}, 5 * 60 * 1000);
+
+// VM 메모리가 빠듯해서(kiwoomapi 실시간 릴레이랑 같이 씀) ffmpeg 렌더링을 동시에 여러 개 돌리면
+// 서로 자원을 다투다가 다 같이 느려지거나 멈춘 것처럼 보임 — 한 번에 하나씩만 순서대로 처리하는 큐.
+let renderQueue = Promise.resolve();
+function enqueueRender(task) {
+  renderQueue = renderQueue.then(task, task); // 앞 작업이 실패해도 큐는 계속 이어짐
+  return renderQueue;
 }
 
-const STYLE = `
-  :root{
-    --bg:#FFFFFF; --surface:#F7F8FA; --border:#E3E6EB;
-    --teal:#14B8A6; --teal-text:#0D7B6C; --amber:#F59E0B; --amber-text:#B45309;
-    --text:#14171C; --muted:#667085;
+function downloadToFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(destPath);
+    https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        file.close();
+        fs.unlink(destPath, () => {});
+        reject(new Error(`다운로드 실패 HTTP ${res.statusCode}: ${url}`));
+        return;
+      }
+      res.pipe(file);
+      file.on("finish", () => file.close(resolve));
+    }).on("error", (err) => {
+      file.close();
+      fs.unlink(destPath, () => {});
+      reject(err);
+    });
+  });
+}
+
+// onProgress(percent): ffmpeg 진행 상황을 stderr의 "time=" 라인에서 파싱해서 콜백으로 알림
+function runFfmpeg(args, totalDurationSec, onProgress) {
+  return new Promise((resolve, reject) => {
+    const proc = spawnMedia("ffmpeg", args);
+    let stderr = "";
+    proc.stderr.on("data", (d) => {
+      const chunk = d.toString();
+      stderr += chunk;
+      if (onProgress && totalDurationSec > 0) {
+        const m = chunk.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+        if (m) {
+          const elapsed = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+          const percent = Math.min(99, Math.round((elapsed / totalDurationSec) * 100));
+          onProgress(percent);
+        }
+      }
+    });
+    proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
+    proc.on("close", (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(describeFfmpegFailure(code, signal, stderr)));
+    });
+  });
+}
+
+// 오디오 파일의 실제 길이(초)를 ffprobe로 확인 — 이걸 알아야 이미지별 노출시간을 자막 비율대로 정확히 나눌 수 있음
+function getAudioDurationSec(audioPath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawnMedia("ffprobe", ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", audioPath]);
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d) => { stdout += d.toString(); });
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (err) => reject(new Error(`ffprobe 실행 실패: ${err.message}`)));
+    proc.on("close", (code) => {
+      const sec = parseFloat(stdout.trim());
+      if (code === 0 && Number.isFinite(sec) && sec > 0) resolve(sec);
+      else reject(new Error(`ffprobe 길이 확인 실패: ${stderr.slice(-300)}`));
+    });
+  });
+}
+
+// 완성된 output.mp4에 실제로 재생 가능한 오디오 트랙이 들어갔는지 검증 — 나레이션이 있었는데(audioPath)
+// 다운로드가 미묘하게 깨졌거나 필터 그래프 문제로 최종 파일엔 오디오가 빠지는 경우를 잡아내기 위함.
+// 그냥 오디오 스트림 존재 여부만 보지 않고, duration이 0.5초 넘게 실제로 있는지까지 확인(빈 트랙 방지).
+function verifyOutputHasAudio(filePath) {
+  return new Promise((resolve) => {
+    const proc = spawnMedia("ffprobe", [
+      "-v", "error",
+      "-select_streams", "a",
+      "-show_entries", "stream=codec_type,duration",
+      "-of", "csv=p=0",
+      filePath,
+    ]);
+    let stdout = "";
+    proc.stdout.on("data", (d) => { stdout += d.toString(); });
+    proc.on("error", () => resolve(false));
+    proc.on("close", () => {
+      const line = stdout.trim().split("\n")[0] || "";
+      const [codecType, durationRaw] = line.split(",");
+      const duration = parseFloat(durationRaw);
+      resolve(codecType === "audio" && Number.isFinite(duration) && duration > 0.5);
+    });
+  });
+}
+
+// 이미지별 노출시간(초) 배열 계산 — weights(자막 글자수 비율)가 있으면 오디오 실길이에 비례 배분,
+// 없거나 개수가 안 맞으면 기존처럼 고정 길이(RENDER_IMAGE_DURATION_SEC)로 폴백.
+// precomputedDuration: 호출부에서 이미 ffprobe로 재둔 오디오 길이가 있으면 넘겨서 중복 ffprobe 호출을 피함.
+async function computeImageDurations(imageCount, audioPath, weights, precomputedDuration) {
+  // 음성이 없어도 자막 분량(weights)에 비례해서 노출시간을 나눠줌 — 안 그러면 이미지당 고정 시간 안에
+  // 문장이 몇 개든 욱여넣게 돼서 자막이 순식간에 지나가버림.
+  const hasWeights = Array.isArray(weights) && weights.length === imageCount;
+  const sumWeights = hasWeights ? (weights.reduce((a, b) => a + b, 0) || 1) : 1;
+  const MIN_SEC = 1.5; // 너무 짧은 컷은 어색하니 최소치는 보장
+
+  if (!audioPath) {
+    const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC; // 음성 없을 때 전체 길이 기준(이미지당 평균 4초어치)
+    if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+    return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
   }
-  *{box-sizing:border-box;}
-  body{ background:var(--bg); color:var(--text); margin:0; font-family:'Inter',system-ui,-apple-system,sans-serif; line-height:1.6; }
-  .mono{ font-family:'IBM Plex Mono',monospace; }
-  h1,h2,h3{ font-family:'Space Grotesk',sans-serif; letter-spacing:-0.02em; margin:0; }
-  a{ color:inherit; text-decoration:none; }
-  .wrap{ max-width:820px; margin:0 auto; padding:0 24px; }
-  header.site{ border-bottom:1px solid var(--border); padding:22px 0; }
-  header.site .wrap{ display:flex; justify-content:space-between; align-items:center; }
-  .logo{ font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:21px; }
-  .logo span{ color:var(--teal-text); }
-  .hero{ padding:56px 0 32px; border-bottom:1px solid var(--border); }
-  .hero .eyebrow{ font-family:'IBM Plex Mono',monospace; font-size:12px; letter-spacing:0.12em; color:var(--teal-text); text-transform:uppercase; margin-bottom:12px; display:block; }
-  .hero h1{ font-size:36px; font-weight:700; line-height:1.2; }
-  .hero p.sub{ color:var(--muted); font-size:15px; margin:12px 0 0; max-width:520px; }
-  .index{ padding:8px 0 48px; }
-  .entry{ display:flex; gap:20px; align-items:stretch; padding:28px 0; border-top:1px solid var(--border); }
-  .entry:first-child{ border-top:none; padding-top:8px; }
-  .entry-main{ flex:1; min-width:0; }
-  .entry-eyebrow{ font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--teal-text); letter-spacing:0.04em; margin-bottom:8px; }
-  .entry-title{ font-family:'Fraunces',serif; font-optical-sizing:auto; font-weight:500; font-size:23px; line-height:1.3; margin:0 0 8px; }
-  .entry:hover .entry-title{ color:var(--teal-text); }
-  .entry-excerpt{ color:var(--muted); font-size:14px; line-height:1.6; margin:0 0 10px; }
-  .entry-meta{ font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--muted); }
-  .entry-thumb{ flex-shrink:0; width:120px; border-radius:8px; overflow:hidden; background:#000; }
-  .entry-thumb img{ width:100%; height:100%; object-fit:cover; }
-  .post-body{ padding:40px 0; max-width:720px; }
-  .post-body h1{ font-size:30px; margin-bottom:8px; }
-  .post-body .meta{ color:var(--muted); font-size:13px; font-family:'IBM Plex Mono',monospace; margin-bottom:24px; }
-  .post-body h2{ font-size:20px; margin:28px 0 10px; }
-  .post-body p{ margin:0 0 16px; color:var(--text); }
-  footer{ border-top:1px solid var(--border); padding:24px 0; color:var(--muted); font-size:13px; }
-  .table-scroll{ width:100%; overflow-x:auto; margin-top:16px; -webkit-overflow-scrolling:touch; }
-  table{ width:100%; min-width:640px; border-collapse:collapse; }
-  th,td{ text-align:left; padding:10px; border-bottom:1px solid var(--border); font-size:13px; word-break:keep-all; overflow-wrap:break-word; white-space:normal; vertical-align:top; }
-  th:first-child,td:first-child{ min-width:160px; }
-  input[type=text]{ padding:9px 12px; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:13px; font-family:inherit; }
-  button{ background:var(--teal); color:#0B1210; border:none; padding:10px 16px; border-radius:6px; font-weight:700; cursor:pointer; }
-  button.danger{ background:#E06C6C; color:#fff; }
-  .slideshow{ position:relative; aspect-ratio:16/9; background:#000; border-radius:10px; overflow:hidden; margin:20px 0; }
-  .slideshow .slide{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; opacity:0; transition:opacity 0.8s ease; }
-  .slideshow .slide.active{ opacity:1; }
-  .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:1px solid rgba(255,255,255,0.4); padding:8px 16px; border-radius:20px; font-size:13px; font-weight:600; cursor:pointer; backdrop-filter:blur(4px); }
-  .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
-  .slideshow .caption-box{ position:absolute; z-index:4; min-height:0; background:transparent; padding:0 12px; white-space:pre-line; transition:top 0.3s ease, bottom 0.3s ease, left 0.3s ease, right 0.3s ease;
-    -webkit-text-stroke:7px #000;
-    paint-order:stroke fill;
-    text-shadow:-6px -6px 0 #000, 6px -6px 0 #000, -6px 6px 0 #000, 6px 6px 0 #000, 0 -6px 0 #000, 0 6px 0 #000, -6px 0 0 #000, 6px 0 0 #000;
-  }
-  .slideshow .caption-box:empty{ display:none; }
 
-  /* [2026-09-02 20:30] 관리자 페이지 카드 그리드 — 인스타그램 피드처럼 정사각형 썸네일 그리드로 표시 */
-  .admin-grid{ display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:14px; margin-top:18px; }
-  .admin-card{ border:1px solid var(--border); border-radius:12px; overflow:hidden; background:#fff; display:flex; flex-direction:column; }
-  .admin-card.is-pending{ border-color:#F59E0B; }
-  .admin-card.is-failed{ border-color:#DC2626; }
-  .admin-card .thumb{ display:block; position:relative; aspect-ratio:1/1; width:100%; background:#11151A; overflow:hidden; }
-  .admin-card .thumb img, .admin-card .thumb video{ width:100%; height:100%; object-fit:cover; display:block; }
-  .admin-card .thumb .placeholder{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:34px; color:#3A4048; }
-  .admin-card .thumb .dur-badge{ position:absolute; right:6px; bottom:6px; background:rgba(0,0,0,0.65); color:#fff; font-size:10px; padding:2px 6px; border-radius:4px; font-family:'IBM Plex Mono',monospace; }
-  .admin-card .body{ padding:10px 11px 11px; display:flex; flex-direction:column; gap:6px; flex:1; }
-  .admin-card .title{ font-size:12.5px; font-weight:600; line-height:1.35; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
-  .admin-card .topic{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--teal-text); }
-  .admin-card .status-line{ font-size:11px; color:var(--muted); line-height:1.5; }
-  .admin-card .progress-track{ height:5px; border-radius:3px; background:var(--surface); overflow:hidden; }
-  .admin-card .progress-fill{ height:100%; width:0%; background:var(--teal); transition:width 0.5s ease; }
-  .admin-card.is-failed .progress-fill{ background:#DC2626; }
-  .admin-card .date{ font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--muted); margin-top:auto; }
-  .admin-card .actions{ display:flex; flex-wrap:wrap; gap:5px; }
-  .admin-card .actions a, .admin-card .actions button{ font-size:10.5px; padding:4px 8px; border-radius:5px; }
-  .admin-card .actions a{ background:var(--surface); color:var(--text); border:1px solid var(--border); }
-  .admin-card .actions form{ margin:0; display:inline; }
-`;
-
-const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Gowun+Dodum&family=Nanum+Pen+Script&family=Gowun+Batang&family=Song+Myung&family=Gaegu&family=Hi+Melody&family=Poor+Story&family=Gamja+Flower&family=Single+Day&family=Cute+Font&family=Stylish&family=Yeon+Sung&family=Gugi&family=Nanum+Brush+Script&family=Sunflower:wght@300&display=swap" rel="stylesheet">`;
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname;
+  let audioDuration = Number.isFinite(precomputedDuration) && precomputedDuration > 0 ? precomputedDuration : null;
+  if (!audioDuration) {
     try {
-      if (path === '/') return await renderHomePage(env);
-      if (path === '/admin') return await renderAdminPage(env, url);
-      if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env);
-      if (path === '/api/generate' && request.method === 'POST') return await handleApiGenerate(request, env);
-      if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
-      if (path === '/admin/dismiss-fail' && request.method === 'POST') { // [2026-08-30 19:52] 렌더링 실패 기록 확인 후 지우기
-        const form = await request.formData();
-        const failSlug = (form.get('slug') || '').toString();
-        if (failSlug) await env.POSTS.delete(`renderFail:${failSlug}`);
-        return new Response(null, { status: 302, headers: { Location: '/admin' } });
-      }
-      if (path === '/admin/render-progress') return await handleRenderProgress(request, env, ctx);
-      if (path === '/admin/retry-render' && request.method === 'POST') return await handleRetryRender(request, env);
-      // [2026-08-31] relay VM이 20초마다 이걸 호출 — 1분 Cloudflare Cron 대신(또는 같이) 훨씬 자주
-      // 폴링 로직을 실행시켜서 탭 안 열어놔도 생성/렌더/유튜브 재시도가 빠르게 진행되게 함.
-      // x-relay-secret으로 인증(기존 RELAY_SECRET 재사용, 별도 시크릿 안 만듦).
-      if (path === '/admin/cron-tick' && request.method === 'POST') {
-        if (!env.RELAY_SECRET || request.headers.get('x-relay-secret') !== env.RELAY_SECRET) {
-          return new Response('unauthorized', { status: 401 });
-        }
-        await runVideoPollTick(env, ctx);
-        return new Response(JSON.stringify({ ok: true, at: new Date().toISOString() }), { headers: { 'Content-Type': 'application/json' } });
-      }
-      if (path === '/admin/generate-step' && request.method === 'POST') return await handleGenerateStep(request, env);
-      if (path === '/admin/cancel-gen' && request.method === 'POST') return await handleCancelGen(request, env);
-      if (path === '/admin/upload-media' && request.method === 'POST') return await handleUploadMedia(request, env);
-      if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
-      const rootSlugMatch = path.match(/^\/([^\/]+)$/);
-      if (rootSlugMatch) return await renderPostPage(env, decodeURIComponent(rootSlugMatch[1]));
-      return new Response('Not Found', { status: 404 });
+      audioDuration = await getAudioDurationSec(audioPath);
     } catch (e) {
-      return new Response('Server error: ' + e.message, { status: 500 });
+      console.log(`오디오 길이 확인 실패, 고정 길이로 폴백: ${e.message}`);
+      const totalSec = imageCount * RENDER_IMAGE_DURATION_SEC;
+      if (!hasWeights) return Array(imageCount).fill(RENDER_IMAGE_DURATION_SEC);
+      return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * totalSec));
     }
-  },
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      (async () => {
-        console.log(`=== 크론 실행: ${new Date().toISOString()} (cron: ${event.cron}) ===`);
-        if (event.cron === VIDEO_POLL_CRON) {
-          await runVideoPollTick(env, ctx);
+  }
+  if (!hasWeights) {
+    return Array(imageCount).fill(audioDuration / imageCount);
+  }
+  return weights.map((w) => Math.max(MIN_SEC, (w / sumWeights) * audioDuration));
+}
+
+// 문장 사이 무음(쉬는) 구간을 실제 음성 파일에서 찾음 — 글자수 비율 추정 대신 진짜 쉬는 지점을 알아내서
+// 자막 타이밍을 정확히 맞추기 위함. ffmpeg의 silencedetect 필터가 stderr로
+// "silence_start: 12.34" / "silence_end: 12.87 | silence_duration: 0.53" 형식으로 찍어줌.
+function detectSilenceGaps(audioPath, noiseDb = -30, minDurSec = 0.12) {
+  return new Promise((resolve) => {
+    const proc = spawnMedia("ffmpeg", [
+      "-i", audioPath,
+      "-af", `silencedetect=noise=${noiseDb}dB:d=${minDurSec}`,
+      "-f", "null", "-",
+    ]);
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", () => resolve([]));
+    proc.on("close", () => {
+      const starts = [...stderr.matchAll(/silence_start:\s*(-?[\d.]+)/g)].map((m) => parseFloat(m[1]));
+      const ends = [...stderr.matchAll(/silence_end:\s*(-?[\d.]+)/g)].map((m) => parseFloat(m[1]));
+      const gaps = [];
+      for (let i = 0; i < Math.min(starts.length, ends.length); i++) {
+        if (Number.isFinite(starts[i]) && Number.isFinite(ends[i]) && ends[i] > starts[i]) {
+          gaps.push({ start: starts[i], end: ends[i] });
         }
-      })()
-    );
+      }
+      resolve(gaps);
+    });
+  });
+}
+
+// captionBeats(이미지별 자막 비트 배열)를 한 줄로 펼쳐서, 오디오 전체를 하나의 타임라인으로 보고 각 비트의
+// 실제 시작/끝 시각(초, 오디오 처음부터 기준)을 계산함.
+//
+// 동작 원리(경량 강제정렬): ① 글자수 비율로 각 문장 경계의 "예상 위치"를 먼저 계산 ② 실제 음성에서 찾은
+// 무음 구간들 중 예상 위치 근처(허용오차 안)에 있는 것을 그 경계의 실제 시각으로 앵커링 ③ 앵커가 잡힐
+// 때마다 이후 예상 위치들을 실제 진행 속도에 맞춰 다시 스케일링(추정 오차가 누적되기 전에 계속 교정됨)
+// ④ 무음이 안 잡힌 경계는 이웃 앵커 사이에서 비율 보간.
+//
+// 예전 구현은 "감지된 무음 개수 == 문장 경계 개수"가 정확히 일치할 때만 적용하고 아니면 통째로 포기했는데,
+// 실제 TTS는 쉼표에서도 쉬고(가짜 무음) 문장 사이를 붙여 읽기도 해서(무음 누락) 개수가 정확히 맞는 경우가
+// 드묾 — 사실상 거의 항상 폴백돼서 개선이 적용되지 않았음. 지금 방식은 개수가 안 맞아도 맞는 무음만 골라
+// 쓰므로 대부분의 영상에서 실제 앵커링이 동작함. 앵커를 하나도 못 찾은 경우에만 null(기존 추정 방식 폴백).
+async function computeRealBeatTimeline(audioPath, audioDuration, captionBeatsPerImage, imageWeights) {
+  if (!audioPath || !Number.isFinite(audioDuration) || audioDuration <= 0) return null;
+  if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
+  // 이미지마다 비트가 최소 1개는 있어야 이미지별 노출시간을 실제 타임라인에서 얻을 수 있음 — 하나라도 비면 폴백.
+  if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) return null;
+
+  // 이미지별 오디오 배분 비율 — Worker가 보낸 weights(글자수 기반, 합=1)를 쓰고, 없으면 균등 분배로 대체.
+  const n = captionBeatsPerImage.length;
+  const hasW = Array.isArray(imageWeights) && imageWeights.length === n && imageWeights.every((w) => Number.isFinite(w) && w > 0);
+  const rawW = hasW ? imageWeights : Array(n).fill(1 / n);
+  const sumW = rawW.reduce((a, b) => a + b, 0) || 1;
+  const wNorm = rawW.map((w) => w / sumW);
+
+  // 재생 순서 그대로 펼치면서, 글자수 비율 기반 "예상" 시작/끝 시각을 함께 계산.
+  // isSentenceEnd 플래그가 없는 옛 버전 Worker가 보낸 비트여도 동작하도록, 줄 텍스트가 문장부호로
+  // 끝나는지로 문장 경계를 추론하는 폴백을 둠(문장 마지막 줄에는 마침표/물음표 등이 남아있음).
+  const flat = []; // { imgIndex, beatIndex, weight, isSentenceEnd, estStart, estEnd }
+  let cursor = 0;
+  captionBeatsPerImage.forEach((beats, imgIndex) => {
+    const imgDur = wNorm[imgIndex] * audioDuration;
+    const beatSum = beats.reduce((a, b) => a + (Math.max(Number(b.weight) || 0, 0.0001)), 0) || 1;
+    beats.forEach((beat, beatIndex) => {
+      const w = Math.max(Number(beat.weight) || 0, 0.0001);
+      const dur = (w / beatSum) * imgDur;
+      const text = (beat.text || "").trim();
+      const isEnd = beat.isSentenceEnd !== undefined ? !!beat.isSentenceEnd : /[.!?。！？…]["'」』)]?$/.test(text);
+      flat.push({ imgIndex, beatIndex, weight: w, isSentenceEnd: isEnd, estStart: cursor, estEnd: cursor + dur });
+      cursor += dur;
+    });
+  });
+  if (flat.length) flat[flat.length - 1].isSentenceEnd = true; // 마지막 비트는 무조건 마지막 문장의 끝
+
+  // 문장 경계 목록: "문장이 끝나는 비트" 뒤가 경계(마지막 문장 뒤는 파일 끝이라 경계 아님)
+  const boundaries = []; // { flatIdx, est } — est: 경계의 예상 시각(= 그 문장 마지막 비트의 예상 끝)
+  for (let i = 0; i < flat.length - 1; i++) {
+    if (flat[i].isSentenceEnd) boundaries.push({ flatIdx: i, est: flat[i].estEnd, real: null });
+  }
+  if (!boundaries.length) return null; // 문장이 1개뿐이면 추정이랑 차이가 없음 — 그냥 폴백
+
+  let gaps;
+  try {
+    gaps = await detectSilenceGaps(audioPath);
+  } catch (e) {
+    return null;
+  }
+  // 파일 시작/끝 여백의 무음은 문장 사이 쉼이 아니므로 제외. 너무 짧은 무음(쉼표 수준)은 후보에서 빼되,
+  // 문장 사이 쉼이 원래 짧은 TTS도 있어서 0.15초까지는 후보로 인정(스코어에서 긴 쉼을 우대해 구분).
+  const EDGE_MARGIN = 0.25;
+  const candidates = gaps
+    .map((g) => ({ start: g.start, end: g.end, dur: g.end - g.start }))
+    .filter((g) => g.dur >= 0.15 && g.start > EDGE_MARGIN && g.end < audioDuration - EDGE_MARGIN)
+    .sort((a, b) => a.start - b.start);
+  if (!candidates.length) return null;
+
+  // 예상 위치 근처의 무음을 순서대로(단조증가) 앵커링. 앵커가 잡히면 남은 구간의 예상 위치를
+  // "실제 남은 시간 / 예상 남은 시간" 비율로 재스케일 — TTS가 추정보다 빨리/느리게 읽어도 계속 따라감.
+  let lastAnchorTime = 0;
+  let lastAnchorEst = 0;
+  let gapPtr = 0;
+  let anchoredCount = 0;
+  for (const b of boundaries) {
+    const remainReal = audioDuration - lastAnchorTime;
+    const remainEst = Math.max(0.001, audioDuration - lastAnchorEst);
+    const estAdj = lastAnchorTime + (b.est - lastAnchorEst) * (remainReal / remainEst);
+    // 허용오차: 마지막 앵커에서 멀수록 추정 오차가 커지므로 거리에 비례해 넓힘. TTS 말속도가 문장에 따라
+    // 추정보다 30~40%씩 다를 수 있어서 넉넉히 잡되(최소 1.2초), 쉼표급 짧은 무음(0.28초 미만)은 진짜
+    // 문장 쉼일 가능성이 낮으니 절반 오차 안에 있을 때만 인정 — 미끼에 낚이는 걸 막음.
+    const tol = Math.max(1.2, 0.35 * (estAdj - lastAnchorTime));
+    let best = null;
+    for (let gi = gapPtr; gi < candidates.length; gi++) {
+      const g = candidates[gi];
+      if (g.end <= lastAnchorTime + 0.15) { continue; }
+      if (g.end > estAdj + tol) break; // 후보는 시각순 정렬돼 있으니 더 볼 필요 없음
+      const gapTol = g.dur >= 0.28 ? tol : tol * 0.5;
+      if (Math.abs(g.end - estAdj) > gapTol) continue;
+      // 예상 위치에 가까울수록 + 무음이 길수록(진짜 문장 쉼일수록) 좋은 후보
+      const score = Math.abs(g.end - estAdj) - Math.min(g.dur, 0.6) * 0.5;
+      if (!best || score < best.score) best = { gi, g, score };
+    }
+    if (best) {
+      b.real = best.g.end; // 다음 문장 음성이 실제로 시작하는 순간에 자막이 바뀜(무음 동안은 이전 자막 유지)
+      gapPtr = best.gi + 1; // 단조증가 보장 — 이미 쓴 무음(과 그 이전 것)은 재사용 안 함
+      lastAnchorTime = b.real;
+      lastAnchorEst = b.est;
+      anchoredCount++;
+    }
+  }
+  if (!anchoredCount) return null; // 하나도 못 맞췄으면 무음 감지를 신뢰할 수 없음 — 폴백
+
+  // 앵커 못 잡은 경계는 이웃 앵커(없으면 파일 시작 0 / 끝 audioDuration) 사이에서 예상 비율로 보간
+  const points = [{ est: 0, real: 0 }, ...boundaries.filter((b) => b.real !== null).map((b) => ({ est: b.est, real: b.real })), { est: audioDuration, real: audioDuration }];
+  const mapEstToReal = (est) => {
+    for (let i = 1; i < points.length; i++) {
+      if (est <= points[i].est || i === points.length - 1) {
+        const a = points[i - 1];
+        const b = points[i];
+        const span = Math.max(0.001, b.est - a.est);
+        return a.real + ((est - a.est) / span) * (b.real - a.real);
+      }
+    }
+    return est;
+  };
+  boundaries.forEach((b) => { if (b.real === null) b.real = mapEstToReal(b.est); });
+
+  // 문장 단위로 실제 구간을 배정하고, 문장 안의 각 줄(비트)은 글자수 비율로 그 작은 구간만 나눔 —
+  // 남은 추정 오차는 문장 하나 길이 안으로만 국한되고 영상 전체에 누적되지 않음.
+  const segStarts = [0, ...boundaries.map((b) => b.real)];
+  const segEnds = [...boundaries.map((b) => b.real), audioDuration];
+  const perImageBeatTimes = captionBeatsPerImage.map((beats) => new Array(beats.length));
+  let sentenceStartFlatIdx = 0;
+  let segIdx = 0;
+  for (let i = 0; i < flat.length; i++) {
+    if (!flat[i].isSentenceEnd) continue;
+    const sentenceBeats = flat.slice(sentenceStartFlatIdx, i + 1);
+    const segStart = segStarts[segIdx];
+    const segEnd = segEnds[segIdx];
+    const segDur = Math.max(0.05, segEnd - segStart);
+    const sw = sentenceBeats.reduce((a, b) => a + b.weight, 0) || 1;
+    let t = segStart;
+    sentenceBeats.forEach((b) => {
+      const dur = (b.weight / sw) * segDur;
+      perImageBeatTimes[b.imgIndex][b.beatIndex] = { start: t, end: t + dur };
+      t += dur;
+    });
+    sentenceStartFlatIdx = i + 1;
+    segIdx++;
+  }
+
+  const imageSpans = perImageBeatTimes.map((times) => ({ start: times[0].start, end: times[times.length - 1].end }));
+  return { perImageBeatTimes, imageSpans, anchoredCount, boundaryCount: boundaries.length };
+}
+
+// ---------- 세그먼트 음성 기반 "실측" 자막 타이밍 — 작업: 2026-08-30 19:59 ----------
+// Worker가 나레이션을 문장 몇 개씩 묶은 세그먼트 단위로 따로 합성해 보내주면(audioSegments),
+// 여기서 각 조각의 실제 길이를 잰 뒤 이어붙임 — 세그먼트 경계의 시각이 "측정값"이라 자막이 어긋날 수가 없음.
+// (전체를 한 번에 합성한 파일에서 무음을 감지해 맞추는 방식은 사람 같은 TTS의 숨소리 때문에 불안정했음.)
+
+// [2026-08-30 19:58] ffmpeg stderr에서 배너(버전/컴파일 옵션/라이브러리 나열)를 걷어냄 — 에러 메시지가
+// 배너에 밀려 잘리면 "실패했는데 이유가 안 보이는" 상황이 됨(실제로 겪음). 진짜 에러 줄만 남김.
+// [2026-09-01] "ffmpeg 종료코드 null"처럼 code가 null인 건 정상 종료가 아니라 신호(signal)로 강제
+// 종료됐다는 뜻인데(예: OOM killer의 SIGKILL), 예전엔 이 signal을 아예 안 잡아서 원인 파악이 불가능했음.
+// 여기서 signal과 그 시점의 메모리 여유를 같이 남겨서 다음에 실패하면 바로 OOM인지 판단 가능하게 함.
+function describeFfmpegFailure(code, signal, stderr) {
+  const freeMb = Math.round(os.freemem() / 1024 / 1024);
+  const totalMb = Math.round(os.totalmem() / 1024 / 1024);
+  const memNote = `메모리 여유 ${freeMb}MB/${totalMb}MB`;
+  if (signal) {
+    const oomHint = signal === 'SIGKILL' ? ' — SIGKILL은 OOM killer(메모리 부족으로 커널이 강제 종료)일 가능성이 높음' : '';
+    return `ffmpeg가 신호로 강제 종료됨(signal=${signal}, ${memNote})${oomHint}\n마지막 출력: ${cleanFfmpegStderr(stderr).slice(-800)}`;
+  }
+  return `ffmpeg 종료코드 ${code} (${memNote}): ${cleanFfmpegStderr(stderr).slice(-800)}`;
+}
+
+function cleanFfmpegStderr(stderr) {
+  return (stderr || "")
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      return t && !t.startsWith("ffmpeg version") && !t.startsWith("built with") &&
+        !t.startsWith("configuration:") && !/^lib(av|sw|post)\w*\s/.test(t);
+    })
+    .join("\n");
+}
+
+function runFfmpegQuiet(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawnMedia("ffmpeg", ["-y", ...args]);
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (err) => reject(new Error(`ffmpeg 실행 실패: ${err.message}`)));
+    proc.on("close", (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(describeFfmpegFailure(code, signal, stderr)));
+    });
+  });
+}
+
+// 다운로드된 세그먼트 mp3들을 → (24kHz 모노 wav + 세그먼트 사이 0.35초 쉼 패딩) → 하나로 이어붙임.
+// 반환: { audioPath(narration.wav), segStarts[k](세그먼트 k의 시작 시각, 실측), totalDur }
+// 패딩 "후" 파일을 ffprobe로 재기 때문에 segStarts는 이어붙인 결과와 정확히 일치함(wav=PCM이라 오차 없음).
+const SEGMENT_PAUSE_SEC = 0.35; // 문장 사이 자연스러운 쉼 — 따로 합성된 조각을 그냥 붙이면 너무 급하게 들림
+async function prepareSegmentedNarration(tmpDir, segmentPaths) {
+  const wavPaths = [];
+  const segDurs = [];
+  for (let k = 0; k < segmentPaths.length; k++) {
+    const wav = path.join(tmpDir, `seg-${k}.wav`);
+    const padArgs = k < segmentPaths.length - 1 ? ["-af", `apad=pad_dur=${SEGMENT_PAUSE_SEC}`] : [];
+    await runFfmpegQuiet(["-i", segmentPaths[k], ...padArgs, "-ar", "24000", "-ac", "1", wav]);
+    wavPaths.push(wav);
+    segDurs.push(await getAudioDurationSec(wav));
+  }
+  const listFile = path.join(tmpDir, "seg-list.txt");
+  fs.writeFileSync(listFile, wavPaths.map((p) => `file '${p}'`).join("\n"), "utf8");
+  const audioPath = path.join(tmpDir, "narration.wav");
+  await runFfmpegQuiet(["-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", audioPath]);
+  const segStarts = [];
+  let cum = 0;
+  for (const d of segDurs) { segStarts.push(cum); cum += d; }
+  return { audioPath, segStarts, totalDur: cum };
+}
+
+// 세그먼트 실측 시각(segStarts) 기반으로 모든 비트의 시작/끝을 계산 — computeRealBeatTimeline과 같은
+// 반환 형태. 각 비트는 worker가 실어준 segIndex(그 문장이 합성된 세그먼트 번호)로 자기 세그먼트의
+// 실측 구간 [segStarts[k], segStarts[k+1])에 배정되고, 그 안에서만 글자수 비례로 나뉨 — 세그먼트가
+// 짧아서(90~220자) 남은 추정 오차는 티가 안 나고, 경계는 측정값이라 누적 자체가 불가능.
+function computeSegmentBeatTimeline(captionBeatsPerImage, segStarts, audioDuration) {
+  if (!Array.isArray(captionBeatsPerImage) || !captionBeatsPerImage.length) return null;
+  if (captionBeatsPerImage.some((beats) => !Array.isArray(beats) || !beats.length)) return null;
+  // [2026-09-02] segStarts 배열 길이 검증 추가 — 세그먼트가 N개면 경계(segStarts)는 N+1개여야 함
+  // (시작 경계 + N-1개 사이 경계 + 끝 경계). 이걸 무시하고 진행하면 segStarts[k+1] 접근에서 undefined가 나올 수 있음.
+  if (!Array.isArray(segStarts) || segStarts.length !== captionBeatsPerImage.length + 1) {
+    console.log(`[computeSegmentBeatTimeline] 배열 길이 불일치: captionBeatsPerImage=${captionBeatsPerImage.length}, segStarts=${segStarts?.length || 'null'} (기대값: ${captionBeatsPerImage.length + 1})`);
+    return null;
+  }
+  const flat = [];
+  captionBeatsPerImage.forEach((beats, imgIndex) => {
+    beats.forEach((beat, beatIndex) => {
+      flat.push({ imgIndex, beatIndex, weight: Math.max(Number(beat.weight) || 0, 0.0001), segIndex: beat.segIndex });
+    });
+  });
+  // 모든 비트에 유효한 세그먼트 번호가 있어야 함(옛 Worker가 보낸 요청엔 없음 → 폴백)
+  if (flat.some((b) => !Number.isInteger(b.segIndex) || b.segIndex < 0 || b.segIndex >= segStarts.length - 1)) return null;
+  // 세그먼트별 비트 묶음 — 비어있는 세그먼트가 있으면 타임라인에 구멍이 생기므로 폴백(정상 흐름에선 없음)
+  const bySeg = Array.from({length: captionBeatsPerImage.length}, () => []);
+  for (const b of flat) bySeg[b.segIndex].push(b);
+  if (bySeg.some((arr) => !arr.length)) return null;
+
+  const perImageBeatTimes = captionBeatsPerImage.map((beats) => new Array(beats.length));
+  for (let k = 0; k < bySeg.length; k++) {
+    const segStart = segStarts[k];
+    const segEnd = segStarts[k + 1];
+    const segDur = Math.max(0.05, segEnd - segStart);
+    const sumW = bySeg[k].reduce((a, b) => a + b.weight, 0) || 1;
+    let t = segStart;
+    for (const b of bySeg[k]) {
+      const dur = (b.weight / sumW) * segDur;
+      perImageBeatTimes[b.imgIndex][b.beatIndex] = { start: t, end: t + dur };
+      t += dur;
+    }
+  }
+  const imageSpans = perImageBeatTimes.map((times) => ({ start: times[0].start, end: times[times.length - 1].end }));
+  return { perImageBeatTimes, imageSpans, segmentCount: segStarts.length };
+}
+
+// 자막용 폰트 4종을 각각 개별로 찾아둠(예전엔 하나만 골라서 전체에 썼는데, 이제 영상마다 Worker가
+// 정해준 폰트 키 하나로 고정해서 씀 — worker.js의 CAPTION_FONT_CHOICES와 key가 일치해야 함).
+// CAPTION_FONT_PATH 환경변수를 지정하면 모든 키가 그 폰트 하나로 강제됨(예전 동작 유지용 이스케이프 해치).
+function resolveFontPath(candidates) {
+  if (process.env.CAPTION_FONT_PATH && fs.existsSync(process.env.CAPTION_FONT_PATH)) {
+    return process.env.CAPTION_FONT_PATH;
+  }
+  return candidates.find((p) => fs.existsSync(p)) || null;
+}
+// [2026-08-30 20:46] 두꺼운 폰트(도현/검은고딕) 제거 + 예쁜 폰트 4종 추가 — worker.js CAPTION_FONT_CHOICES와 key 일치.
+// 신규 폰트 TTF는 VM에 설치 필요(설치 안 돼 있으면 FALLBACK_FONT_PATH로 자동 폴백이라 렌더링은 안 죽음).
+const CAPTION_FONT_PATHS = {
+  gowun: resolveFontPath([
+    "/usr/local/share/fonts/GowunDodum-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/GowunDodum-Regular.ttf",
+  ]),
+  nanumpen: resolveFontPath([
+    "/usr/local/share/fonts/NanumPenScript-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/NanumPenScript-Regular.ttf",
+  ]),
+  gowunbatang: resolveFontPath([
+    "/usr/local/share/fonts/GowunBatang-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/GowunBatang-Regular.ttf",
+  ]),
+  songmyung: resolveFontPath([
+    "/usr/local/share/fonts/SongMyung-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/SongMyung-Regular.ttf",
+  ]),
+  gaegu: resolveFontPath([
+    "/usr/local/share/fonts/Gaegu-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/Gaegu-Regular.ttf",
+  ]),
+  himelody: resolveFontPath([
+    "/usr/local/share/fonts/HiMelody-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/HiMelody-Regular.ttf",
+  ]),
+  // [2026-08-30 22:02] 아기자기한 폰트 4종 추가(사용자 요청) — worker.js CAPTION_FONT_CHOICES와 키 일치, TTF는 VM 설치 필요
+  poorstory: resolveFontPath([
+    "/usr/local/share/fonts/PoorStory-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/PoorStory-Regular.ttf",
+  ]),
+  gamjaflower: resolveFontPath([
+    "/usr/local/share/fonts/GamjaFlower-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/GamjaFlower-Regular.ttf",
+  ]),
+  singleday: resolveFontPath([
+    "/usr/local/share/fonts/SingleDay-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/SingleDay-Regular.ttf",
+  ]),
+  cutefont: resolveFontPath([
+    "/usr/local/share/fonts/CuteFont-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/CuteFont-Regular.ttf",
+  ]),
+  // [2026-08-30 23:31] 예쁜 폰트 5종 추가(사용자 요청, 두꺼운 폰트 제외) — worker.js CAPTION_FONT_CHOICES와 키 일치, TTF는 VM 설치 필요
+  stylish: resolveFontPath([
+    "/usr/local/share/fonts/Stylish-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/Stylish-Regular.ttf",
+  ]),
+  yeonsung: resolveFontPath([
+    "/usr/local/share/fonts/YeonSung-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/YeonSung-Regular.ttf",
+  ]),
+  gugi: resolveFontPath([
+    "/usr/local/share/fonts/Gugi-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/Gugi-Regular.ttf",
+  ]),
+  nanumbrush: resolveFontPath([
+    "/usr/local/share/fonts/NanumBrushScript-Regular.ttf",
+    "/usr/share/fonts/truetype/custom/NanumBrushScript-Regular.ttf",
+  ]),
+  sunflower: resolveFontPath([
+    "/usr/local/share/fonts/Sunflower-Light.ttf", // Sunflower는 Regular 없이 Light/Medium/Bold — 얇은 Light 사용
+    "/usr/share/fonts/truetype/custom/Sunflower-Light.ttf",
+  ]),
+};
+// 요청받은 폰트 키가 이 VM에 실제로 설치돼있지 않으면(아직 다운로드 전 등) 있는 것 중 아무거나로 폴백 —
+// 폰트 없다고 자막 자체를 통째로 스킵하던 예전 방식보다 훨씬 덜 아쉬움.
+const FALLBACK_FONT_PATH =
+  CAPTION_FONT_PATHS.gowun || CAPTION_FONT_PATHS.nanumpen || CAPTION_FONT_PATHS.gowunbatang || CAPTION_FONT_PATHS.songmyung ||
+  CAPTION_FONT_PATHS.gaegu || CAPTION_FONT_PATHS.himelody ||
+  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+function resolveVideoFontPath(fontKey) {
+  return (fontKey && CAPTION_FONT_PATHS[fontKey]) || FALLBACK_FONT_PATH;
+}
+
+// 자막 "위치" 후보 5개 — 이제 비트마다 순환하지 않고, Worker(worker.js)가 영상 하나당 하나를 골라서
+// 모든 비트에 같은 styleIndex로 넣어 보냄(폰트/색과 동일하게 영상 전체 고정). 여기선 그 인덱스로 매칭만 함.
+// [2026-08-30 20:13] 자막 크기 2/3로 축소(사용자 요청): 60/56/66/62/64 → 40/37/44/41/43
+const CAPTION_POSITIONS = [
+  { x: "(w-text_w)/2", y: "h-th-80", size: 40 },
+  { x: "(w-text_w)/2", y: "80", size: 37 },
+  { x: "60", y: "h-th-90", size: 44 },
+  { x: "w-text_w-60", y: "h-th-90", size: 41 },
+  { x: "(w-text_w)/2", y: "(h-th)/2", size: 43 },
+];
+
+async function runRender(jobId, images, audioUrl, audioSegmentUrls, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `render-${jobId}-`));
+  const setProgress = (stage, percent) => {
+    const prev = renderJobs.get(jobId) || {};
+    renderJobs.set(jobId, { ...prev, status: "processing", stage, percent, startedAt: prev.startedAt || Date.now() });
+  };
+  try {
+    if (!r2Client) throw new Error("R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY 환경변수 없음");
+    if (!images.length) throw new Error("이미지가 없음");
+
+    setProgress("이미지 다운로드 중", 5);
+    // [2026-08-30 19:10] 미디어 종류 구분 — .mp4는 실사 클립(장면 일부에 사진 대신 사용), 나머지는 사진.
+    // 확장자만으로 판단(Worker가 키를 그렇게 만들어 보냄). mediaIsClip은 입력 인자/필터 구성에서 씀.
+    const imagePaths = [];
+    const mediaIsClip = [];
+    for (let i = 0; i < images.length; i++) {
+      const isClip = /\.mp4(\?|$)/i.test(images[i]);
+      const dest = path.join(tmpDir, `img-${i}.${isClip ? "mp4" : "jpg"}`);
+      await downloadToFile(images[i], dest);
+      imagePaths.push(dest);
+      mediaIsClip.push(isClip);
+      setProgress("이미지 다운로드 중", 5 + Math.round((i + 1) / images.length * 15)); // 5~20%
+    }
+    // ---- 음성 확보: 세그먼트(실측 타이밍)가 최우선, 없거나 실패하면 통짜 mp3(추정 타이밍) ----
+    let audioPath = null;
+    let audioDurationSec = null;
+    let segStarts = null; // 세그먼트별 시작 시각(실측) — 자막 타이밍의 기준점
+    if (Array.isArray(audioSegmentUrls) && audioSegmentUrls.length) {
+      try {
+        setProgress("음성 세그먼트 다운로드 중", 21);
+        const segPaths = [];
+        for (let k = 0; k < audioSegmentUrls.length; k++) {
+          const dest = path.join(tmpDir, `seg-src-${k}.mp3`);
+          await downloadToFile(audioSegmentUrls[k], dest);
+          segPaths.push(dest);
+        }
+        setProgress("음성 세그먼트 결합 중", 23);
+        const prepared = await prepareSegmentedNarration(tmpDir, segPaths);
+        audioPath = prepared.audioPath;
+        audioDurationSec = prepared.totalDur;
+        segStarts = prepared.segStarts;
+      } catch (e) {
+        console.log(`[render:${jobId}] 세그먼트 음성 준비 실패(통짜 mp3로 폴백): ${e.message}`);
+        audioPath = null;
+        segStarts = null;
+      }
+    }
+    if (!audioPath && audioUrl) {
+      setProgress("음성 다운로드 중", 22);
+      audioPath = path.join(tmpDir, "narration.mp3");
+      await downloadToFile(audioUrl, audioPath);
+    }
+
+    setProgress("영상 길이 계산 중", 25);
+    if (audioPath && !audioDurationSec) {
+      try { audioDurationSec = await getAudioDurationSec(audioPath); } catch (e) { console.log(`[render:${jobId}] 오디오 길이 확인 실패: ${e.message}`); }
+    }
+    // 자막 타이밍 우선순위: ① 세그먼트 실측(정확, 추정 없음) ② 무음 감지 정렬(구버전 요청 하위호환)
+    // ③ 글자수 비율 추정(최후 폴백). ①이 있으면 ②는 아예 시도하지 않음.
+    let realTimeline = null;
+    if (audioPath && audioDurationSec && Array.isArray(captionBeats)) {
+      if (segStarts) {
+        realTimeline = computeSegmentBeatTimeline(captionBeats, segStarts, audioDurationSec);
+      }
+      if (!realTimeline) {
+        try {
+          realTimeline = await computeRealBeatTimeline(audioPath, audioDurationSec, captionBeats, weights);
+        } catch (e) {
+          console.log(`[render:${jobId}] 무음 구간 타이밍 계산 실패, 글자수 비율 추정으로 폴백: ${e.message}`);
+          realTimeline = null;
+        }
+      }
+      console.log(`[render:${jobId}] 자막 타이밍: ${realTimeline
+        ? (realTimeline.segmentCount
+          ? `세그먼트 실측(${realTimeline.segmentCount}개 조각, 경계 전부 측정값)`
+          : `무음 구간 앵커링(문장 경계 ${realTimeline.boundaryCount}개 중 ${realTimeline.anchoredCount}개 실측, 나머지 보간)`)
+        : '글자수 비율 추정(폴백)'}`);
+    }
+    const durations = realTimeline
+      ? realTimeline.imageSpans.map((span) => Math.max(0.3, span.end - span.start))
+      : await computeImageDurations(imagePaths.length, audioPath, weights, audioDurationSec);
+    // 전환(xfade) 보정: 전환마다 다음 이미지의 시작이 겹침(fade 길이)만큼 당겨지므로, "그 전환의 실제
+    // fade 길이"를 왼쪽 이미지 노출시간에 더해줘야 이후 모든 이미지/자막의 벽시계 타이밍이 계획과 정확히
+    // 일치함. 예전엔 고정 XFADE_DUR을 더한 뒤 실제 fade는 min()으로 줄어들 수 있어서(짧은 컷) 그 차이만큼
+    // 뒤 이미지들이 늦어지는 미세 드리프트가 있었음 — fade를 먼저 확정하고 그 값을 그대로 더해서 해결.
+    const XFADE_DUR = 0.6; // 전환 길이 상한(초)
+    const xfadeDurs = [];
+    if (durations.length > 1) {
+      for (let i = 0; i < durations.length - 1; i++) {
+        xfadeDurs.push(Math.max(0.05, Math.min(XFADE_DUR, durations[i] * 0.4, durations[i + 1] * 0.4)));
+      }
+      for (let i = 0; i < durations.length - 1; i++) durations[i] += xfadeDurs[i];
+    }
+    const totalDurationSec = durations.reduce((a, b) => a + b, 0);
+    // 이 영상 전체에 쓸 폰트/색을 하나로 확정 — Worker가 골라서 넘겨준 값(위치도 이제 비트마다 안 바뀌고
+    // 영상 하나당 하나로 고정 — captionBeats의 styleIndex가 전부 동일한 값으로 옴).
+    const resolvedFontPath = resolveVideoFontPath(captionFontKey);
+    const fontAvailable = !!resolvedFontPath && fs.existsSync(resolvedFontPath);
+    if (!fontAvailable) {
+      console.log(`[render:${jobId}] 자막 폰트를 못 찾음(요청 키: ${captionFontKey}, 경로: ${resolvedFontPath}) — 이번 렌더링은 자막 없이 진행`);
+    }
+    const captionColorFF = (typeof captionColor === "string" && /^#[0-9a-fA-F]{6}$/.test(captionColor))
+      ? captionColor.replace("#", "0x")
+      : "0xFFFFFF";
+
+    const outputPath = path.join(tmpDir, "output.mp4");
+
+    // 이미지 하나의 필터 체인(스케일+색보정+자막 drawtext)을 만드는 공용 빌더 — 한방/청크 렌더링이 같이 씀.
+    // inputIdx: 이번 ffmpeg 실행 안에서의 입력 번호 / imgIdx: 영상 전체 기준 이미지 번호(자막·시간은 항상 이 기준).
+    // lanczos: 원본 해상도가 1280x720이랑 다를 때(Pixabay/Pexels/FLUX 다 제각각) 기본 리사이즈보다 훨씬 선명함.
+    // eq: 사진 톤을 살짝 또렷하고 생기있게 보정(과하지 않게) — 화질 좋아 보이는 효과의 8할은 이 정도 보정에서 나옴.
+    // 자막은 drawtext로 직접 그림 — 비트가 여러 개면 enable='between(t,..)'로 시간대를 나눠 순서대로 갈아끼움.
+    // text= 대신 textfile=을 써서 콜론/따옴표 등 ffmpeg 필터 특수문자 이스케이프 문제를 원천적으로 피함.
+    // [2026-08-30 19:10] 미디어 입력 인자 — 사진은 -loop 1(정지화면 반복), 클립(mp4)은 -stream_loop -1로
+    // 배정 구간보다 짧으면 반복하고 -t로 구간 길이만큼만 읽음(길면 앞부분만 사용). 클립 자체 오디오는
+    // 어차피 [i:v]만 쓰므로 자동으로 버려지고 나레이션이 입혀짐.
+    const pushMediaInput = (inputArgs, imgIdx) => {
+      if (mediaIsClip[imgIdx]) {
+        inputArgs.push("-stream_loop", "-1", "-t", String(durations[imgIdx].toFixed(2)), "-i", imagePaths[imgIdx]);
+      } else {
+        inputArgs.push("-loop", "1", "-t", String(durations[imgIdx].toFixed(2)), "-i", imagePaths[imgIdx]);
+      }
+    };
+
+    const makeImageChain = (inputIdx, imgIdx) => {
+      // fps=25: 사진 루프는 원래 25fps지만 클립은 원본 fps가 제각각이라 통일 — xfade가 fps 불일치에 민감함
+      let chain = `[${inputIdx}:v]fps=25,scale=1280:720:flags=lanczos,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
+      const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[imgIdx] || []) : [];
+      if (beats.length) {
+        // realTimeline이 있으면(세그먼트 실측/무음 앵커링) 실제 초 단위 시각을 그대로 쓰고, 이미지 자체
+        // 타임라인(-loop 1 입력은 t=0부터) 기준으로 바꾸려고 이미지 시작 시각(imgRealStart)을 빼줌.
+        // 없으면 글자수 비율로 이미지 노출시간(durations[imgIdx])을 나눔(최후 폴백).
+        const realTimes = realTimeline ? realTimeline.perImageBeatTimes[imgIdx] : null;
+        const imgRealStart = realTimeline ? realTimeline.imageSpans[imgIdx].start : 0;
+        const sumWeight = beats.reduce((a, b) => a + (b.weight || 1), 0) || 1;
+        let t = 0;
+        beats.forEach((beat, bi) => {
+          const text = (beat.text || "").trim();
+          const real = realTimes && realTimes[bi];
+          const start = real ? (real.start - imgRealStart) : t;
+          const beatDur = real ? Math.max(0.3, real.end - real.start) : Math.max(0.3, (beat.weight / sumWeight) * durations[imgIdx]);
+          const end = start + beatDur;
+          t = end;
+          if (!text) return;
+          const capFile = path.join(tmpDir, `cap-${imgIdx}-${bi}.txt`);
+          fs.writeFileSync(capFile, text, "utf8");
+          const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
+          chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
+            `borderw=8:bordercolor=black:box=0:line_spacing=12:x=${st.x}:y=${st.y}:` +
+            `enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'`;
+        });
+      }
+      return `${chain}[v${inputIdx}]`;
+    };
+
+    // 오디오(나레이션 loudnorm 또는 합성 BGM) 입력/필터를 붙이는 공용 빌더 — videoInputCount 뒤 번호부터 오디오 입력.
+    const appendAudioParts = (inputArgs, filterComplex, videoInputCount) => {
+      let outputArgs;
+      if (audioPath) {
+        inputArgs.push("-i", audioPath);
+        // loudnorm: TTS 음원마다 볼륨이 들쭉날쭉할 수 있어서, 방송 표준 음량(-16 LUFS)으로 정규화
+        filterComplex += `;[${videoInputCount}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
+        outputArgs = ["-map", "[outv]", "-map", "[anorm]", "-c:a", "aac", "-shortest"];
+      } else {
+        // 음성이 없을 때는 무음 대신, 외부 음원 없이 ffmpeg 자체 신호(사인파 3개로 만든 화음 패드)를
+        // 배경음악으로 깔아줌 — 저작권 걱정이 원천적으로 없고 외부 링크에 의존하지 않아 항상 안정적으로 동작함.
+        const bgmFreqs = [130.81, 164.81, 196.0]; // C3-E3-G3, 낮고 잔잔한 장3화음
+        // totalDurationSec은 전환 보정 때문에 실제 최종 영상 길이보다 살짝 크게 잡혀있음 — 페이드아웃이
+        // 영상 끝나기 전에 끝나도록 실제 길이(전환으로 줄어드는 만큼 뺀 값) 기준으로 계산
+        const xfadeLoss = xfadeDurs.reduce((a, b) => a + b, 0);
+        const finalVideoLengthSec = totalDurationSec - xfadeLoss;
+        bgmFreqs.forEach((f) => {
+          inputArgs.push("-f", "lavfi", "-i", `sine=frequency=${f}:duration=${totalDurationSec.toFixed(2)}`);
+        });
+        const bgmMixInputs = bgmFreqs.map((_, i) => `[${videoInputCount + i}:a]`).join("");
+        const fadeOutStart = Math.max(0, finalVideoLengthSec - 2).toFixed(2);
+        // normalize=0: amix 기본 자동정규화(입력 개수만큼 자동으로 줄임)를 끄고 volume으로 직접 조절 —
+        // 안 그러면 자동정규화(1/3) × volume이 이중으로 곱해져서 사실상 안 들릴 정도로 작아짐(원인 발견).
+        filterComplex += `;${bgmMixInputs}amix=inputs=${bgmFreqs.length}:duration=longest:normalize=0,volume=0.25,afade=t=in:d=2,afade=t=out:st=${fadeOutStart}:d=2[bgm]`;
+        outputArgs = ["-map", "[outv]", "-map", "[bgm]", "-c:a", "aac", "-shortest"];
+      }
+      return { filterComplex, outputArgs };
+    };
+
+    // 청크 렌더링: 이미지가 많으면(4분/20장) xfade 필터들이 720p 프레임 버퍼를 동시에 쥐고 있어서
+    // 1GB VM(키움 릴레이와 공유)에 부담됨 → CHUNK_SIZE장씩 부분 영상(자막 포함, 무음)을 먼저 만들고,
+    // 마지막에 부분 영상들끼리 경계 xfade로 병합하며 오디오를 입힘. 각 전환의 fade 길이가 왼쪽 조각의
+    // 길이에 이미 포함돼 있어(위 durations 보정) 벽시계 기준 자막/전환 타이밍이 한방 렌더링과 완전히 같음.
+    const CHUNK_SIZE = 5;
+    if (imagePaths.length <= CHUNK_SIZE) {
+      // 소량: 예전처럼 한 번에 렌더링(중간 재인코딩 없음)
+      const inputArgs = [];
+      imagePaths.forEach((p, i) => pushMediaInput(inputArgs, i));
+      const filterInputs = imagePaths.map((p, i) => makeImageChain(i, i)).join(";");
+      let filterComplex;
+      if (imagePaths.length <= 1) {
+        filterComplex = `${filterInputs};[v0]concat=n=1:v=1:a=0[outv]`;
+      } else {
+        let prevLabel = "v0";
+        let cumulative = durations[0];
+        const xfadeParts = [];
+        for (let i = 1; i < imagePaths.length; i++) {
+          const dur = xfadeDurs[i - 1]; // durations[i-1]에 이미 더해져 있어 offset이 정확히 맞음
+          const offset = Math.max(0, cumulative - dur);
+          const outLabel = i === imagePaths.length - 1 ? "outv" : `vx${i}`;
+          xfadeParts.push(`[${prevLabel}][v${i}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
+          prevLabel = outLabel;
+          cumulative += durations[i] - dur;
+        }
+        filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
+      }
+      const audioParts = appendAudioParts(inputArgs, filterComplex, imagePaths.length);
+      setProgress("렌더링 중", 30);
+      await runFfmpeg([
+        "-y", ...inputArgs,
+        "-filter_complex", audioParts.filterComplex,
+        ...audioParts.outputArgs,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        outputPath,
+      ], totalDurationSec, (ffmpegPercent) => {
+        // ffmpeg 자체 진행률(0~99)을 전체 진행률의 30~85% 구간에 매핑
+        setProgress("렌더링 중", 30 + Math.round((ffmpegPercent / 100) * 55));
+      });
+    } else {
+      // 1) 청크별 부분 영상 렌더링(무음, 자막 포함) — 경계 전환의 fade 꼬리는 각 청크 마지막 이미지에 포함돼 있음
+      const chunkIdxGroups = [];
+      for (let i = 0; i < imagePaths.length; i += CHUNK_SIZE) {
+        chunkIdxGroups.push(Array.from({ length: Math.min(CHUNK_SIZE, imagePaths.length - i) }, (_, j) => i + j));
+      }
+      const chunkFiles = [];
+      const chunkSpanSums = [];
+      for (let k = 0; k < chunkIdxGroups.length; k++) {
+        const group = chunkIdxGroups[k];
+        const inputArgs = [];
+        group.forEach((g) => pushMediaInput(inputArgs, g));
+        const filterInputs = group.map((g, j) => makeImageChain(j, g)).join(";");
+        let filterComplex;
+        let mapLabel;
+        if (group.length === 1) {
+          filterComplex = filterInputs;
+          mapLabel = "[v0]";
+        } else {
+          let prevLabel = "v0";
+          let cumulative = durations[group[0]];
+          const xfadeParts = [];
+          for (let j = 1; j < group.length; j++) {
+            const dur = xfadeDurs[group[j - 1]]; // 청크 안 전환만 여기서 소화(경계 전환은 병합 단계에서)
+            const offset = Math.max(0, cumulative - dur);
+            const outLabel = j === group.length - 1 ? "outv" : `vx${j}`;
+            xfadeParts.push(`[${prevLabel}][v${j}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
+            prevLabel = outLabel;
+            cumulative += durations[group[j]] - dur;
+          }
+          filterComplex = `${filterInputs};${xfadeParts.join(";")}`;
+          mapLabel = "[outv]";
+        }
+        const chunkFile = path.join(tmpDir, `chunk-${k}.mp4`);
+        const internalFades = group.slice(0, -1).reduce((a, g) => a + xfadeDurs[g], 0);
+        const chunkLen = group.reduce((a, g) => a + durations[g], 0) - internalFades;
+        // 중간 산출물은 crf 16(고화질) — 최종 병합에서 한 번 더 인코딩되므로 여기서 아끼면 화질이 이중으로 깎임
+        await runFfmpeg([
+          "-y", ...inputArgs,
+          "-filter_complex", filterComplex,
+          "-map", mapLabel,
+          "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+          chunkFile,
+        ], chunkLen, (ffmpegPercent) => {
+          setProgress(`부분 렌더링 중 (${k + 1}/${chunkIdxGroups.length})`, 30 + Math.round(((k + ffmpegPercent / 100) / chunkIdxGroups.length) * 40)); // 30~70%
+        });
+        chunkFiles.push(chunkFile);
+        // [2026-08-31] 청크 경계마다 자막이 조금씩 더 밀리던 원인: 여기서 chunkLen(계획값)을 그대로 썼는데,
+        // ffmpeg는 fps=25(0.04초 단위)로 프레임을 딱 맞춰 인코딩하면서 계획값을 살짝 반올림함 — 그 오차가
+        // 청크 하나당 최대 0.04초 정도인데, 청크를 거칠 때마다(약 1분 간격) 계속 쌓여서 뒤로 갈수록 자막이
+        // 음성보다 벌어졌던 것. 음성 세그먼트처럼 여기도 "계산값" 대신 ffprobe로 실제 렌더링된 파일 길이를
+        // 재서 그 실측값으로 다음 청크의 위치를 잡음 — 추정을 없애서 청크 경계마다 오차가 리셋되게 함.
+        const measuredChunkLen = await getAudioDurationSec(chunkFile).catch((e) => {
+          console.log(`[render:${jobId}] 청크 ${k} 실측 길이 확인 실패, 계획값으로 대체: ${e.message}`);
+          return chunkLen; // 실측 실패해도 렌더링 자체는 막지 않고 예전처럼 계획값으로 폴백
+        });
+        // chunkLen(계획)에는 이 청크의 "꼬리 전환(다음 청크와 겹칠 fade)"까지 포함돼 있으므로, 병합 offset에
+        // 쓸 spanSum은 실측 길이에서 그 꼬리 길이만큼 다시 빼야 함(마지막 청크는 꼬리 전환이 없음).
+        const isLastChunk = k === chunkIdxGroups.length - 1;
+        const tailFade = isLastChunk ? 0 : xfadeDurs[group[group.length - 1]];
+        chunkSpanSums.push(Math.max(0.05, measuredChunkLen - tailFade));
+      }
+
+      // 2) 부분 영상 병합: 경계마다 이미지 전환과 똑같은 xfade + 오디오/BGM — 동시에 여는 스트림이 청크
+      // 개수(20장 기준 4개)뿐이라 메모리 부담이 작음. offset은 순수 노출시간(spans) 누적합 = 실제 경계 시각.
+      const inputArgs = [];
+      chunkFiles.forEach((f) => inputArgs.push("-i", f));
+      let prevLabel = "0:v";
+      let cumulative = chunkSpanSums[0];
+      const xfadeParts = [];
+      for (let k = 1; k < chunkFiles.length; k++) {
+        const boundaryImg = chunkIdxGroups[k - 1][chunkIdxGroups[k - 1].length - 1]; // 앞 청크의 마지막 이미지
+        const dur = xfadeDurs[boundaryImg];
+        const outLabel = k === chunkFiles.length - 1 ? "outv" : `cx${k}`;
+        xfadeParts.push(`[${prevLabel}][${k}:v]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${cumulative.toFixed(2)}[${outLabel}]`);
+        prevLabel = outLabel;
+        cumulative += chunkSpanSums[k];
+      }
+      const audioParts = appendAudioParts(inputArgs, xfadeParts.join(";"), chunkFiles.length);
+      const finalLen = chunkSpanSums.reduce((a, b) => a + b, 0);
+      setProgress("최종 병합 중", 70);
+      await runFfmpeg([
+        "-y", ...inputArgs,
+        "-filter_complex", audioParts.filterComplex,
+        ...audioParts.outputArgs,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        outputPath,
+      ], finalLen, (ffmpegPercent) => {
+        setProgress("최종 병합 중", 70 + Math.round((ffmpegPercent / 100) * 15)); // 70~85%
+      });
+    }
+
+    // 나레이션이 있었는데(audioPath) 최종 mp4에 오디오 트랙이 실제로 없으면(다운로드 미묘한 손상,
+    // 필터그래프 문제 등) R2에 올리지 않고 여기서 바로 실패 처리 — 무음 영상이 조용히 발행되는 걸 막음.
+    // 에러 메시지에 NO_AUDIO_TRACK 마커를 붙여서 Worker(worker.js)가 이 실패를 일반 렌더링 실패와
+    // 구분해서 글 자체를 삭제하도록 함(finalizeRenderFailed 참고).
+    if (audioPath) {
+      setProgress("오디오 트랙 검증 중", 89);
+      const hasAudioTrack = await verifyOutputHasAudio(outputPath);
+      if (!hasAudioTrack) {
+        throw new Error("NO_AUDIO_TRACK: 최종 mp4에 오디오 트랙이 없음(나레이션 있었는데 누락됨)");
+      }
+    }
+
+    // [2026-08-30 22:55] ---------- 숏츠(세로 9:16) 렌더링 ----------
+    // [2026-09-02 21:05] highlightSegRange(Worker가 AI로 고른 하이라이트 문장 구간)가 오면 그 구간
+    // 하나만 사용 — 없으면(구버전 재시도 등) 예전처럼 도입/중간/결론 후보 로직으로 폴백.
+    // 이미 실측된 음성·자막 타이밍·이미지를 재활용해 구간을 세로(720x1280, 중앙 크롭)로 잘라냄.
+    // 구간 경계는 전부 문장(=음성 조각) 경계라 말이 중간에 끊기지 않음. 각 구간 57초 이내(숏츠 60초 상한 안쪽).
+    // 숏츠 실패는 본편 발행을 막지 않음(로그만 남기고 건너뜀). 세그먼트 실측 모드에서만 생성.
+    const shortsDone = []; // 실제로 R2에 올라간 숏츠 키들
+    if (Array.isArray(shortOutputKeys) && shortOutputKeys.length && audioPath && realTimeline && realTimeline.segmentCount) {
+      const SHORT_LIMIT_SEC = 57;
+      const total = audioDurationSec;
+      // 모든 문장(비트) 경계 시각을 정렬해 모음 — 구간 시작/끝은 항상 이 경계 위에서만 고름
+      const bounds = [0];
+      realTimeline.perImageBeatTimes.forEach((times) => times.forEach((t) => bounds.push(t.end)));
+      bounds.sort((a, b) => a - b);
+      const endBoundFor = (sT) => { // sT에서 시작해 57초 안에 끝나는 마지막 문장 경계
+        let e = 0;
+        for (const b of bounds) if (b > sT + 1 && b <= sT + SHORT_LIMIT_SEC && b > e) e = b;
+        return e;
+      };
+      const startBoundNear = (t) => { // t 이전(같음 포함)의 가장 늦은 문장 경계
+        let s = 0;
+        for (const b of bounds) if (b <= t && b > s) s = b;
+        return s;
+      };
+      // [2026-09-02 21:05, 2026-09-04 22:55 수정] highlightSegRange가 유효하면 그 구간 하나만 사용.
+      // 버그였던 지점: end를 아예 안 보고 start부터 무조건 57초까지 늘렸음 — AI가 하이라이트로
+      // 고른 범위보다 훨씬 더 뒤(관련 없는 내용)까지 쇼츠에 딸려 들어갈 수 있었음. 이제 end로 정해진
+      // "의도한 끝"이 57초 안이면 그대로 쓰고, 넘으면 그때만 57초 상한 안에서 가장 가까운 경계로 줄임.
+      const highlightValid = highlightSegRange
+        && Number.isInteger(highlightSegRange.start)
+        && Number.isInteger(highlightSegRange.end)
+        && Array.isArray(segStarts)
+        && highlightSegRange.start >= 0
+        && highlightSegRange.end >= highlightSegRange.start
+        && highlightSegRange.start < segStarts.length - 1;
+      let highlightRegion = null;
+      if (highlightValid) {
+        const hSt = segStarts[highlightSegRange.start];
+        const endIdx = Math.min(highlightSegRange.end + 1, segStarts.length - 1);
+        const intendedEnd = segStarts[endIdx];
+        const hEt = intendedEnd <= hSt + SHORT_LIMIT_SEC ? intendedEnd : endBoundFor(hSt);
+        highlightRegion = { label: "하이라이트", sT: hSt, eT: hEt };
+      }
+      const candidates = highlightRegion
+        ? [highlightRegion]
+        : [
+            { label: "도입", sT: 0, eT: endBoundFor(0) },
+            (() => { const sT = startBoundNear(total * 0.4); return { label: "중간", sT, eT: endBoundFor(sT) }; })(),
+            (() => { const sT = startBoundNear(Math.max(0, total - SHORT_LIMIT_SEC) + 0.01) || startBoundNear(total * 0.75); return { label: "결론", sT, eT: total }; })(),
+          ];
+      // 너무 짧거나(15초 미만) 이미 채택된 구간과 크게 겹치면 건너뜀(짧은 본편에서 구간이 뭉치는 경우)
+      const regions = [];
+      for (const c of candidates) {
+        if (!c || c.eT - c.sT < 15 || c.eT - c.sT > SHORT_LIMIT_SEC + 1) continue;
+        const overlaps = regions.some((r) => Math.min(r.eT, c.eT) - Math.max(r.sT, c.sT) > (c.eT - c.sT) * 0.5);
+        if (!overlaps) regions.push(c);
+      }
+      // [2026-09-02 21:38] 폴백도 처음(0초)부터가 아니라, 있으면 AI가 고른 하이라이트 시작점을 그대로
+      // 씀 — highlightSegRange가 필터(15초 미만 등)에 걸려 후보에서 빠졌어도 시작점 자체는 여전히 유효함.
+      if (!regions.length) {
+        const fallbackStart = highlightRegion ? highlightRegion.sT : 0;
+        const fallbackEnd = endBoundFor(fallbackStart) || Math.min(total, fallbackStart + SHORT_LIMIT_SEC);
+        if (fallbackEnd > fallbackStart + 1) regions.push({ label: "기본(인스타사이즈)", sT: fallbackStart, eT: fallbackEnd });
+      }
+      for (let ri = 0; ri < regions.length && ri < shortOutputKeys.length; ri++) {
+        const { label, sT, eT } = regions[ri];
+        const outKey = shortOutputKeys[ri];
+        try {
+          setProgress(`숏츠 렌더링 중 (${ri + 1}/${regions.length})`, 86 + ri);
+          // 이 구간에 걸치는 이미지들 — 구간 밖으로 삐져나온 앞뒤는 잘라냄
+          const shortImgIdx = [];
+          const sSpans = [];
+          const sStarts = []; // 각 이미지의 구간 내 실제 시작(비트 로컬 시각 계산용)
+          realTimeline.imageSpans.forEach((span, i) => {
+            const rs = Math.max(span.start, sT);
+            const re = Math.min(span.end, eT);
+            if (re - rs > 0.15) {
+              shortImgIdx.push(i);
+              sSpans.push(Math.max(0.3, re - rs));
+              sStarts.push(rs);
+            }
+          });
+          if (!shortImgIdx.length) continue;
+          const sDur = sSpans.slice();
+          const sFades = [];
+          for (let j = 0; j < sDur.length - 1; j++) sFades.push(Math.max(0.05, Math.min(XFADE_DUR, sDur[j] * 0.4, sDur[j + 1] * 0.4)));
+          for (let j = 0; j < sDur.length - 1; j++) sDur[j] += sFades[j];
+          const sInputs = [];
+          shortImgIdx.forEach((g, j) => {
+            if (mediaIsClip[g]) sInputs.push("-stream_loop", "-1", "-t", String(sDur[j].toFixed(2)), "-i", imagePaths[g]);
+            else sInputs.push("-loop", "1", "-t", String(sDur[j].toFixed(2)), "-i", imagePaths[g]);
+          });
+          const sChains = shortImgIdx.map((g, j) => {
+            // 세로 꽉 채움: 비율 유지로 확대 후 중앙 크롭(가로 원본의 좌우가 잘려나감 — 숏츠 표준 연출)
+            let chain = `[${j}:v]fps=25,scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,eq=contrast=1.06:saturation=1.12:brightness=0.02:gamma=1.02`;
+            const beats = fontAvailable && Array.isArray(captionBeats) ? (captionBeats[g] || []) : [];
+            const realTimes = realTimeline.perImageBeatTimes[g];
+            const imgLocalBase = sStarts[j]; // 이 이미지 입력의 t=0이 전체 타임라인에서 어디인지
+            beats.forEach((beat, bi) => {
+              const text = (beat.text || "").trim();
+              const real = realTimes && realTimes[bi];
+              if (!text || !real || real.end <= sT + 0.05 || real.start >= eT - 0.05) return; // 구간 밖 문장
+              const st = CAPTION_POSITIONS[(beat.styleIndex || 0) % CAPTION_POSITIONS.length];
+              const bs = Math.max(0, Math.max(real.start, sT) - imgLocalBase);
+              const be = Math.max(bs + 0.2, Math.min(real.end, eT) - imgLocalBase);
+              const capFile = path.join(tmpDir, `scap-${ri}-${g}-${bi}.txt`);
+              fs.writeFileSync(capFile, text, "utf8");
+              chain += `,drawtext=fontfile=${resolvedFontPath}:textfile=${capFile}:fontsize=${st.size}:fontcolor=${captionColorFF}:` +
+                `borderw=8:bordercolor=black:box=0:line_spacing=12:x=${st.x}:y=${st.y}:` +
+                `enable='between(t,${bs.toFixed(2)},${be.toFixed(2)})'`;
+            });
+            return `${chain}[sv${j}]`;
+          }).join(";");
+          let sFilter;
+          let sMap = "[outv]";
+          if (shortImgIdx.length === 1) {
+            sFilter = sChains;
+            sMap = "[sv0]";
+          } else {
+            let prevLabel = "sv0";
+            let cumulative = sDur[0];
+            const parts = [];
+            for (let j = 1; j < shortImgIdx.length; j++) {
+              const dur = sFades[j - 1];
+              const offset = Math.max(0, cumulative - dur);
+              const outLabel = j === shortImgIdx.length - 1 ? "outv" : `sx${j}`;
+              parts.push(`[${prevLabel}][sv${j}]xfade=transition=fade:duration=${dur.toFixed(2)}:offset=${offset.toFixed(2)}[${outLabel}]`);
+              prevLabel = outLabel;
+              cumulative += sDur[j] - dur;
+            }
+            sFilter = `${sChains};${parts.join(";")}`;
+          }
+          sInputs.push("-ss", sT.toFixed(2), "-t", (eT - sT).toFixed(2), "-i", audioPath); // 음성도 같은 구간만(wav라 초 단위 정확)
+          sFilter += `;[${shortImgIdx.length}:a]loudnorm=I=-16:TP=-1.5:LRA=11[anorm]`;
+          const shortPath = path.join(tmpDir, `short-${ri}.mp4`);
+          await runFfmpeg([
+            "-y", ...sInputs,
+            "-filter_complex", sFilter,
+            "-map", sMap, "-map", "[anorm]", "-c:a", "aac", "-shortest",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", // [2026-08-30 23:00] 숏츠는 파일이 작아 veryfast로 시간 절약
+            shortPath,
+          ], eT - sT, (p) => setProgress(`숏츠 렌더링 중 (${ri + 1}/${regions.length})`, 86 + ri + Math.round(p / 100)));
+          if (await verifyOutputHasAudio(shortPath)) {
+            await r2Client.send(new PutObjectCommand({
+              Bucket: R2_BUCKET,
+              Key: outKey,
+              Body: fs.readFileSync(shortPath),
+              ContentType: "video/mp4",
+            }));
+            shortsDone.push(outKey);
+            console.log(`[render:${jobId}] 숏츠(${label}) 저장: ${outKey} (${sT.toFixed(1)}~${eT.toFixed(1)}s, 이미지 ${shortImgIdx.length}장)`);
+          } else {
+            console.log(`[render:${jobId}] 숏츠(${label}) 오디오 검증 실패 — 이 숏츠만 건너뜀`);
+          }
+        } catch (e) {
+          console.log(`[render:${jobId}] 숏츠(${label}) 렌더링 실패(본편은 정상 진행): ${e.message}`);
+        }
+      }
+    }
+
+    setProgress("업로드 중", 90);
+    const videoBuffer = fs.readFileSync(outputPath);
+    await r2Client.send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: outputKey,
+      Body: videoBuffer,
+      ContentType: "video/mp4",
+    }));
+
+    renderJobs.set(jobId, { status: "done", stage: "완료", percent: 100, r2Key: outputKey, shortKeys: shortsDone, shortKey: shortsDone[0] || null, durationSec: Math.round(audioDurationSec || 0), startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() }); // [2026-09-01] durationSec 추가 — 관리자 목록에 "몇 분짜리"로 표시
+    console.log(`[render:${jobId}] 완료, R2 저장: ${outputKey}${shortsDone.length ? ` + 숏츠 ${shortsDone.length}개` : ''}`);
+  } catch (e) {
+    renderJobs.set(jobId, { status: "failed", stage: "실패", percent: 0, error: e.message, startedAt: renderJobs.get(jobId)?.startedAt || Date.now(), completedAt: Date.now() });
+    console.log(`[render:${jobId}] 실패: ${e.message}`);
+  } finally {
+    fs.rm(tmpDir, { recursive: true, force: true }, () => {});
+  }
+}
+
+// ---------- Keep-Alive 연결 재사용 ----------
+// 기존엔 https.request 호출마다(키움 TR, Worker 전송, REST 패스스루) 매번 새 TCP+TLS
+// 핸드셰이크를 맺었음. 장중엔 2~3초 간격으로 이런 호출이 반복되므로, 연결을 재사용하는
+// keep-alive Agent를 붙여서 핸드셰이크 비용을 없앰 (지연시간 절감의 핵심 최적화).
+const kiwoomAgent = new https.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 30000 });
+const workerAgent = new https.Agent({ keepAlive: true, maxSockets: 10, keepAliveMsecs: 30000 });
+const naverAgent = new https.Agent({ keepAlive: true, maxSockets: 5, keepAliveMsecs: 30000 });
+
+// 웹소켓 실시간 시세용 (지수 등). 앱키/시크릿이 없으면 웹소켓 기능만 비활성화되고
+// 기존 REST 중계는 그대로 동작함 (하위호환 - 환경변수 추가 전에도 안 죽음)
+const APP_KEY = process.env.KIWOOM_APP_KEY_REAL;
+const APP_SECRET = process.env.KIWOOM_APP_SECRET_REAL;
+const WS_URL = "wss://api.kiwoom.com:10000/api/dostk/websocket";
+
+if (!RELAY_SECRET) {
+  console.error("RELAY_SECRET 환경변수가 없습니다.");
+  process.exit(1);
+}
+
+// ---------- 실시간 시세 캐시 (웹소켓으로 받은 최신값을 메모리에 보관) ----------
+// Worker가 조회하면 이 캐시를 즉시 반환 -> 키움 TR 호출 없이 실시간에 가까운 값 제공
+const realtimeCache = {
+  index: {}, // { "001": {price, rate, time, updatedAt}, "101": {...} }
+  stock: {}, // { "005930": {price, rate, volume, cntrStr, time, updatedAt}, ... }
+  // 조건검색: 현재 조건을 만족하는 종목 집합 (실시간 편입/이탈로 갱신됨)
+  condition: {
+    seq: null,
+    name: null, // 조건식 이름 (CNSRLST 응답에서 확보) - 자동편입 라벨 등에 표시용
+    codes: [], // 현재 조건 만족 종목코드 목록
+    lastEventAt: null,
+    events: [], // 최근 편입/이탈 이벤트 (최대 50개, 디버깅/확인용)
+    history: [], // 편입 이력 (최대 60개) - 조건에서 빠져나가도 유지되어 놓치지 않게 함
   },
 };
 
-// [2026-08-31] 1분 Cloudflare Cron과, relay VM에서 5초마다 호출하는 /admin/cron-tick 둘 다 이 함수를 씀 —
-// 로직 하나로 통일해서 두 경로가 어긋나지 않게 함.
-async function runVideoPollTick(env, ctx) {
-  await checkRelayHealth(env);
-  await pollPendingGenJobs(env); // [2026-08-31 07:05] 탭이 안 열려있어도 생성이 이어지도록 한 단계씩 진행
-  await pollYoutubeQuotaRetries(env); // [2026-08-31] 유튜브 할당량 초과로 막혔던 업로드, 리셋 시각 지나면 자동 재시도
-  await pollPendingVideoJobs(env);
-  await pollPendingRenderJobs(env, ctx);
-}
+// 감시할 조건식 번호. 환경변수로 지정 (미설정이면 조건검색 기능 비활성화)
+const CONDITION_SEQ = process.env.KIWOOM_CONDITION_SEQ || "";
+const WORKER_URL = process.env.WORKER_URL || "https://kiwoomapi.usbkr.workers.dev";
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
 
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
+// ---------- 실시간가 로컬 파일 스냅샷 (VM 재시작 시 즉시 복구용) ----------
+// 웹소켓 재연결 전까지는 값이 비어서 손익판단/화면이 잠깐 비는데, 재시작 직전 스냅샷을
+// 먼저 메모리에 올려두면 재연결될 때까지의 공백을 직전 값으로 메꿀 수 있음(참고용, 신선도는 낮음).
+const SNAPSHOT_PATH = path.join(__dirname, "realtime-snapshot.json");
+const SNAPSHOT_INTERVAL_MS = 15000;
 
-// [2026-08-30 21:17] 긴 에러를 앞+뒤로 나눠 표시 — 다단계 폴백 에러는 마지막 단계 결과가 끝에 있어서 앞만 자르면 안 보임
-function truncErrText(msg, head = 220, tail = 220) {
-  const s = String(msg || '');
-  return s.length <= head + tail + 3 ? s : s.slice(0, head) + ' … ' + s.slice(-tail);
-}
-
-function makeExcerpt(html, maxLen = 130) {
-  const text = (html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  return text.length > maxLen ? text.slice(0, maxLen).trim() + '…' : text;
-}
-
-function stripHtml(html) {
-  return (html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-// [2026-09-01] 초 단위 시간을 "N분 M초"/"N초"로 표시 — admin 목록, 글 페이지 등 여러 곳에서 공용으로 씀
-function fmtDurSec(sec) {
-  return (typeof sec === 'number' && sec >= 0) ? (sec >= 60 ? `${Math.floor(sec / 60)}분 ${sec % 60}초` : `${sec}초`) : '';
-}
-
-function page(title, body, options = {}) {
-  const { description = '생활 속 다양한 주제를 다루는 글과 영상', noindex = false } = options;
-  const meta = `<meta name="description" content="${escapeHtml(description)}">
-<meta property="og:title" content="${escapeHtml(title)}">
-<meta property="og:description" content="${escapeHtml(description)}">
-${noindex ? '<meta name="robots" content="noindex, nofollow">' : ''}`;
-  return `<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title>${meta}${FONTS}<style>${STYLE}</style></head><body>${body}</body></html>`;
-}
-
-function siteHeader() {
-  return `<header class="site"><div class="wrap"><a class="logo" href="/">life<span>.news</span></a><div class="mono" style="font-size:12px;color:var(--muted)">생활뉴스 · 글+슬라이드쇼</div></div></header>`;
-}
-
-// [2026-08-30 19:41] Cerebras 제거(크레딧 소진으로 402만 뱉어서 뺌) — 이제 Groq(2개 모델) → Workers AI 순.
-// CEREBRAS_API_KEY 환경변수는 더 이상 안 읽으므로 그대로 둬도 무해함(지워도 됨).
-async function callAiChain(systemPrompt, userPrompt, env) {
-  const attemptErrors = [];
-
-  // [2026-08-30 22:44] SambaNova Cloud 1순위 연결(사용자 요청) — OpenAI 호환 API, 무료 티어.
-  // DeepSeek-V3.1(다국어 강함) → Llama-3.3-70B 순. 실패하면 아래 Groq → Workers AI로 폴백.
-  // Cloudflare에 SAMBANOVA_API_KEY 시크릿 등록 필요(없으면 이 단계는 건너뜀).
-  if (env.SAMBANOVA_API_KEY) {
-    for (const model of ['DeepSeek-V3.1', 'Meta-Llama-3.3-70B-Instruct']) {
-      try {
-        const res = await fetch('https://api.sambanova.ai/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.SAMBANOVA_API_KEY}` },
-          body: JSON.stringify({
-            model,
-            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-            temperature: 0.7,
-            max_tokens: 4000,
-          }),
-          signal: AbortSignal.timeout(45000),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          let raw = data?.choices?.[0]?.message?.content;
-          if (raw) {
-            // DeepSeek 계열이 <think>...</think>를 앞에 붙이는 경우 제거 후 JSON 파싱
-            raw = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim().replace(/^```json\s*|\s*```$/gm, '').trim();
-            try {
-              return { result: JSON.parse(raw), error: null, modelUsed: `sambanova:${model}` };
-            } catch (e) {
-              attemptErrors.push(`[sambanova:${model}] JSON 파싱 실패: ${e.message}`);
-              continue;
-            }
-          } else {
-            attemptErrors.push(`[sambanova:${model}] 응답에 content 없음(finish: ${data?.choices?.[0]?.finish_reason || '?'})`);
-            continue;
-          }
-        } else {
-          const bodyText = await res.text();
-          attemptErrors.push(`[sambanova:${model}] HTTP ${res.status}: ${bodyText.slice(0, 150)}`);
-          continue;
-        }
-      } catch (e) {
-        attemptErrors.push(`[sambanova:${model}] 네트워크 오류: ${e.message}`);
-        continue;
-      }
-    }
-  } else {
-    attemptErrors.push('[sambanova] SAMBANOVA_API_KEY 미설정');
-  }
-
-  if (env.GROQ_API_KEY) {
-    // [2026-08-30 21:08] 모델 현행화: llama-3.1-8b-instant가 2026-08-16 Groq에서 퇴역(404) → gpt-oss-20b(빠름) →
-    // gpt-oss-120b(품질) → qwen3.6-27b 순. gpt-oss 계열은 추론(리즈닝) 모델이라 생각 토큰이 한도를 다 먹으면
-    // content가 비어버림 → reasoning_effort를 low로 낮추고 max_tokens도 8000으로 넉넉히.
-    for (const model of ['openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'qwen/qwen3.6-27b']) {
-      try {
-        const res = await fetch(`https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_AI_GATEWAY}/groq/openai/v1/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.GROQ_API_KEY}` },
-          body: JSON.stringify({
-            model,
-            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-            temperature: 0.7,
-            max_tokens: 4000, // [2026-08-30 21:17] 8000→4000: 무료 티어 분당 토큰 한도에 입력+max_tokens가 합산돼 413 나던 문제(reasoning low라 4000이면 충분)
-            ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
-          }),
-          signal: AbortSignal.timeout(45000), // 4분 분량 생성이라 넉넉히(스텝 방식이라 오래 기다려도 됨)
-        });
-        if (res.ok) {
-          const data = await res.json();
-          let raw = data?.choices?.[0]?.message?.content;
-          if (raw) {
-            raw = raw.trim().replace(/^```json\s*|\s*```$/gm, '').trim();
-            try {
-              return { result: JSON.parse(raw), error: null, modelUsed: model };
-            } catch (e) {
-              attemptErrors.push(`[${model}] JSON 파싱 실패: ${e.message}`);
-              continue;
-            }
-          } else {
-            attemptErrors.push(`[${model}] 응답에 content 없음(finish: ${data?.choices?.[0]?.finish_reason || '?'})`);
-            continue;
-          }
-        } else {
-          const bodyText = await res.text();
-          attemptErrors.push(`[${model}] HTTP ${res.status}: ${bodyText.slice(0, 150)}`);
-          continue;
-        }
-      } catch (e) {
-        attemptErrors.push(`[${model}] 네트워크 오류: ${e.message}`);
-        continue;
-      }
-    }
-  } else {
-    attemptErrors.push('[groq] GROQ_API_KEY 미설정');
-  }
-
-  if (env.AI) {
-    try {
-      const response = await withTimeout(env.AI.run('@cf/zai-org/glm-4.7-flash', {
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-        max_tokens: 5000, // [2026-08-30 19:38] 4분 분량(1,700~2,000자) 글이 2000토큰에서 잘려 JSON 파싱 실패하던 문제 수정
-      }, { gateway: { id: CF_AI_GATEWAY } }), 90000, 'workers-ai 글 생성'); // [2026-08-30 21:17] 90초로 확대(55초도 4분 분량 한국어 JSON엔 빠듯했음)
-      let raw = response?.response;
-      if (raw) {
-        raw = raw.trim().replace(/^```json\s*|\s*```$/gm, '').trim();
-        try {
-          return { result: JSON.parse(raw), error: null, modelUsed: 'workers-ai:glm-4.7-flash' };
-        } catch (e) {
-          attemptErrors.push(`[workers-ai] JSON 파싱 실패: ${e.message}`);
-        }
-      } else {
-        attemptErrors.push('[workers-ai] 응답에 content 없음');
-      }
-    } catch (e) {
-      attemptErrors.push(`[workers-ai] 오류: ${e.message}`);
-    }
-  } else {
-    attemptErrors.push('[workers-ai] AI 바인딩 없음');
-  }
-
-  return { result: null, error: `모든 모델 시도 실패 — ${attemptErrors.join(' / ')}` };
-}
-
-function stripNaverHighlight(text) {
-  // 네이버 검색 API는 강조 부분에 <b></b> 태그를 붙여서 줌, 순수 텍스트로 정리
-  return (text || '').replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').trim();
-}
-
-async function searchNaverNews(topic, env) {
-  if (!env.NAVER_CLIENT_ID || !env.NAVER_CLIENT_SECRET) return [];
+function saveRealtimeSnapshot() {
   try {
-    const res = await fetch(`https://openapi.naver.com/v1/search/news.json?query=${encodeURIComponent(topic)}&display=5&sort=date`, {
-      headers: {
-        'X-Naver-Client-Id': env.NAVER_CLIENT_ID,
-        'X-Naver-Client-Secret': env.NAVER_CLIENT_SECRET,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) {
-      await res.text().catch(() => {}); // body 미소비 시 "stalled response" 경고 발생 방지
-      console.log(`네이버 뉴스검색 실패: HTTP ${res.status}`);
-      return [];
-    }
-    const data = await res.json();
-    const items = Array.isArray(data?.items) ? data.items : [];
-    return items.map((item) => ({
-      title: stripNaverHighlight(item.title),
-      description: stripNaverHighlight(item.description),
-      pubDate: item.pubDate,
-      originalLink: item.originallink || item.link || '',
-    }));
-  } catch (e) {
-    console.log('네이버 뉴스검색 오류: ' + e.message);
-    return [];
-  }
-}
-
-async function generateArticle(topic, newsResults, env) {
-  let systemPrompt, userPrompt;
-  if (newsResults.length) {
-    console.log(`네이버 뉴스 ${newsResults.length}건 참고자료로 사용`);
-    const referenceText = newsResults
-      .map((n, i) => `[참고자료 ${i + 1}] ${n.title}\n${n.description}`)
-      .join('\n\n');
-    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 아래에 실제 뉴스 검색 결과가 참고자료로 주어진다. 이 참고자료에 있는 사실만을 근거로 글을 쓴다. 참고자료에 없는 구체적 수치·통계·날짜를 지어내지 않는다. 참고자료끼리 내용이 다르면 "~라는 보도가 있다"처럼 출처를 명시하는 톤으로 서술한다. 참고자료 문장을 그대로 베끼지 말고 반드시 자신의 표현으로 다시 쓴다(패러프레이즈). 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 전혀 쓰지 않는다. 쉼표를 쓸 자리는 문장을 끊어서 짧은 문장 두 개로 나눈다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 5분 분량이 되도록 공백 포함 최소 2,500자 이상, 2,500~3,000자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 5~7개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 250자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
-    userPrompt = `주제: ${topic}\n\n${referenceText}`;
-  } else {
-    console.log('네이버 뉴스검색 결과 없음(또는 키 미설정), 참고자료 없이 작성');
-    systemPrompt = '너는 한국어 생활뉴스를 진행자처럼 구어체로 설명하는 내레이터다. 주어진 주제에 대해 정직하고 담백한 정보성 글을 쓴다. 실제 사용 경험이나 확인 안 된 통계·수치를 단정적으로 지어내지 않는다. 확실하지 않은 내용은 "일반적으로", "~로 알려져 있다" 같은 표현을 쓴다. 과장된 표현이나 광고성 문구는 쓰지 않는다. 본문은 반드시 순수 한글로만 작성한다. 문체(가장 중요): 딱딱한 문어체(-습니다, -였다 같은 서술문투) 대신, 청자에게 직접 말하듯이 설명하는 자연스러운 구어체 존댓말을 쓴다(예: -해요, -거든요, -그런데요, -인데요, -더라고요). 뉴스 기사를 읽는 게 아니라 사람이 옆에서 이야기해주는 느낌이어야 한다. 문장 규칙(음성 낭독과 자막 표시에 그대로 쓰이므로 반드시 지킨다, 구어체와 함께 지켜야 함): 한 문장은 공백 포함 20~45자로 아주 짧게 쓰고, 한 문장에 한 가지 내용만 담는다. 긴 설명은 짧은 문장 여러 개로 나눈다. 문장과 문장 사이는 그런데, 그래서, 사실은, 특히 같은 자연스러운 구어체 접속어로 이어서 술술 읽히게 한다. 모든 문장은 마침표·물음표·느낌표로 끝낸다. 말줄임표, 괄호 보충설명, 따옴표 인용, 이모지, 특수기호, 영어 약어는 쓰지 않는다(음성 합성이 다르게 읽어서 자막과 어긋나는 원인이 된다). 숫자와 단위는 소리 내어 읽는 그대로 한글 표기를 우선한다(예: 25% 대신 25퍼센트). 쉼표는 전혀 쓰지 않는다. 쉼표를 쓸 자리는 문장을 끊어서 짧은 문장 두 개로 나눈다. 띄어쓰기(매우 중요 — TTS가 단어를 붙여서 급하게 읽는 사고의 직접 원인): 마침표·물음표·느낌표·쉼표 뒤에는 반드시 띄어쓰기를 하나 넣는다(붙여쓰면 음성 합성이 두 단어를 숨 쉴 틈 없이 이어 읽어버린다). 단어와 단어 사이도 표준 띄어쓰기를 정확히 지킨다. 분량(반드시 지킬 것 — 목표보다 짧게 쓰지 않는다): 전체(도입부+본문+마무리)를 소리 내어 읽으면 약 5분 분량이 되도록 공백 포함 최소 2,500자 이상, 2,500~3,000자로 쓴다. 이보다 짧으면 안 된다. 소제목 섹션은 5~7개로 나누고, 각 섹션 본문은 짧게 끝내지 말고 최소 250자 이상으로 충분히 풀어서 쓴다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"title": "제목(한국어)", "intro_html": "<p>도입부 1~2문단</p>", "sections": [{"heading":"소제목","body_html":"<p>본문</p>"}], "outro_html":"<p>마무리 문단</p>", "threads_text": "스레드(SNS) 홍보 글 — 이 형식을 정확히 지킨다: 첫 줄은 어울리는 이모지 1개로 시작하는 짧고 강렬한 훅 한 문장, 빈 줄 하나, 핵심 요약 2~3줄(한 줄에 한 가지 내용, 각 줄 짧게), 빈 줄 하나, 마지막 줄에 어울리는 해시태그 2~3개. 본문과 달리 이 필드에서만 이모지 사용 가능. 전체 공백 포함 300자 이내, 링크는 넣지 않는다, 줄바꿈은 \\n"}';
-    userPrompt = `주제: ${topic}`;
-  }
-
-  const { result, error, modelUsed } = await callAiChain(systemPrompt, userPrompt, env);
-  return { article: result, error, modelUsed };
-}
-
-// [2026-09-02 21:20] 생성된 글을 다시 한 번 AI로 다듬어 TTS가 자연스럽게 읽도록 함 — 원래 글쓰기
-// 프롬프트의 20~45자 규칙만으로는 실제로 정확히 5초 분량이 되도록 맞추기 어려워서, 완성된 글을 놓고
-// "문장 하나 = 약 5초"를 유일한 목표로 삼아 다시 나누고 다듬는 전용 편집 패스를 추가함(의미는 그대로 유지).
-// 실패하거나 결과가 너무 짧으면(원문 절반 미만) 원문을 그대로 씀 — 발행 자체가 막히지 않게.
-async function reeditForTtsPacing(text, env) {
-  if (!text || text.length < 15) return text;
-  const systemPrompt = '너는 TTS(음성합성)가 자연스럽게 읽을 수 있도록 나레이션 글을 다시 다듬는 편집자다. 아래 글에 나온 문장과 정보의 순서를 절대 바꾸지 않는다 — 원문에 등장하는 순서 그대로 처음부터 끝까지 유지하면서, 문장을 나누거나 합치거나 표현만 다듬는다(내용을 앞뒤로 옮기거나 재배열하지 않는다). 의미와 정보는 하나도 빠짐없이 그대로 유지하면서 모든 문장을 소리 내어 읽었을 때 각각 약 5초(공백 포함 28~35자) 분량이 되도록 조정한다. 문장 하나에 한 가지 내용만 담고 너무 짧게 쪼개서 부자연스럽게 끊기지 않도록 자연스러운 구어체 흐름을 유지한다(-해요, -거든요, -그런데요 같은 말투 유지). 모든 문장은 마침표 물음표 느낌표로 끝낸다. 쉼표 괄호 따옴표 이모지 특수기호는 쓰지 않는다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"text": "재편집된 전체 글(원문과 같은 순서, 문장 사이는 공백 하나로 구분)"}';
-  try {
-    const { result } = await callAiChain(systemPrompt, text, env);
-    const edited = typeof result?.text === 'string' ? result.text.trim() : '';
-    return edited.length >= text.length * 0.5 ? edited : text; // 결과가 너무 짧으면 뭔가 잘못된 것으로 보고 원문 사용
-  } catch (e) {
-    return text;
-  }
-}
-
-const MIN_USABLE_IMAGE_BYTES = 15 * 1024; // 15KB 미만이면 아이콘/로고/썸네일일 가능성이 높아 "못 쓰는 이미지"로 판단
-
-function isUsableImage(buffer) {
-  return !!buffer && buffer.byteLength >= MIN_USABLE_IMAGE_BYTES;
-}
-
-// [2026-09-02 20:45] wantCount 파라미터 추가 — 사용자가 미디어를 직접 첨부한 만큼 AI가 생성할 장면 수를
-// SCENE_COUNT에서 빼서 요청함(전체 장면 수는 항상 SCENE_COUNT로 유지, 첨부분 + AI생성분 = SCENE_COUNT)
-async function generateScenePrompts(topic, articleTitle, env, wantCount = SCENE_COUNT) {
-  const systemPrompt = `너는 짧은 슬라이드쇼 영상을 위한 아트 디렉터다. 주어진 주제와 글 제목을 참고해서, 정지 이미지로 표현할 장면 ${wantCount}개를 구상한다. 각 장면은 서로 다른 각도/구도로 주제를 시각화하며, 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 각 장면마다 두 가지를 만든다: 1) keyword — 실제 스톡사진 사이트(Pexels)에서 진짜로 검색될 만한, 실존하는 사물/장소/상황을 나타내는 짧은 영어 키워드(2~4단어). 너무 추상적이거나 상상 속 장면이 아니라, 사진작가가 실제로 찍었을 법한 평범하고 구체적인 소재로 만든다(예: "laptop office desk", "grocery shopping supermarket", "family dinner table"). 2) prompt — 만약 실사진이 없을 경우에 대비한 AI 이미지 생성용 상세한 장면 묘사. 이 프롬프트는 반드시 영어로만 작성한다(한국어 절대 금지) — 이미지 생성 모델이 영어 캡션으로 학습되어 있어서 한국어를 넣으면 엉뚱한 결과가 나옴. 사진처럼 사실적인 스타일, 카메라 앵글/조명까지 구체적으로 묘사. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"scenes": [{"keyword": "영어 검색어", "prompt": "영어로만 작성된 상세 장면 묘사"}, ...]} (배열 길이는 정확히 ${wantCount}개)`;
-  const userPrompt = `주제: ${topic}\n글 제목: ${articleTitle}`;
-  const { result } = await callAiChain(systemPrompt, userPrompt, env);
-  if (Array.isArray(result?.scenes) && result.scenes.length) {
-    return result.scenes.slice(0, wantCount).map((s) => ({
-      keyword: typeof s === 'string' ? topic : (s.keyword || topic),
-      prompt: typeof s === 'string' ? s : (s.prompt || `A realistic photo representing: ${topic}`),
-    }));
-  }
-  return Array.from({ length: wantCount }, (_, i) => ({
-    keyword: topic,
-    prompt: `A realistic photo representing: ${topic}, scene ${i + 1}`,
-  }));
-}
-
-// [2026-09-02 21:05] 쇼츠(하이라이트) 구간 선정 — 문장(=음성 세그먼트) 번호가 매겨진 목록을 AI에게
-// 보여주고, 소리 내어 읽었을 때 약 35~45초가 되는 연속 구간 중 가장 하이라이트가 될 만한 곳을 고르게 함.
-// relay.js가 이 구간(문장 인덱스)을 실측 세그먼트 시각으로 변환해서 그 부분만 쇼츠로 잘라냄.
-// 실패하면 null 반환 — relay.js는 null이면 예전처럼 도입/중간/결론 후보 로직으로 폴백함.
-async function pickHighlightRange(sentences, topic, env) {
-  if (!sentences?.length) return null;
-  if (sentences.length === 1) return { start: 0, end: 0 };
-  const numbered = sentences.map((s, i) => `${i}: ${s}`).join('\n');
-  const systemPrompt = '너는 짧은 하이라이트 클립(쇼츠)을 만들기 위해 나레이션 문장들 중 가장 흥미롭고 핵심적인 구간을 고르는 편집자다. 아래에 번호가 매겨진 문장 목록이 주어진다. 이 중 연속된 문장 구간 하나를 고른다 — 시청자의 관심을 가장 끌만한 핵심 정보나 임팩트 있는 내용이 담긴 구간이어야 한다. 고른 구간을 소리 내어 읽었을 때 총 길이가 약 35~45초(대략 230~300자)가 되도록 문장 개수를 조절한다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"startIndex": 시작문장번호, "endIndex": 끝문장번호}';
-  const userPrompt = `주제: ${topic}\n\n문장 목록:\n${numbered}`;
-  try {
-    const { result } = await callAiChain(systemPrompt, userPrompt, env);
-    const start = Number(result?.startIndex);
-    const end = Number(result?.endIndex);
-    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= sentences.length) return null;
-    return { start, end };
-  } catch (e) {
-    return null;
-  }
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// env.AI.run()은 fetch가 아니라 바인딩 호출이라 AbortSignal이 안 먹힘 — Promise.race로 강제 타임아웃.
-// (이게 없어서 응답이 하염없이 안 돌아오면 진행률이 특정 %에서 영원히 멈추는 문제가 있었음)
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} 타임아웃(${ms}ms)`)), ms)),
-  ]);
-}
-
-// 검색 결과가 실제로 쿼리랑 관련 있는지 대충 확인 — Pixabay tags / Pexels alt 텍스트에
-// 쿼리 단어가 하나라도 들어있으면 "관련 있음"으로 판단. 이걸 통과 못 하면 그 이미지는 버리고
-// 다음 소스(Pexels → 그래도 없으면 FLUX 생성)로 넘어가게 함.
-function isRelevantMatch(query, metaText) {
-  if (!metaText) return false;
-  const stopwords = new Set(['the', 'and', 'with', 'for', 'from', 'this', 'that']);
-  const queryWords = query.toLowerCase().split(/[^a-z0-9가-힣]+/).filter((w) => w.length >= 3 && !stopwords.has(w));
-  if (!queryWords.length) return true; // 쿼리 자체가 너무 짧으면 걸러낼 기준이 없으니 통과시킴
-  const lowerMeta = metaText.toLowerCase();
-  return queryWords.some((w) => lowerMeta.includes(w));
-}
-
-async function searchPixabayImage(query, env, attempt = 0) {
-  if (!env.PIXABAY_API_KEY) return null;
-  try {
-    const res = await fetch(`https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&image_type=photo&orientation=horizontal&per_page=3&safesearch=true`, { signal: AbortSignal.timeout(10000) });
-    if (res.status === 429 && attempt < 2) {
-      await res.text().catch(() => {});
-      const backoffMs = 800 * (attempt + 1); // 레이트리밋이면 잠깐 쉬었다가 최대 2번 더 시도
-      console.log(`Pixabay 요청 제한("${query}"), ${backoffMs}ms 대기 후 재시도`);
-      await sleep(backoffMs);
-      return searchPixabayImage(query, env, attempt + 1);
-    }
-    if (!res.ok) {
-      await res.text().catch(() => {}); // body 미소비 시 "stalled response" 경고 발생 방지 (429 등 빈번함)
-      console.log(`Pixabay 검색 실패("${query}"): HTTP ${res.status}`);
-      return null;
-    }
-    const data = await res.json();
-    const hit = data?.hits?.[0];
-    if (!hit) return null;
-    if (!isRelevantMatch(query, hit.tags)) {
-      console.log(`Pixabay 결과가 "${query}"랑 안 맞아 보임(태그: ${hit.tags}) — 건너뜀`);
-      return null;
-    }
-    const imageUrl = hit?.largeImageURL || hit?.webformatURL;
-    if (!imageUrl) return null;
-    const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
-    if (!imgRes.ok) {
-      await imgRes.text().catch(() => {});
-      return null;
-    }
-    const buffer = await imgRes.arrayBuffer();
-    if (!isUsableImage(buffer)) {
-      console.log(`Pixabay 이미지가 너무 작아(용량 기준) 못 씀("${query}"): ${buffer.byteLength}바이트`);
-      return null;
-    }
-    return buffer;
-  } catch (e) {
-    console.log(`Pixabay 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
-    return null;
-  }
-}
-
-async function searchPexelsImage(query, env, attempt = 0) {
-  if (!env.PEXELS_API_KEY) return null;
-  try {
-    const res = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape`, {
-      headers: { Authorization: env.PEXELS_API_KEY },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (res.status === 429 && attempt < 2) {
-      await res.text().catch(() => {});
-      const backoffMs = 800 * (attempt + 1);
-      console.log(`Pexels 요청 제한("${query}"), ${backoffMs}ms 대기 후 재시도`);
-      await sleep(backoffMs);
-      return searchPexelsImage(query, env, attempt + 1);
-    }
-    if (!res.ok) {
-      await res.text().catch(() => {}); // body 미소비 시 "stalled response" 경고 발생 방지
-      console.log(`Pexels 검색 실패("${query}"): HTTP ${res.status}`);
-      return null;
-    }
-    const data = await res.json();
-    const photo = data?.photos?.[0];
-    if (!photo) return null;
-    if (!isRelevantMatch(query, photo.alt)) {
-      console.log(`Pexels 결과가 "${query}"랑 안 맞아 보임(alt: ${photo.alt}) — 건너뜀`);
-      return null;
-    }
-    const imageUrl = photo?.src?.large || photo?.src?.medium;
-    if (!imageUrl) return null;
-    const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
-    if (!imgRes.ok) {
-      await imgRes.text().catch(() => {});
-      return null;
-    }
-    const buffer = await imgRes.arrayBuffer();
-    if (!isUsableImage(buffer)) {
-      console.log(`Pexels 이미지가 너무 작아(용량 기준) 못 씀("${query}"): ${buffer.byteLength}바이트`);
-      return null;
-    }
-    return buffer;
-  } catch (e) {
-    console.log(`Pexels 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
-    return null;
-  }
-}
-
-async function searchUnsplashImage(query, env) {
-  if (!env.UNSPLASH_ACCESS_KEY) return null;
-  try {
-    const res = await fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape`, {
-      headers: { Authorization: `Client-ID ${env.UNSPLASH_ACCESS_KEY}` },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) {
-      await res.text().catch(() => {}); // 429(시간당 50건 제한)도 여기서 조용히 넘어감 — 어차피 폴백 체인 마지막이라 재시도 안 함
-      console.log(`Unsplash 검색 실패("${query}"): HTTP ${res.status}`);
-      return null;
-    }
-    const data = await res.json();
-    const photo = data?.results?.[0];
-    if (!photo) return null;
-    const altText = [photo.alt_description, photo.description].filter(Boolean).join(' ');
-    if (!isRelevantMatch(query, altText)) {
-      console.log(`Unsplash 결과가 "${query}"랑 안 맞아 보임(설명: ${altText}) — 건너뜀`);
-      return null;
-    }
-    const imageUrl = photo?.urls?.regular || photo?.urls?.small;
-    if (!imageUrl) return null;
-    const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
-    if (!imgRes.ok) {
-      await imgRes.text().catch(() => {});
-      return null;
-    }
-    const buffer = await imgRes.arrayBuffer();
-    if (!isUsableImage(buffer)) {
-      console.log(`Unsplash 이미지가 너무 작아(용량 기준) 못 씀("${query}"): ${buffer.byteLength}바이트`);
-      return null;
-    }
-    return buffer;
-  } catch (e) {
-    console.log(`Unsplash 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
-    return null;
-  }
-}
-
-async function getSceneImage(scene, topic, env) {
-  // 1순위: Pixabay — 규모가 크고(1900만+) 빠름(다운로드 위주라 FLUX 생성보다 훨씬 짧게 걸림)
-  let image = await searchPixabayImage(scene.keyword, env);
-  if (image) {
-    console.log(`Pixabay 이미지 사용(장면 키워드): "${scene.keyword}"`);
-    return image;
-  }
-  if (scene.keyword !== topic) {
-    image = await searchPixabayImage(topic, env);
-    if (image) {
-      console.log(`Pixabay 이미지 사용(주제 검색): "${topic}"`);
-      return image;
-    }
-  }
-
-  // 2순위: Pexels — 마찬가지로 라이선스 안전한 스톡사진, Pixabay에 없을 때 보조
-  image = await searchPexelsImage(scene.keyword, env);
-  if (image) {
-    console.log(`Pexels 이미지 사용(장면 키워드): "${scene.keyword}"`);
-    return image;
-  }
-  if (scene.keyword !== topic) {
-    image = await searchPexelsImage(topic, env);
-    if (image) {
-      console.log(`Pexels 이미지 사용(주제 검색): "${topic}"`);
-      return image;
-    }
-  }
-
-  // 3순위: Unsplash — 퀄리티는 제일 좋은 편인데 요청 제한(시간당 50건)이 셋 중 제일 빡빡해서 마지막에 배치
-  image = await searchUnsplashImage(scene.keyword, env);
-  if (image) {
-    console.log(`Unsplash 이미지 사용(장면 키워드): "${scene.keyword}"`);
-    return image;
-  }
-  if (scene.keyword !== topic) {
-    image = await searchUnsplashImage(topic, env);
-    if (image) {
-      console.log(`Unsplash 이미지 사용(주제 검색): "${topic}"`);
-      return image;
-    }
-  }
-
-  // 4순위: 실사진을 못 찾았을 때만 FLUX로 생성(느림, 최후 수단)
-  console.log(`실사진 소스 전부 실패(장면/주제 둘 다), FLUX로 생성: "${scene.keyword}"`);
-  // FLUX는 네거티브 프롬프트가 아예 안 먹혀서(구조적 제약), 원하는 걸 긍정문으로 항상 덧붙여줌
-  const qualitySuffix = ', photorealistic, sharp focus, natural lighting, high detail, professional photography';
-  image = await generateSceneImage(scene.prompt + qualitySuffix, env);
-  if (image) return image;
-
-  console.log(`모든 이미지 소스 실패: "${scene.keyword}"`);
-  return null;
-}
-
-// [2026-08-30 19:10] ---------- 영상 클립 검색 (장면 일부를 사진 대신 실사 클립으로) ----------
-// 영상당 클립 CLIP_TARGET개 + 나머지는 사진. 연관성(isRelevantMatch) 통과 못 하면 클립을 포기하고
-// 사진으로 폴백 — "아무 클립이나"보다 "관련 있는 사진"이 낫다는 방침. 클립 소스도 사진과 같은
-// Pixabay/Pexels 무료 스톡(같은 API 키), 다운로드가 커서 해상도 1280 이하 변형만 고름.
-const CLIP_TARGET = 3; // 영상 하나당 목표 클립 수
-const CLIP_MAX_BYTES = 30 * 1024 * 1024; // 이 이상은 다운로드/렌더링 부담이 커서 스킵
-const CLIP_MIN_BYTES = 100 * 1024; // 너무 작으면 썸네일급 저품질일 가능성
-const CLIP_DURATION_RANGE = [3, 60]; // 초 — 너무 짧으면 루프 티가 나고, 너무 길면 파일이 큼
-
-// [2026-08-30 19:10] Pixabay 영상 검색 — 사진 검색과 같은 키, hits[].videos에 해상도별 변형이 옴.
-async function searchPixabayClip(query, env, attempt = 0) {
-  if (!env.PIXABAY_API_KEY) return null;
-  try {
-    const res = await fetch(`https://pixabay.com/api/videos/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&per_page=3&safesearch=true`, { signal: AbortSignal.timeout(10000) });
-    if (res.status === 429 && attempt < 2) {
-      await res.text().catch(() => {});
-      await sleep(800 * (attempt + 1));
-      return searchPixabayClip(query, env, attempt + 1);
-    }
-    if (!res.ok) {
-      await res.text().catch(() => {});
-      console.log(`Pixabay 클립 검색 실패("${query}"): HTTP ${res.status}`);
-      return null;
-    }
-    const data = await res.json();
-    for (const hit of data?.hits || []) {
-      if (!isRelevantMatch(query, hit.tags)) continue; // 연관성 없으면 다음 후보
-      if (hit.duration < CLIP_DURATION_RANGE[0] || hit.duration > CLIP_DURATION_RANGE[1]) continue;
-      // 1280 이하 변형 중 가장 큰 것(보통 medium=1280, small=960)
-      const variants = Object.values(hit.videos || {}).filter((v) => v?.url && v.width && v.width <= 1280);
-      variants.sort((a, b) => b.width - a.width);
-      const v = variants[0];
-      if (!v || (v.size && v.size > CLIP_MAX_BYTES)) continue;
-      const clipRes = await fetch(v.url, { signal: AbortSignal.timeout(20000) });
-      if (!clipRes.ok) { await clipRes.text().catch(() => {}); continue; }
-      const buffer = await clipRes.arrayBuffer();
-      if (buffer.byteLength < CLIP_MIN_BYTES || buffer.byteLength > CLIP_MAX_BYTES) continue;
-      console.log(`Pixabay 클립 사용("${query}"): ${hit.duration}s, ${v.width}px, ${Math.round(buffer.byteLength / 1024)}KB`);
-      return buffer;
-    }
-    return null;
-  } catch (e) {
-    console.log(`Pixabay 클립 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
-    return null;
-  }
-}
-
-// [2026-08-30 19:10] Pexels 영상 검색 — 태그가 따로 없어서 영상 페이지 URL 슬러그(설명 단어 포함)로 연관성 판단.
-async function searchPexelsClip(query, env, attempt = 0) {
-  if (!env.PEXELS_API_KEY) return null;
-  try {
-    const res = await fetch(`https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=3&orientation=landscape`, {
-      headers: { Authorization: env.PEXELS_API_KEY },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (res.status === 429 && attempt < 2) {
-      await res.text().catch(() => {});
-      await sleep(800 * (attempt + 1));
-      return searchPexelsClip(query, env, attempt + 1);
-    }
-    if (!res.ok) {
-      await res.text().catch(() => {});
-      console.log(`Pexels 클립 검색 실패("${query}"): HTTP ${res.status}`);
-      return null;
-    }
-    const data = await res.json();
-    for (const video of data?.videos || []) {
-      if (!isRelevantMatch(query, video.url)) continue; // URL 슬러그에 설명 단어가 들어있음
-      if (video.duration < CLIP_DURATION_RANGE[0] || video.duration > CLIP_DURATION_RANGE[1]) continue;
-      const files = (video.video_files || []).filter((f) => f?.link && f.file_type === 'video/mp4' && f.width && f.width <= 1280);
-      files.sort((a, b) => b.width - a.width);
-      const f = files[0];
-      if (!f) continue;
-      const clipRes = await fetch(f.link, { signal: AbortSignal.timeout(20000) });
-      if (!clipRes.ok) { await clipRes.text().catch(() => {}); continue; }
-      const buffer = await clipRes.arrayBuffer();
-      if (buffer.byteLength < CLIP_MIN_BYTES || buffer.byteLength > CLIP_MAX_BYTES) continue;
-      console.log(`Pexels 클립 사용("${query}"): ${video.duration}s, ${f.width}px, ${Math.round(buffer.byteLength / 1024)}KB`);
-      return buffer;
-    }
-    return null;
-  } catch (e) {
-    console.log(`Pexels 클립 검색 오류("${query}"): ${e.name === 'TimeoutError' ? '응답 지연으로 타임아웃' : e.message}`);
-    return null;
-  }
-}
-
-// [2026-08-30 19:10] 장면 하나에 쓸 클립 찾기 — 장면 키워드 → 주제 순서로 검색, 연관성 통과 못 하면 null(사진 폴백).
-async function getSceneClip(scene, topic, env) {
-  let clip = await searchPixabayClip(scene.keyword, env);
-  if (clip) return clip;
-  clip = await searchPexelsClip(scene.keyword, env);
-  if (clip) return clip;
-  if (scene.keyword !== topic) {
-    clip = await searchPixabayClip(topic, env);
-    if (clip) return clip;
-    clip = await searchPexelsClip(topic, env);
-    if (clip) return clip;
-  }
-  return null;
-}
-
-async function generateSceneImage(prompt, env) {
-  if (!env.AI) return null;
-  try {
-    // flux-1-schnell은 prompt/seed/steps만 지원 (width/height 파라미터 없음 — FLUX.2 계열 얘기와 다름)
-    // steps 4(기본) → 6으로 올려서 품질 개선(최대 8, 그 이상은 효과 미미하고 느려지기만 함)
-    // 네거티브 프롬프트는 구조상 아예 안 먹혀서 품질 키워드는 프롬프트 자체(긍정문)에 미리 박아둠(generateScenePrompts 참고)
-    const response = await withTimeout(env.AI.run('@cf/black-forest-labs/flux-1-schnell', {
-      prompt,
-      steps: 6,
-    }, { gateway: { id: CF_AI_GATEWAY } }), 25000, 'FLUX 이미지 생성');
-    if (!response?.image) return null;
-    const binary = atob(response.image);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes.buffer;
-  } catch (e) {
-    console.log('이미지 생성 실패: ' + e.message);
-    return null;
-  }
-}
-
-// Chirp3-HD: Google의 최신 생성형 TTS, Wavenet보다 훨씬 인간미 있는 억양/호흡 표현.
-// 단점: speakingRate/pitch 파라미터를 아예 지원 안 함(넣으면 400 에러) — audioConfig는 인코딩만.
-const KOREAN_TTS_VOICES_NATURAL = [
-  'ko-KR-Chirp3-HD-Aoede', 'ko-KR-Chirp3-HD-Kore', 'ko-KR-Chirp3-HD-Leda',
-  'ko-KR-Chirp3-HD-Charon', 'ko-KR-Chirp3-HD-Puck', 'ko-KR-Chirp3-HD-Orus',
-];
-// Chirp3-HD가 실패할 경우(지역/쿼터 이슈 등) 대비한 예전 세대 폴백
-const KOREAN_TTS_VOICES_FALLBACK = ['ko-KR-Wavenet-A', 'ko-KR-Wavenet-B', 'ko-KR-Wavenet-C', 'ko-KR-Wavenet-D'];
-
-// 영상 하나에서 쓸 목소리를 한 번만 뽑아 고정 — 문장(세그먼트)별로 음성을 따로 합성하게 되면서,
-// 호출마다 랜덤으로 뽑으면 문장마다 목소리가 바뀌어버리기 때문. 자막 폰트/색과 같은 원리.
-function pickTtsVoices() {
-  return {
-    natural: KOREAN_TTS_VOICES_NATURAL[Math.floor(Math.random() * KOREAN_TTS_VOICES_NATURAL.length)],
-    fallback: KOREAN_TTS_VOICES_FALLBACK[Math.floor(Math.random() * KOREAN_TTS_VOICES_FALLBACK.length)],
-  };
-}
-
-// voices: {natural, fallback} — 지정하면 그 목소리로 고정(세그먼트 합성용), 없으면 시도마다 랜덤(예전 동작).
-async function generateNarrationAudio(text, env, voices) {
-  if (!env.GOOGLE_TTS_API_KEY) {
-    return { buffer: null, error: 'GOOGLE_TTS_API_KEY 환경변수 미설정' };
-  }
-  const trimmed = text.slice(0, 3000); // Google Cloud TTS는 요청당 5000바이트 제한이라 여유있게 자름
-
-  // 버그였던 지점: fetch()가 타임아웃(AbortSignal)이나 네트워크 오류로 "실패 응답"이 아니라 "예외"를
-  // 던지면, 이 함수에 try/catch가 없어서 그 예외가 그대로 generateNarrationAudio 바깥 catch까지
-  // 뚫고 나가버렸음 — 그러면 Chirp3-HD 2번째 시도는커녕 Wavenet/MeloTTS 폴백까지 전부 건너뛰고
-  // "1번 타임아웃 = 그 패스 전체 포기"가 돼버림(RETRIES_PER_TIER를 아무리 올려도 소용없었던 이유).
-  // 실제 로그("3차 전량 실패 — 오류: The operation was aborted due to timeout")가 이 패턴과 정확히 일치.
-  // 여기서 잡아서 { ok:false } 로 정상 반환해야 재시도/폴백 루프가 원래 설계대로 다음 시도로 넘어감.
-  const tryVoice = async (voiceName, useNaturalConfig) => {
-    const audioConfig = useNaturalConfig
-      ? { audioEncoding: 'MP3' } // Chirp3-HD는 속도/피치 파라미터 자체를 거부함
-      : { audioEncoding: 'MP3', speakingRate: 0.9 };
-    try {
-      const res = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${env.GOOGLE_TTS_API_KEY}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          input: { text: trimmed },
-          voice: { languageCode: 'ko-KR', name: voiceName },
-          audioConfig,
-        }),
-        signal: AbortSignal.timeout(30000), // Chirp3-HD가 긴 텍스트에선 20초를 넘기는 경우가 있어서 여유를 둠
-      });
-      if (!res.ok) {
-        const bodyText = await res.text();
-        return { ok: false, error: `HTTP ${res.status} — ${bodyText.slice(0, 300)}` };
-      }
-      return { ok: true, data: await res.json() };
-    } catch (e) {
-      return { ok: false, error: `요청 실패(타임아웃/네트워크): ${e.message}` };
-    }
-  };
-
-  try {
-    // 각 목소리군마다 최대 2번씩 시도(사이에 잠깐 대기) — 일시적인 오류(타임아웃, 순간 과부하 등)면
-    // 재시도로 넘어갈 수 있는데, 예전엔 한 번 실패하면 바로 포기해서 음성 없이 발행되는 경우가 잦았음.
-    const RETRIES_PER_TIER = 3;
-    const attemptErrors = [];
-    let voiceName = null;
-    let attempt = null;
-
-    for (let i = 0; i < RETRIES_PER_TIER && !attempt?.ok; i++) {
-      voiceName = voices?.natural || KOREAN_TTS_VOICES_NATURAL[Math.floor(Math.random() * KOREAN_TTS_VOICES_NATURAL.length)];
-      attempt = await tryVoice(voiceName, true);
-      if (!attempt.ok) {
-        attemptErrors.push(`Chirp3-HD 시도${i + 1}(${voiceName}) 실패: ${attempt.error}`);
-        if (i < RETRIES_PER_TIER - 1) await sleep(1000);
-      }
-    }
-
-    if (!attempt.ok) {
-      for (let i = 0; i < RETRIES_PER_TIER && !attempt.ok; i++) {
-        voiceName = voices?.fallback || KOREAN_TTS_VOICES_FALLBACK[Math.floor(Math.random() * KOREAN_TTS_VOICES_FALLBACK.length)];
-        attempt = await tryVoice(voiceName, false);
-        if (!attempt.ok) {
-          attemptErrors.push(`Wavenet 시도${i + 1}(${voiceName}) 실패: ${attempt.error}`);
-          if (i < RETRIES_PER_TIER - 1) await sleep(1000);
-        }
-      }
-    }
-
-    // Google TTS 두 계열 다 실패하면, Workers AI 자체 TTS(MeloTTS)도 마지막으로 한 번 시도 —
-    // 별도 API 키 필요 없이 이미 쓰고 있는 AI 바인딩 그대로라 부담 없이 끼워넣을 수 있는 마지막 카드.
-    if (!attempt.ok && env.AI) {
-      try {
-        const meloResponse = await withTimeout(
-          env.AI.run('@cf/myshell-ai/melotts', { prompt: trimmed, lang: 'ko' }, { gateway: { id: CF_AI_GATEWAY } }),
-          20000, 'MeloTTS 음성합성'
-        );
-        if (meloResponse?.audio) {
-          const binary = atob(meloResponse.audio);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-          console.log('음성합성 성공 (Workers AI MeloTTS, 마지막 폴백)');
-          return { buffer: bytes.buffer, error: null };
-        }
-        attemptErrors.push('MeloTTS 실패: 응답에 audio 없음');
-      } catch (e) {
-        attemptErrors.push(`MeloTTS 실패: ${e.message}`);
-      }
-    }
-
-    if (!attempt.ok) {
-      return { buffer: null, error: attemptErrors.join(' / ') };
-    }
-
-    const data = attempt.data;
-    if (!data?.audioContent) {
-      return { buffer: null, error: '응답에 audioContent 없음 — raw: ' + JSON.stringify(data).slice(0, 300) };
-    }
-    const binary = atob(data.audioContent);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    console.log(`음성합성 성공 (Google Cloud TTS, 목소리: ${voiceName})`);
-    return { buffer: bytes.buffer, error: null };
-  } catch (e) {
-    return { buffer: null, error: `오류: ${e.message}` };
-  }
-}
-
-// generateNarrationAudio 하나가 이미 Chirp3-HD 3회 + Wavenet 3회 + MeloTTS 1회(7번)를 시도하지만,
-// 그래도 다 실패하면 예전엔 그냥 무음으로 발행돼버렸음. 여기서 그 전체 패스를 한 번 더 감싸서
-// 총 3패스(최대 21번 시도)까지 기다렸다가 포기하도록 함 — 순간적인 429/5xx/게이트웨이 hiccup 정도는
-// 이 정도면 거의 다 흡수됨. API 키 자체가 없는 경우는 각 패스가 즉시 실패라 금방 끝남.
-async function generateNarrationAudioWithRetry(text, env, maxAttempts = 3, voices = null) {
-  let lastError = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const result = await generateNarrationAudio(text, env, voices);
-    if (result.buffer) {
-      if (attempt > 1) console.log(`음성합성 ${attempt}차 시도에서 성공`);
-      return result;
-    }
-    lastError = result.error;
-    console.log(`음성합성 ${attempt}차 전체 실패: ${result.error}`);
-    if (attempt < maxAttempts) await sleep(2000);
-  }
-  return { buffer: null, error: `음성합성 ${maxAttempts}차 전량 실패 — ${lastError}` };
-}
-
-// ---------- 문장(세그먼트)별 음성 합성 ----------
-// 자막-음성 싱크의 근본 해결책: 나레이션 전체를 한 번에 합성하면 각 문장이 언제 시작하는지 알 방법이
-// 없어서(Chirp3-HD는 SSML 타임포인트 미지원) 글자수로 추정할 수밖에 없고, 그 추정 오차가 누적돼 뒤로
-// 갈수록 자막이 어긋났음. 무음 감지로 맞추는 시도도 실제 TTS(숨소리 섞인 사람 같은 음성)에선 불안정.
-// → 문장을 몇 개씩 묶은 "세그먼트" 단위로 음성을 따로따로 합성하면, 릴레이(ffmpeg)가 각 조각의 실제
-// 길이를 정확히 잰 뒤 이어붙이므로 세그먼트 경계마다 자막 타이밍이 구조적으로 정확해짐(추정이 아예 없음).
-
-function splitIntoSentences(text) {
-  return (text || '').split(/(?<=[.!?。！？])\s+/).filter(Boolean);
-}
-
-// [2026-08-30 19:25] 나레이션 텍스트 정규화 — 음성·자막 싱크에 유리한 형태로 다듬음.
-// TTS가 기호를 예상 밖 길이로 읽으면(예: '%'→"퍼센트", 이모지 무시) 글자수 기반 줄 배분이 어긋나므로,
-// 읽는 소리와 글자수가 일치하도록 기호를 한글로 바꾸거나 제거. 괄호는 기호만 벗기고 내용은 유지.
-// 나레이션과 자막이 같은 이 텍스트를 쓰기 때문에 여기서 뭘 바꿔도 둘은 항상 일치함(본문 HTML은 원문 유지).
-function sanitizeNarrationText(text) {
-  return (text || '')
-    .replace(/[…]+|\.{3,}/g, '.') // 말줄임표 → 마침표(TTS가 길게 끌지 않게)
-    .replace(/[%％]/g, '퍼센트')
-    .replace(/[℃]/g, '도')
-    .replace(/[·•]/g, ', ') // 나열 기호 → 쉼표(TTS가 통째로 건너뛰는 걸 방지)
-    .replace(/[()\[\]{}「」『』<>《》〈〉"'‘’“”]/g, ' ') // 괄호/따옴표 기호 제거(내용은 유지)
-    .replace(/[^가-힣ᄀ-ᇿ0-9a-zA-Z.,!?~\s]/g, ' ') // 이모지 등 나머지 특수문자 제거
-    .replace(/\s+([.,!?])/g, '$1') // 기호 제거로 생긴 "텍스트 ." 꼴 정리
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-// [2026-08-30 19:25] 긴 문장은 쉼표에서 쪼갬 — 문장 하나가 세그먼트 상한(90자)을 넘으면 그 안에서는
-// 글자수 추정 배분만 남아 싱크 이점이 줄어듦. 가운데에 가장 가까운 쉼표에서 갈라 두 문장처럼 취급
-// (자막·음성 둘 다 같은 조각을 쓰므로 어색함 없음). 쪼갠 뒤에도 길면 재귀적으로 계속.
-function splitLongSentence(sentence, maxChars = 100) {
-  if (sentence.length <= maxChars) return [sentence];
-  const mid = sentence.length / 2;
-  let best = -1;
-  for (let i = 0; i < sentence.length; i++) {
-    if (sentence[i] === ',' && (best === -1 || Math.abs(i - mid) < Math.abs(best - mid))) best = i;
-  }
-  if (best <= 0 || best >= sentence.length - 1) return [sentence]; // 쉼표가 없으면 그대로 둠
-  const head = sentence.slice(0, best + 1).trim();
-  const tail = sentence.slice(best + 1).trim();
-  return [...splitLongSentence(head, maxChars), ...splitLongSentence(tail, maxChars)];
-}
-
-// [2026-08-30 19:25] 나레이션 문장 배열 준비 — 정규화 → 문장 분리 → 긴 문장 쪼개기. 음성 합성과 자막이
-// 모두 이 결과를 쓰는 단일 기준(같은 배열에서 세그먼트와 자막 비트가 나옴 → 싱크가 구조적으로 일치).
-function prepareNarrationSentences(text) {
-  return splitIntoSentences(sanitizeNarrationText(text)).flatMap((s) => splitLongSentence(s)).filter(Boolean);
-}
-
-// 나레이션이 상한을 넘으면 "문장이 끝나는 지점"에서 자름 — 예전처럼 글자수로 뚝 자르면
-// 마지막 문장이 중간에 끊긴 채 읽히고 자막도 어색하게 끝났음.
-function trimNarrationToSentence(text, maxChars) {
-  if ((text || '').length <= maxChars) return text;
-  const cut = text.slice(0, maxChars);
-  const m = cut.match(/[\s\S]*[.!?。！？]/);
-  return m ? m[0] : cut;
-}
-
-// [2026-09-01] TTS가 갑자기 두 단어를 붙여서 급하게 읽는 현상 대응 — AI가 프롬프트 지시(마침표/쉼표 뒤
-// 띄어쓰기)를 가끔 놓칠 수 있어서(분량 undershoot 때와 같은 패턴), 프롬프트만 믿지 않고 코드에서 한 번 더
-// 강제 보정함. 마침표·물음표·느낌표·쉼표 뒤에 공백이 없으면 넣어주고, 문장부호 앞에 붙은 불필요한 공백은
-// 제거해서 리듬이 자연스럽게 유지되게 함. 이 정규화는 자막 표시 문장과도 100% 동일 텍스트에 적용되므로
-// 자막-음성 매칭에는 영향 없음(양쪽 다 같은 결과를 봄).
-function normalizeNarrationSpacing(text) {
-  return (text || '')
-    .replace(/\s+([.!?,])/g, '$1') // 문장부호 앞의 공백 제거(". " 처럼 앞에 붙어있던 경우)
-    .replace(/([.!?,])(?=\S)/g, '$1 ') // 문장부호 뒤에 공백이 없으면 하나 넣음(붙여 읽기 방지의 핵심)
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-// 인접 문장을 maxChars 이내로 묶어 세그먼트 목록을 만듦 — 너무 잘게 나누면 TTS 호출이 많아지고
-// 문장 사이 억양이 뚝뚝 끊기므로 적당히 묶되, 한 세그먼트 안에서의 자막 줄 배분(글자수 비례 추정)
-// 오차가 눈에 안 띄게 세그먼트를 짧게 유지함. 반환: [{ text, sentences: [문장...] }]
-function planAudioSegments(sentences, maxChars) {
-  const segments = [];
-  let current = [];
-  let currentLen = 0;
-  for (const s of sentences) {
-    if (current.length && currentLen + s.length > maxChars) {
-      segments.push({ text: current.join(' '), sentences: current });
-      current = [];
-      currentLen = 0;
-    }
-    current.push(s);
-    currentLen += s.length;
-  }
-  if (current.length) segments.push({ text: current.join(' '), sentences: current });
-  return segments;
-}
-
-// 세그먼트들을 순서대로 이어붙인 하나의 mp3 버퍼 — 웹 슬라이드쇼 재생용(post.audio).
-// mp3는 프레임 단위 포맷이라 단순 바이트 연결로도 대부분의 플레이어에서 정상 재생됨.
-function concatAudioBuffers(buffers) {
-  const total = buffers.reduce((a, b) => a + b.byteLength, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const b of buffers) {
-    out.set(new Uint8Array(b), offset);
-    offset += b.byteLength;
-  }
-  return out.buffer;
-}
-
-async function buildVeoPrompt(topic, articleTitle, env) {
-  const systemPrompt = '너는 짧은 AI 생성 영상을 위한 크리에이티브 디렉터다. 주어진 주제와 글 제목을 참고해서 Google Veo에 넣을 영상 생성 프롬프트를 하나 작성한다. 장면 묘사, 카메라 움직임, 조명을 구체적으로 포함하고 5~8초 분량의 장면 하나로 압축한다. 실제 인물/유명인/브랜드 로고를 특정해서 묘사하지 않는다. 결과는 반드시 아래 JSON 형식으로만 출력한다:\n{"prompt": "Veo에 넣을 프롬프트 문장"}';
-  const userPrompt = `주제: ${topic}\n글 제목: ${articleTitle}`;
-  const { result } = await callAiChain(systemPrompt, userPrompt, env);
-  if (result?.prompt) return result.prompt;
-  return `${topic}을(를) 표현하는 짧고 차분한 영상. 다큐멘터리 스타일의 자연스러운 장면, 부드러운 조명, 절제된 카메라 움직임.`;
-}
-
-async function startVeoOperation(prompt, env) {
-  let res;
-  try {
-    res = await fetch(`${VEO_BASE_URL}/models/${VEO_MODEL}:predictLongRunning`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
-      body: JSON.stringify({ instances: [{ prompt }] }),
-    });
-  } catch (e) {
-    return { ok: false, error: `Veo 시작 네트워크 오류: ${e.message}` };
-  }
-  if (!res.ok) {
-    const bodyText = await res.text();
-    return { ok: false, error: `Veo 시작 실패 HTTP ${res.status}: ${bodyText.slice(0, 300)}` };
-  }
-  const data = await res.json();
-  if (!data?.name) return { ok: false, error: `operation name 없음 — raw: ${JSON.stringify(data).slice(0, 300)}` };
-  return { ok: true, operationName: data.name };
-}
-
-async function fetchVeoVideoBytes(videoUri, videoBase64, env) {
-  if (videoBase64) {
-    const binary = atob(videoBase64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes.buffer;
-  }
-  const res = await fetch(videoUri, { headers: { 'x-goog-api-key': env.GEMINI_API_KEY } });
-  if (!res.ok) throw new Error(`영상 다운로드 실패: HTTP ${res.status}`);
-  return await res.arrayBuffer();
-}
-
-const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서 접근할 이미지/음성 URL의 기준 도메인
-
-// [2026-08-30 23:31] 스레드 공유 캡션 — 훅 / 요약 / 해시태그 / 링크를 빈 줄로 나눠 보기 좋게 구성.
-// AI가 줄바꿈 없이 한 덩어리로 준 경우에도 첫 문장(훅)과 해시태그를 분리해 자동으로 재구성함.
-function buildThreadsCaption(p) {
-  const raw = (p.threadsText || '').trim();
-  let bodyText = raw;
-  if (raw && !raw.includes('\n')) {
-    const tags = (raw.match(/#[^\s#]+/g) || []).join(' ');
-    const rest = raw.replace(/#[^\s#]+/g, '').replace(/\s+/g, ' ').trim();
-    const m = rest.match(/^(.+?[.!?])\s*(.*)$/);
-    bodyText = m && m[2] ? `${m[1]}\n\n${m[2]}` : rest;
-    if (tags) bodyText += `\n\n${tags}`;
-  }
-  if (!bodyText) bodyText = `${p.title || ''}\n${p.topic || ''}`.trim();
-  const link = p.youtubeUrl || `${SITE_ORIGIN}/${p.slug}`;
-  return `${bodyText}\n\n🎬 영상 보기 👉 ${link}\n\n— 제로지`;
-}
-
-// Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
-// 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
-async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, env, highlightSegRange) {
-  if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
-  if (!imageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
-
-  const imageUrls = imageKeys.map((k) => `${SITE_ORIGIN}/media/${k}`);
-  const audioUrl = audioKey ? `${SITE_ORIGIN}/media/${audioKey}` : null;
-  // 세그먼트 원본 목록 — 릴레이가 각각의 실제 길이를 재서 이어붙이고, 자막 타이밍을 실측으로 맞추는 데 씀.
-  const audioSegments = Array.isArray(audioSegmentKeys) && audioSegmentKeys.length
-    ? audioSegmentKeys.map((k) => `${SITE_ORIGIN}/media/${k}`)
-    : null;
-
-  try {
-    // [2026-08-31 00:33] 렌더링 전 메모리 정리 — 오래된 작업 제거 + GC 강제 실행
-    try {
-      const cleanupRes = await fetch(`${env.RELAY_URL}/cleanup`, {
-        method: 'POST',
-        headers: { 'x-relay-secret': env.RELAY_SECRET },
-        signal: AbortSignal.timeout(5000),
-      });
-      // cleanup 실패는 경고만 하고 계속 진행
-      if (!cleanupRes.ok) console.warn(`relay cleanup 실패: HTTP ${cleanupRes.status}`);
-    } catch (cleanupErr) {
-      console.warn(`relay cleanup 요청 오류: ${cleanupErr.message}`);
-    }
-
-    const res = await fetch(`${env.RELAY_URL}/render`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
-      // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
-      // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림; 비트마다 segIndex로 음성 세그먼트 매핑)
-      // captionFontKey/captionColor: 이 영상 전체에 고정으로 쓸 폰트 키/색 하나(위치도 영상당 하나로 고정 — captionBeats의 styleIndex가 이미 전부 동일한 값으로 옴)
-      // [2026-09-02 21:05] highlightSegRange: 쇼츠를 잘라낼 하이라이트 문장 구간(있으면 relay가 이 구간만
-      // 사용, 없으면 예전처럼 도입/중간/결론 후보 로직으로 폴백)
-      body: JSON.stringify({ images: imageUrls, audioUrl, audioSegments, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange: highlightSegRange || null }),
-      signal: AbortSignal.timeout(25000),
-    });
-    if (!res.ok) {
-      const bodyText = await res.text();
-      return { ok: false, error: `릴레이 렌더링 요청 실패: HTTP ${res.status} — ${bodyText.slice(0, 400)}` };
-    }
-    const data = await res.json();
-    if (!data?.jobId) return { ok: false, error: `릴레이 응답에 jobId 없음 — raw: ${JSON.stringify(data).slice(0, 400)}` };
-    return { ok: true, jobId: data.jobId };
-  } catch (e) {
-    return { ok: false, error: `릴레이 요청 오류: ${e.message}` };
-  }
-}
-
-// 렌더링 완료/실패 처리를 공통 함수로 분리 — 5분 크론뿐 아니라 admin 페이지가 실시간으로 상태를
-// 물어볼 때도(handleRenderProgress) 그 자리에서 바로 반영시켜서, "완료라고 뜨는데 실제로는 최대 5분
-// 기다려야 반영되는" 시차를 없앰.
-async function finalizeRenderDone(job, renderJobKeyName, env, ctx) {
-  const postRaw = await env.POSTS.get(`post:${job.slug}`);
-  if (postRaw) {
-    const post = JSON.parse(postRaw);
-    post.video = job.r2Key;
-    if (job.durationSec) post.videoDurationSec = job.durationSec; // [2026-09-01] 관리자 목록에 "몇 분짜리"로 표시
-    // [2026-08-30 22:14] 숏츠가 실제로 R2에 있는지 확인해 기록(릴레이가 조건에 따라 건너뛸 수 있어 head로 검증)
-    const shortKeyList = Array.isArray(job.shortKeys) ? job.shortKeys : (job.shortKey ? [job.shortKey] : []); // [2026-08-30 22:55] 숏츠 3개 지원
-    const existingShorts = [];
-    for (const sk of shortKeyList) {
-      const head = await env.MEDIA.head(sk).catch(() => null);
-      if (head) existingShorts.push(sk);
-    }
-    if (existingShorts.length) {
-      post.videoShorts = existingShorts;
-      post.videoShort = existingShorts[0]; // 하위호환(기존 표시/다운로드 코드)
-    }
-
-    // mp4가 완성되면 이미지·mp3(세그먼트 포함)는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
-    const toDelete = [...(post.images || []), ...(post.audioSegments || [])];
-    if (post.audio) toDelete.push(post.audio);
-    if (toDelete.length) {
-      await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
-    }
-    post.images = [];
-    post.audio = null;
-    post.audioSegments = [];
-
-    await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
-
-    // 유튜브 자동 업로드 — 응답/크론을 안 붙잡고 백그라운드로 돌림(ctx.waitUntil). 실패해도 글은 그대로 살려두고
-    // youtubeError만 남김(음성처럼 삭제하진 않음 — 유튜브는 부가 기능이라 실패가 발행 자체를 막을 이유는 없음).
-    const uploadPromise = triggerYoutubeUpload(job.slug, job.r2Key, env);
-    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(uploadPromise);
-    else await uploadPromise;
-  } else {
-    // [2026-09-02 18:45] 고아 mp4 자동청소 — post가 삭제/취소된 상태로 렌더가 끝나면 결과물을 R2에서 지운다
-    const orphanKeys = [job.r2Key, ...(Array.isArray(job.shortKeys) ? job.shortKeys : (job.shortKey ? [job.shortKey] : []))].filter(Boolean);
-    if (orphanKeys.length && env.MEDIA) {
-      await Promise.all(orphanKeys.map((k) => env.MEDIA.delete(k).catch(() => {})));
-      console.log(`[${renderJobKeyName}] post 없음 — 고아 렌더 결과물 삭제: ${orphanKeys.join(', ')}`);
-    }
-  }
-  await env.POSTS.delete(renderJobKeyName);
-  console.log(`[${renderJobKeyName}] 릴레이 렌더링 완료 및 저장: ${job.r2Key}`);
-}
-
-// ---------- 유튜브 자동 업로드 ----------
-// refresh_token으로 access_token을 매번 새로 발급받음(access_token은 수명이 짧아서 캐싱 안 하고 그때그때 발급).
-async function getYoutubeAccessToken(env) {
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: env.YOUTUBE_CLIENT_ID,
-      client_secret: env.YOUTUBE_CLIENT_SECRET,
-      refresh_token: env.YOUTUBE_REFRESH_TOKEN,
-      grant_type: 'refresh_token',
-    }),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) {
-    const bodyText = await res.text();
-    throw new Error(`access_token 발급 실패: HTTP ${res.status} — ${bodyText.slice(0, 300)}`);
-  }
-  const data = await res.json();
-  if (!data.access_token) throw new Error(`access_token 응답에 값 없음: ${JSON.stringify(data).slice(0, 300)}`);
-  return data.access_token;
-}
-
-// YouTube Data API v3 resumable upload — 세션을 먼저 열고(POST) 실제 영상 바이트를 청크 단위로 PUT함.
-// 예전엔 한 번에 통째로 PUT했지만, 그러면 업로드 도중 진행률을 전혀 알 수 없어서(관리자 화면이 "업로드 중"에서
-// 멈춰있음) 8MiB씩 나눠 순차 PUT하고, 청크가 성공할 때마다 onProgress(percent)로 진행률을 알려줌.
-const YOUTUBE_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024; // YouTube 리줌 업로드 규격상 256KiB의 배수여야 함 — 8MiB는 배수
-// [2026-08-30 22:13] opts.shorts: 숏츠 업로드 모드 — 제목에 #Shorts 추가(세로 + 60초 이내라 유튜브가 자동으로 숏츠 분류)
-async function uploadVideoToYoutube(post, videoBuffer, env, onProgress, opts = {}) {
-  if (!env.YOUTUBE_CLIENT_ID || !env.YOUTUBE_CLIENT_SECRET || !env.YOUTUBE_REFRESH_TOKEN) {
-    return { ok: false, error: 'YOUTUBE_CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN 환경변수 미설정' };
-  }
-  try {
-    const accessToken = await getYoutubeAccessToken(env);
-    const description = `${stripHtml(post.intro).slice(0, 400)}\n\n작성자: 제로지\n원문: ${SITE_ORIGIN}/${post.slug}`;
-    const shortsSuffix = opts.shorts ? `${opts.partTotal > 1 ? ` (${opts.partNo}/${opts.partTotal})` : ''} #Shorts` : ''; // [2026-08-30 22:55] 숏츠 여러 개면 (1/3) 식으로 제목 구분
-    // 유튜브 tags 정제: 빈 문자열/null 제거, 개수 제한(≤10), 각 태그 50자 이하
-    const sanitizeTag = (t) => (typeof t === 'string' ? t.trim().replace(/[<>"{}|\\^`\[\]]/g, '').slice(0, 50) : '');
-    const tags = [post.topic, ...(post.tags || [])].map(sanitizeTag).filter((t) => t.length > 0).slice(0, 10);
-    const metadata = {
-      snippet: {
-        title: (post.title || post.topic || 'life.news').slice(0, 100 - shortsSuffix.length) + shortsSuffix,
-        description: description.slice(0, 4900),
-        tags: tags.length > 0 ? tags : undefined, // 유튜브: tags 배열이 비면 필드 자체 제거
-        categoryId: '25', // News & Politics — 생활뉴스 성격에 맞춤
-      },
-      status: { privacyStatus: 'public', selfDeclaredMadeForKids: false },
+    const stockCount = Object.keys(realtimeCache.stock).length;
+    if (stockCount === 0) return; // 빈 값으로 덮어쓰면 마지막 유효 스냅샷이 소실됨 - 값 있을 때만 저장
+    const data = {
+      savedAt: new Date().toISOString(),
+      index: realtimeCache.index,
+      stock: realtimeCache.stock,
     };
-    const initRes = await fetch('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json; charset=UTF-8',
-        'X-Upload-Content-Type': 'video/mp4',
-        'X-Upload-Content-Length': String(videoBuffer.byteLength),
-      },
-      body: JSON.stringify(metadata),
-      signal: AbortSignal.timeout(20000),
-    });
-    if (!initRes.ok) {
-      const bodyText = await initRes.text();
-      return { ok: false, error: `업로드 세션 생성 실패: HTTP ${initRes.status} — ${bodyText.slice(0, 300)}`, quotaExceeded: isQuotaExceededBody(bodyText) };
-    }
-    const uploadUrl = initRes.headers.get('Location');
-    if (!uploadUrl) return { ok: false, error: '업로드 세션 응답에 Location 헤더 없음' };
+    fs.writeFileSync(SNAPSHOT_PATH, JSON.stringify(data));
+  } catch (e) {
+    console.log("스냅샷 저장 실패: " + e.message);
+  }
+}
 
-    const total = videoBuffer.byteLength;
-    let uploaded = 0;
-    let finalData = null;
-    if (onProgress) await onProgress(0);
-    while (uploaded < total) {
-      const end = Math.min(uploaded + YOUTUBE_UPLOAD_CHUNK_SIZE, total);
-      const chunk = videoBuffer.slice(uploaded, end);
-      const chunkRes = await fetch(uploadUrl, {
-        method: 'PUT',
+function loadRealtimeSnapshot() {
+  try {
+    if (!fs.existsSync(SNAPSHOT_PATH)) return;
+    const raw = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, "utf8"));
+    const ageMs = Date.now() - new Date(raw.savedAt).getTime();
+    // 장중엔 10분 넘게 지난 값은 버림(그 사이 장 상황이 바뀌었을 것). 장마감 후엔 마지막 장중 값이
+    // 여전히 유효한 "현재가"이므로 신선도 제한 없이 그대로 복구(다음 장 시작 전까지 안 바뀌는 데이터).
+    if (isMarketHoursKST() && ageMs > 10 * 60 * 1000) return;
+    if (raw.index) Object.assign(realtimeCache.index, raw.index);
+    if (raw.stock) Object.assign(realtimeCache.stock, raw.stock);
+    console.log(`실시간가 스냅샷 복구: 종목 ${Object.keys(raw.stock || {}).length}개 (${Math.round(ageMs / 1000)}초 전 값)`);
+  } catch (e) {
+    console.log("스냅샷 복구 실패: " + e.message);
+  }
+}
+
+loadRealtimeSnapshot();
+setInterval(saveRealtimeSnapshot, SNAPSHOT_INTERVAL_MS);
+
+// 현재 구독 중인 종목코드 목록. Worker가 /realtime/subscribe 로 갱신하면 웹소켓에 재등록함.
+// 키움 제한: 한 연결에서 등록 가능한 실시간 종목이 총 200개(실측 확인 - 그룹 합산 기준).
+// 지수 2개 + 여유분을 빼고, 관심종목을 우선 배정한 뒤 남는 만큼만 리스트 종목에 씀.
+const TOTAL_STOCK_LIMIT = 180; // 지수(2) + 조건검색 등 여유를 빼고 종목에 쓸 총량
+const WATCH_RESERVED = 40; // 관심종목에 우선 배정할 최대 수
+let subscribedStocks = []; // 관심종목 (그룹2)
+let subscribedListStocks = []; // 화면 리스트 종목 (그룹3)
+
+let ws = null;
+let wsConnected = false;
+let wsLoggedIn = false;
+let wsReconnectDelay = 5000; // 재연결 대기 (실패 누적 시 늘어남, 최대 60초)
+let wsLastMessageAt = 0;
+let wsLoginAt = 0; // 로그인 완료 시각 - 직후 구독 요청이 몰리는 것을 막는 데 씀
+
+function parseSignedNumber(v) {
+  // 키움 실시간 값은 "+6629.24" / "-118077" 형태로 부호가 붙어서 옴
+  const n = parseFloat(String(v == null ? "" : v).replace(/[^0-9.\-]/g, ""));
+  return isNaN(n) ? 0 : n;
+}
+
+function issueToken() {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      grant_type: "client_credentials",
+      appkey: APP_KEY,
+      secretkey: APP_SECRET,
+    });
+    const req = https.request(
+      {
+        hostname: KIWOOM_REAL_HOST,
+        path: "/oauth2/token",
+        method: "POST",
+        agent: kiwoomAgent,
         headers: {
-          'Content-Type': 'video/mp4',
-          'Content-Length': String(chunk.byteLength),
-          'Content-Range': `bytes ${uploaded}-${end - 1}/${total}`,
+          "Content-Type": "application/json;charset=UTF-8",
+          "Content-Length": Buffer.byteLength(body),
         },
-        body: chunk,
-        signal: AbortSignal.timeout(60000), // 청크 하나(최대 8MiB)당 타임아웃 — 전체를 한 번에 기다리지 않아도 됨
-      });
-      if (chunkRes.status === 200 || chunkRes.status === 201) {
-        // 마지막 청크까지 다 받으면 여기서 완성된 video 리소스(JSON)를 돌려줌
-        finalData = await chunkRes.json();
-        uploaded = end;
-        if (onProgress) await onProgress(100);
-        break;
+      },
+      (res) => {
+        let raw = "";
+        res.on("data", (c) => (raw += c));
+        res.on("end", () => {
+          try {
+            const d = JSON.parse(raw);
+            if (!d.token) return reject(new Error("토큰 없음: " + raw.slice(0, 200)));
+            resolve(d.token);
+          } catch (e) {
+            reject(new Error("토큰 응답 파싱 실패: " + raw.slice(0, 200)));
+          }
+        });
       }
-      if (chunkRes.status === 308) {
-        // 중간 청크 정상 접수 — Range 헤더로 서버가 실제 받은 바이트 수를 알려주면 그걸 신뢰, 없으면 방금 보낸 만큼으로 간주
-        const rangeHeader = chunkRes.headers.get('Range'); // 형식: "bytes=0-8388607"
-        const match = rangeHeader && /bytes=0-(\d+)/.exec(rangeHeader);
-        uploaded = match ? parseInt(match[1], 10) + 1 : end;
-        if (onProgress) await onProgress(Math.floor((uploaded / total) * 100));
-        continue;
-      }
-      const bodyText = await chunkRes.text().catch(() => '');
-      return { ok: false, error: `영상 업로드 실패: HTTP ${chunkRes.status} — ${bodyText.slice(0, 300)}`, quotaExceeded: isQuotaExceededBody(bodyText) };
-    }
-    if (!finalData || !finalData.id) return { ok: false, error: `업로드 응답에 video id 없음: ${JSON.stringify(finalData || {}).slice(0, 300)}` };
-    return { ok: true, youtubeId: finalData.id, youtubeUrl: `https://youtu.be/${finalData.id}` };
-  } catch (e) {
-    return { ok: false, error: `유튜브 업로드 오류: ${e.message}` };
-  }
+    );
+    req.on("error", reject);
+    req.end(body);
+  });
 }
 
-// KV에 저장된 post의 유튜브 업로드 진행률만 갱신 — 관리자 화면 폴링이 이 값을 읽어 "업로드 중 N%"로 표시함.
-async function updateYoutubeUploadPercent(slug, percent, env) {
-  try {
-    const raw = await env.POSTS.get(`post:${slug}`);
-    if (!raw) return;
-    const p = JSON.parse(raw);
-    p.youtubeUploadPercent = percent;
-    await env.POSTS.put(`post:${slug}`, JSON.stringify(p));
-  } catch (e) {
-    console.log(`[youtube:${slug}] 진행률 저장 실패(무시하고 계속 업로드): ${e.message}`);
+// 종목명 캐시 { code: name } - 조건검색은 종목코드만 주기 때문에 이름을 따로 조회해서 보관.
+// 한 번 조회하면 계속 재사용(종목명은 바뀌지 않음).
+const stockNameCache = {};
+let nameFetchQueue = [];
+let nameFetchRunning = false;
+
+function queueNameFetch(codes) {
+  for (const c of codes) {
+    if (!stockNameCache[c] && !nameFetchQueue.includes(c)) nameFetchQueue.push(c);
   }
+  runNameFetch();
 }
 
-// [2026-08-31 00:07] relay.js health check — 주기적으로 폴링 → 3회 연속 실패 시 자동 재시작 시도
-let relayHealthFailCount = 0;
-async function checkRelayHealth(env) {
-  if (!env.RELAY_URL || !env.RELAY_SECRET) return; // env 미설정이면 체크 스킵
-  try {
-    const res = await fetch(`${env.RELAY_URL}/health`, {
-      headers: { 'x-relay-secret': env.RELAY_SECRET },
-      signal: AbortSignal.timeout(5000),
+function runNameFetch() {
+  if (nameFetchRunning || !nameFetchQueue.length) return;
+  nameFetchRunning = true;
+  const code = nameFetchQueue.shift();
+
+  issueTokenCached()
+    .then((token) => kiwoomRest("/api/dostk/stkinfo", "ka10001", { stk_cd: code }, token))
+    .then((data) => {
+      const name = data && (data.stk_nm || data.stk_name);
+      if (name) stockNameCache[code] = String(name).trim();
+    })
+    .catch(() => {})
+    .finally(() => {
+      nameFetchRunning = false;
+      // 키움 TR 초당1건 제한 준수
+      setTimeout(runNameFetch, 1100);
     });
-    if (res.ok) {
-      const data = await res.json();
-      relayHealthFailCount = 0; // 성공하면 카운트 리셋
-      console.log(`[relay-health] OK: ${data.status}, ${data.processingJobCount} jobs rendering`);
-      return { ok: true, ...data };
+}
+
+// relay 내부에서 키움 REST를 직접 호출할 때 쓰는 헬퍼 (종목명 조회용)
+function kiwoomRest(path, apiId, body, token) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = https.request(
+      {
+        hostname: KIWOOM_REAL_HOST,
+        path: path,
+        method: "POST",
+        agent: kiwoomAgent,
+        headers: {
+          "Content-Type": "application/json;charset=UTF-8",
+          authorization: "Bearer " + token,
+          "cont-yn": "N",
+          "next-key": "",
+          "api-id": apiId,
+          "Content-Length": Buffer.byteLength(payload),
+        },
+      },
+      (res) => {
+        let raw = "";
+        res.on("data", (c) => (raw += c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(raw));
+          } catch (e) {
+            reject(new Error("파싱 실패"));
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+// 토큰 캐시 (종목명 조회에 재사용 - 매번 발급하면 낭비)
+let restToken = null;
+let restTokenAt = 0;
+function issueTokenCached() {
+  if (restToken && Date.now() - restTokenAt < 3 * 60 * 60 * 1000) return Promise.resolve(restToken);
+  return issueToken().then((t) => {
+    restToken = t;
+    restTokenAt = Date.now();
+    return t;
+  });
+}
+
+// ---------- 등락률 상위 종목 수집 (ka10027) - Worker collectAndStore 이전 ----------
+// 원래 Worker의 2분 cron이 CPU시간 안에서 KOSPI/KOSDAQ 순차조회(1.1초 대기 포함)를 했는데,
+// relay는 상시구동이라 이 대기가 부담 없음. relay가 수집+파싱까지 끝내고 결과 배열만
+// Worker(/api/ingest/snapshots)로 POST -> Worker는 D1 insert만 수행(가벼움).
+function kiwoomRankingUp(mrktTp, token) {
+  const body = {
+    mrkt_tp: mrktTp,
+    sort_tp: "1",
+    trde_qty_cnd: "0000",
+    updown_incls: "1",
+    stk_cnd: "0",
+    crd_cnd: "0",
+    pric_cnd: "0",
+    trde_prica_cnd: "0",
+    flu_cnd: "1",
+    stex_tp: "3",
+  };
+  return kiwoomRest("/api/dostk/rkinfo", "ka10027", body, token).then((data) => {
+    if (data.return_code !== 0) throw new Error(`ka10027 실패(mrkt_tp=${mrktTp}): ${JSON.stringify(data).slice(0, 200)}`);
+    return data;
+  });
+}
+
+function parseKiwoomRankingRows(json) {
+  let rows = [];
+  for (const key of Object.keys(json)) {
+    if (Array.isArray(json[key])) {
+      rows = json[key];
+      break;
+    }
+  }
+  return rows
+    .map((row) => {
+      const code = (row.stk_cd || row.stk_no || "").split("_")[0];
+      const name = row.stk_nm || row.stk_name || "";
+      const price = Math.abs(parseInt(String(row.cur_prc ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+      const rate = parseFloat(row.flu_rt ?? row.updn_rt ?? "0") || 0;
+      const volume = Math.abs(parseInt(String(row.now_trde_qty ?? row.trde_qty ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+      const cntrStr = parseFloat(row.cntr_str ?? "0") || 0;
+      const buyReq = Math.abs(parseInt(String(row.buy_req ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+      const selReq = Math.abs(parseInt(String(row.sel_req ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+      return { code, name, price, rate, volume, cntrStr, buyReq, selReq };
+    })
+    .filter((r) => r.code);
+}
+
+const MIN_RATE = 5;
+const MAX_RATE = 15;
+// Worker의 isRegularStock/NON_STOCK_KEYWORD/ETF_BRAND_PREFIX와 완전히 동일한 기준으로 유지해야
+// 두 경로(구버전 Worker 직접수집 vs relay 이전수집) 사이에 필터링 결과가 어긋나지 않음.
+const NON_STOCK_KEYWORD = /(ETN|ETF|인버스|레버리지|선물|커버드콜|합성|파생결합|TDF|액티브|스팩|리츠|맥쿼리인프라)/i;
+const ETF_BRAND_PREFIX =
+  /^(KODEX|TIGER|KBSTAR|KIWOOM|ACE|SOL|RISE|PLUS|HANARO|KOSEF|KINDEX|TIMEFOLIO|마이다스|파워|WOORI|히어로즈|신한|대신|KTOP|FOCUS|네비게이터|파빌리온|우리|코세프|VITA|1Q|삼성|미래에셋|한투|마이티|WON|IBK|메리츠)\s?[0-9A-Za-z가-힣]*(200|100|150|300|배당|채권|국고채|MSCI|합성)/i;
+function isRegularStockName(name) {
+  if (!name) return false;
+  if (NON_STOCK_KEYWORD.test(name)) return false;
+  if (ETF_BRAND_PREFIX.test(name)) return false;
+  return true;
+}
+
+async function fetchRiseListForMarket(mrktTp, market, token) {
+  const json = await kiwoomRankingUp(mrktTp, token);
+  const rows = parseKiwoomRankingRows(json);
+  return rows
+    .filter((r) => r.rate >= MIN_RATE && r.rate <= MAX_RATE && isRegularStockName(r.name))
+    .map((r) => ({ ...r, market }));
+}
+
+// 데이터 수집용 장시간 판단 - 매매중지(isTradingActiveKST, 15:50컷)와는 별개.
+// Worker의 isMarketHoursKST(09:01~15:46)와 동일 기준으로 맞춰야 수집 공백/시간대 불일치가 안 생김.
+function isMarketHoursKST() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const day = kst.getDay();
+  if (day === 0 || day === 6) return false;
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  return minutes >= 9 * 60 + 1 && minutes <= 15 * 60 + 46;
+}
+
+async function collectAndForwardSnapshots() {
+  if (!ADMIN_KEY) return; // 인증 없으면 Worker가 받아주지 않으므로 스킵
+  if (!isMarketHoursKST()) return;
+  try {
+    const token = await issueTokenCached();
+    const kospi = await fetchRiseListForMarket("001", "KOSPI", token);
+    await new Promise((r) => setTimeout(r, 1100)); // ka10027 초당 1건 제한
+    const kosdaq = await fetchRiseListForMarket("101", "KOSDAQ", token);
+    const all = [...kospi, ...kosdaq];
+    if (!all.length) return;
+    const result = await workerRequest("/api/ingest/snapshots", "POST", { items: all, capturedAt: new Date().toISOString() });
+    if (result.ok) {
+      console.log(`스냅샷 전송 완료: ${result.saved}건 (${result.capturedAt})`);
     } else {
-      relayHealthFailCount++;
-      console.log(`[relay-health] HTTP ${res.status}, fail count: ${relayHealthFailCount}`);
+      console.log("스냅샷 전송 실패: " + (result.error || "unknown"));
     }
   } catch (e) {
-    relayHealthFailCount++;
-    console.log(`[relay-health] 폴링 실패: ${e.message}, fail count: ${relayHealthFailCount}`);
+    console.log("스냅샷 수집 실패: " + e.message);
   }
-  // 3회 연속 실패 → 자동 재시작 시도
-  if (relayHealthFailCount >= 3) {
-    console.log(`[relay-health] 3회 연속 실패 → 자동 재시작 시도 (주소: ${env.RELAY_URL})`);
-    relayHealthFailCount = 0; // 재시작 시도 후 카운트 리셋(반복 호출 방지)
-    // 실제 재시작은 관리자가 수동으로 하거나, SSH로 systemctl restart를 호출할 env 권한이 필요
-    // 지금은 알림만 하고, 향후 SSH/systemctl 권한 있으면 자동 실행
+}
+// Worker cron의 collectAndStore를 완전히 대체 - 2분 주기로 relay가 직접 수집.
+setInterval(collectAndForwardSnapshots, 120000);
+setTimeout(collectAndForwardSnapshots, 5000); // 재시작 직후 2분 공백 방지용 1회 즉시 실행(5초 뒤, 토큰발급 여유)
+
+// ---------- 해외지수(다우/나스닥/S&P500) + 원달러 환율 ----------
+// 키움 국내주식 API 권한으로는 해외지수/환율을 못 받아옴(별도 해외파생 API 권한 필요) - 대신
+// 네이버 모바일증권의 공개 JSON API(인증 불필요, 비공식이지만 안정적으로 널리 쓰임)를 사용.
+// 국내 장 시간과 무관하게(미국 장은 밤에 열림) 24시간 갱신 - 장중 게이트 없음.
+function fetchNaverIndex(code) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(
+        `https://m.stock.naver.com/api/index/${encodeURIComponent(code)}/basic`,
+        { headers: { "User-Agent": "Mozilla/5.0" }, timeout: 8000, agent: naverAgent },
+        (res) => {
+          let body = "";
+          res.on("data", (c) => (body += c));
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(body));
+            } catch (e) {
+              reject(new Error("파싱 실패: " + body.slice(0, 200)));
+            }
+          });
+        }
+      )
+      .on("error", reject)
+      .on("timeout", function () {
+        this.destroy(new Error("타임아웃"));
+      });
+  });
+}
+
+const globalIndexCache = { dji: null, ixic: null, spx: null, usdkrw: null, updatedAt: null };
+async function refreshGlobalIndices() {
+  const targets = [
+    ["dji", ".DJI"], // 다우존스
+    ["ixic", ".IXIC"], // 나스닥종합
+    ["spx", ".SPX"], // S&P500
+    ["usdkrw", "FX_USDKRW"], // 원달러 환율
+  ];
+  for (const [key, code] of targets) {
     try {
-      await env.POSTS.put(`relay:health-alert`, JSON.stringify({
-        alert: '⚠️ relay 응답 없음 — 3회 폴링 실패. 수동 재시작 필요.',
-        failedAt: new Date().toISOString(),
-        relayUrl: env.RELAY_URL,
-      }), { expirationTtl: 30 * 60 }); // 30분 유지
-      console.log(`[relay-health] 알림 저장 완료`);
+      const json = await fetchNaverIndex(code);
+      // 네이버 응답 필드명은 지수/환율 종류에 따라 조금씩 다를 수 있어 여러 후보를 순서대로 확인
+      const price = parseFloat(json.closePrice ?? json.now ?? json.tradePrice ?? json.closePriceStr ?? "0");
+      const rate = parseFloat(
+        String(json.fluctuationsRatio ?? json.changeRate ?? json.fluctuationsRatioStr ?? "0").replace(/[^0-9.-]/g, "")
+      );
+      if (price > 0) {
+        globalIndexCache[key] = { price, rate };
+      }
     } catch (e) {
-      console.log(`[relay-health] 알림 저장 실패: ${e.message}`);
+      console.log(`해외지수(${code}) 조회 실패: ${e.message}`);
     }
   }
-  return { ok: false };
+  globalIndexCache.updatedAt = new Date().toISOString();
+}
+setInterval(refreshGlobalIndices, 5000); // 5초마다 - 너무 짧으면(3초 이하) 네이버 차단 위험, 5초가 안전권에서 최대한 당긴 값
+setTimeout(refreshGlobalIndices, 3000);
+
+// 국내(웹소켓 실시간)+해외(네이버 폴링) 지수를 한 번에 묶어서 반환 - SSE/realtime-all 등 여러
+// 응답 지점에서 공통으로 재사용.
+function buildIndexPayload() {
+  return {
+    kospi: realtimeCache.index["001"] || null,
+    kosdaq: realtimeCache.index["101"] || null,
+    dji: globalIndexCache.dji,
+    ixic: globalIndexCache.ixic,
+    spx: globalIndexCache.spx,
+    usdkrw: globalIndexCache.usdkrw,
+  };
 }
 
-// mp4가 R2(env.MEDIA)에 올라간 직후 호출 — 그 자리에서 바로 바이트를 읽어 유튜브에 올리고 결과를 post에 반영.
-// [2026-08-31] 유튜브 일일 업로드 할당량(태평양 시간 자정 리셋) 초과를 다른 실패(네트워크 오류, 파일 문제 등)와
-// 구분해서 감지 — 이거여야 "내일 자동 재시도"가 의미 있음(다른 실패는 재시도해도 똑같이 실패할 뿐).
-function isQuotaExceededBody(bodyText) {
-  return /quotaExceeded|dailyLimitExceeded/i.test(bodyText || '');
+// ---------- 15:36 최종 종가 재조회 (Worker collectFinalAccurateQuotes/retryFinalQuotePending 완전 이전) ----------
+// Worker는 호출당 서브리퀘스트 한도(약 50개)가 있어서 종목이 많으면 여러 틱(15:36/38/40/42/44)에
+// 나눠 재시도해야 했음. relay는 그런 한도가 없어서 한 번에 전종목 순차조회(1.1초 간격) 가능.
+function kiwoomQuoteRelay(code, token) {
+  return kiwoomRest("/api/dostk/mrkcond", "ka10007", { stk_cd: code }, token);
+}
+function parseKiwoomQuoteRelay(json) {
+  const abs = (v) => Math.abs(parseInt(String(v ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+  return {
+    price: abs(json.cur_prc),
+    rate: parseFloat(json.flu_rt ?? "0") || 0,
+    volume: abs(json.trde_qty ?? json.now_trde_qty),
+  };
 }
 
-// 유튜브 할당량은 매일 태평양 시간(America/Los_Angeles) 자정에 리셋됨 — 지금 시각 기준으로
-// "다음 자정 + 5분 여유"를 밀리초 타임스탬프로 계산. DST 전환일 근처엔 몇 분 오차 있을 수 있는데
-// 재시도 타이밍이라 치명적이지 않음(그 정도는 몇 분 일찍/늦게 재시도돼도 무방).
-function nextYoutubeQuotaResetMs() {
-  const now = new Date();
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
-  }).formatToParts(now);
-  const get = (t) => parseInt(parts.find((p) => p.type === t).value, 10);
-  const y = get('year'), mo = get('month'), d = get('day'), h = get('hour'), mi = get('minute'), s = get('second');
-  // "지금 태평양시간 벽시계"를 UTC로 착각하고 만든 값과 실제 now의 차이 = 현재 UTC-PT 오프셋(ms)
-  const offsetMs = now.getTime() - Date.UTC(y, mo - 1, d, h, mi, s);
-  const nextMidnightAsUtc = Date.UTC(y, mo - 1, d + 1, 0, 0, 0);
-  return nextMidnightAsUtc + offsetMs + 5 * 60 * 1000; // 5분 여유
-}
-
-// [2026-08-31] 할당량 초과로 막힌 영상들을 "순서가 있는 큐"로 관리 — 개별 재시도 시각을 각자 따로 예약하던
-// 방식(ytRetry:슬러그) 대신, 하나의 KV 키에 순번이 있는 목록을 유지함. 막힌 순서대로 쌓이고, 리셋 시각이
-// 지나면 크론이 맨 앞부터 하나씩 차례로 다시 시도 — 본편이든 숏츠든 같은 큐로 관리.
-const YT_QUEUE_KEY = 'ytUploadQueue';
-async function getYoutubeQueue(env) {
-  const raw = await env.POSTS.get(YT_QUEUE_KEY);
-  if (!raw) return { items: [], nextAttemptAt: null };
+let finalQuoteDoneToday = null; // "YYYY-MM-DD" - 하루 한 번만 실행되게 (같은 날 재시작돼도 중복 방지)
+async function runFinalQuoteReconcile() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
+  if (finalQuoteDoneToday === dateKey) return;
+  if (!ADMIN_KEY) return;
   try {
-    const q = JSON.parse(raw);
-    return { items: Array.isArray(q.items) ? q.items : [], nextAttemptAt: q.nextAttemptAt || null };
-  } catch {
-    return { items: [], nextAttemptAt: null };
+    const targetsRes = await workerRequest("/api/final-quote-targets", "GET");
+    if (!targetsRes.ok || !targetsRes.targets.length) return;
+    const targets = targetsRes.targets;
+    const token = await issueTokenCached();
+    const rows = [];
+    const failedCodes = [];
+    for (const t of targets) {
+      try {
+        const raw = await kiwoomQuoteRelay(t.code, token);
+        const q = parseKiwoomQuoteRelay(raw);
+        rows.push({ code: t.code, name: t.name, price: q.price, rate: q.rate, volume: q.volume, market: t.market });
+      } catch (e) {
+        failedCodes.push(t.code);
+      }
+      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+    }
+    if (rows.length) {
+      const result = await workerRequest("/api/ingest/final-quotes", "POST", {
+        rows, capturedAt: new Date().toISOString(), failedCodes,
+      });
+      if (result.ok) {
+        console.log(`최종 종가 재조회 완료: ${result.saved}/${targets.length}종목 (실패 ${failedCodes.length}종목)`);
+        finalQuoteDoneToday = dateKey;
+      } else {
+        console.log("최종 종가 재조회 전송 실패: " + (result.error || "unknown"));
+      }
+    }
+  } catch (e) {
+    console.log("최종 종가 재조회 실패: " + e.message);
   }
 }
-async function saveYoutubeQueue(queue, env) {
-  await env.POSTS.put(YT_QUEUE_KEY, JSON.stringify(queue)).catch(() => {});
-}
-// 이 슬러그가 큐에서 몇 번째인지(1부터) — 없으면 null. admin 화면에 순번 표시용.
-async function getYoutubeQueuePosition(slug, env) {
-  const queue = await getYoutubeQueue(env);
-  const idx = queue.items.findIndex((it) => it.slug === slug);
-  return idx === -1 ? null : idx + 1;
-}
-// 할당량 초과로 여전히 막혀있으면 큐에 남겨두고(이미 있으면 순번 그대로, 없으면 맨 뒤에 새로 추가) 다음
-// 리셋 시각을 갱신 — 성공했거나 할당량과 무관한 실패로 확정되면 큐에서 뺌(재시도해도 소용없으므로).
-async function updateYoutubeQueue(slug, stillBlocked, env) {
-  const queue = await getYoutubeQueue(env);
-  const idx = queue.items.findIndex((it) => it.slug === slug);
-  if (stillBlocked) {
-    if (idx === -1) queue.items.push({ slug, addedAt: Date.now() }); // 새로 막힌 것 — 맨 뒤에 추가(도착 순서 = 순번)
-    queue.nextAttemptAt = nextYoutubeQuotaResetMs();
-    await saveYoutubeQueue(queue, env);
-    const whenText = new Date(queue.nextAttemptAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
-    console.log(`[youtube:${slug}] 할당량 초과 — 대기열 ${idx === -1 ? queue.items.length : idx + 1}번째, ${whenText} 이후 재시도`);
-    return `오늘 유튜브 업로드 할당량을 다 써서 실패했어요. 대기열 ${idx === -1 ? queue.items.length : idx + 1}번째로 등록됐고, ${whenText} 이후 차례가 되면 자동으로 재시도됩니다.`;
+// 15:36 KST 정각을 정확히 맞추기보다, 15:35~15:40 사이 1분 간격으로 체크해서 그 구간에 한 번만 실행.
+// (분 단위 트리거를 setInterval로 대충 맞추는 방식 - cron 없는 Node 프로세스라 이렇게 처리)
+setInterval(() => {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  if (minutes >= 15 * 60 + 36 && minutes <= 15 * 60 + 40) {
+    runFinalQuoteReconcile();
   }
-  if (idx !== -1) {
-    queue.items.splice(idx, 1);
-    await saveYoutubeQueue(queue, env);
+}, 60000);
+
+// ---------- SSE(Server-Sent Events) 실시간 스트리밍 ----------
+// Worker가 2초마다 폴링하며 relay를 두드리던 구조 대신, relay가 웹소켓으로 값을 받는
+// 즉시 연결된 모든 SSE 클라이언트(Worker 경유)에 바로 push. 폴링 지연이 사라지고
+// 키움->relay->Worker->브라우저 전 구간이 이벤트 기반이 됨(진짜 실시간에 가까워짐).
+const sseClients = new Set(); // Set<http.ServerResponse>
+// 캐시에 남아있는 전 종목이 아니라, 실제로 화면에 쓰이는 3그룹(관심종목/화면리스트/실시간포착)에
+// 속한 종목만 골라서 반환 - SSE 브로드캐스트와 폴링 엔드포인트(/realtime/all, /realtime/stocks)가
+// 공통으로 씀. 정리(trim) 타이밍 사이에 남아있는 자투리 데이터까지 매번 통째로 직렬화/전송하던 낭비를 줄임.
+function relevantStocksPayload() {
+  const relevantCodes = new Set([...subscribedStocks, ...subscribedListStocks, ...realtimeCache.condition.codes]);
+  const stocks = {};
+  for (const code of relevantCodes) {
+    if (realtimeCache.stock[code]) stocks[code] = realtimeCache.stock[code];
   }
-  return null;
+  return stocks;
 }
 
-// 1분 크론이 호출 — 리셋 시각이 지났으면 큐 맨 앞의 항목 "딱 하나만" 다시 시도(한 틱에 여러 건 몰아서
-// 시도하면 할당량 재확인 없이 연달아 실패만 반복할 수 있어서, 한 번에 하나씩 순서대로 처리함).
-// 결과에 따라 triggerYoutubeUpload 내부에서 큐 순번을 알아서 갱신(성공/영구실패=제거, 계속 막힘=유지+다음날 예약).
-async function pollYoutubeQuotaRetries(env) {
-  const queue = await getYoutubeQueue(env);
-  if (!queue.items.length) return;
-  if (queue.nextAttemptAt && Date.now() < queue.nextAttemptAt) return; // 아직 리셋 시각 안 됨
-  // 맨 앞부터 훑되, 글 자체가 삭제됐거나 mp4가 없어진 무효 항목은 건너뛰지 말고 즉시 큐에서 제거하고 다음 항목으로.
-  while (queue.items.length) {
-    const front = queue.items[0];
-    const postRaw = await env.POSTS.get(`post:${front.slug}`);
-    if (!postRaw) { queue.items.shift(); await saveYoutubeQueue(queue, env); continue; }
-    const post = JSON.parse(postRaw);
-    if (!post.video) { queue.items.shift(); await saveYoutubeQueue(queue, env); continue; }
-    console.log(`[youtube-retry] 대기열 1번째(${front.slug}) 재업로드 시도`);
-    await triggerYoutubeUpload(front.slug, post.video, env); // 성공/실패 판정 후 큐 갱신은 내부에서 처리
-    return; // 한 틱에 하나만 — 다음 시도는 다음 분 크론에서
+function sseBroadcast(payload) {
+  if (!sseClients.size) return;
+  const line = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(line);
+    } catch (e) {
+      sseClients.delete(res);
+    }
+  }
+}
+// 매 웹소켓 메시지마다 브로드캐스트하면 너무 잦을 수 있어(체결이 빈번한 종목은 초당 여러 번) 묶어서
+// 전송. 200ms는 장중 종목 수가 많아지면(관심종목+화면리스트+실시간포착 합쳐 최대 250여개) relay
+// CPU와 클라이언트 렌더링 부하가 누적돼 장중 갈수록 느려지는 원인이 됐음 - 500ms로 완화.
+// 그래도 기존 2초 폴링보다 4배 빠름.
+let sseBroadcastPending = false;
+function scheduleSseBroadcast() {
+  if (sseBroadcastPending || !sseClients.size) return;
+  sseBroadcastPending = true;
+  setTimeout(() => {
+    sseBroadcastPending = false;
+    const cond = realtimeCache.condition;
+    const history = buildConditionHistory();
+    sseBroadcast({
+      index: buildIndexPayload(),
+      stocks: relevantStocksPayload(),
+      condition: { seq: cond.seq, name: cond.name, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history },
+    });
+  }, 500);
+}
+
+// 당일 최고 등락률(0B 체결 틱마다 갱신) / 직전 호가잔량(0D 틱마다 갱신) - 배치(2분 cron)로만
+// 계산하던 isTodayHigh/bidTurnedPositive/buyReqSpike/sellReqThinning을 relay가 실시간으로
+// 직접 계산하기 위한 캐시. 장 시작 시 리셋은 아래 miniCandleCacheClearedDate 옆 setInterval에서 같이 처리.
+const todayMaxRateCache = {}; // { code: 오늘 최고 등락률 }
+const prevOrderFlowCache = {}; // { code: { buyReq, selReq } } - 직전 호가 틱 값
+let group9ResyncPending = false;
+let group9LastCodes = []; // 직전에 실제로 등록한 목록 - 내용이 안 바뀌었으면 재등록 스킵
+function scheduleGroup9Resync() {
+  if (group9ResyncPending) return;
+  group9ResyncPending = true;
+  setTimeout(() => {
+    group9ResyncPending = false;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const current = [...realtimeCache.condition.codes];
+    const changed = current.length !== group9LastCodes.length || current.some((c) => !group9LastCodes.includes(c));
+    if (!changed) return;
+    ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "9" }));
+    if (current.length) {
+      ws.send(JSON.stringify({
+        trnm: "REG", grp_no: "9", refresh: "1",
+        data: [{ item: current, type: ["0B", "0D"] }],
+      }));
+    }
+    group9LastCodes = current;
+    console.log("실시간포착 호가잔량 구독 재동기화:", current.length + "종목");
+  }, 2000); // 조건검색 편입/이탈이 짧은 시간에 몰아서 일어날 수 있어 2초 묶어서 처리(REG 스팸 방지)
+}
+
+function handleRealtimeMessage(msg) {
+  if (!Array.isArray(msg.data)) return;
+  for (const entry of msg.data) {
+    if (entry.type === "0J" && entry.values) {
+      // 업종지수: 10=현재가, 12=등락률, 20=체결시각
+      // 주의: 키움 실시간 "현재가"는 부호가 붙어 오지만(-71400 등) 이건 가격이 마이너스라는 뜻이 아니라
+      // "기준가 대비 하락중"이라는 방향 표시임. 가격 자체는 항상 절댓값으로 처리해야 함(그대로 두면 하락일에
+      // 가격이 음수로 계산되는 버그가 생김 - 실측으로 확인됨). 등락률(12)은 방향이 의미 있으니 부호 유지.
+      realtimeCache.index[entry.item] = {
+        price: Math.abs(parseSignedNumber(entry.values["10"])),
+        rate: parseSignedNumber(entry.values["12"]),
+        time: entry.values["20"] || "",
+        updatedAt: new Date().toISOString(),
+      };
+    } else if (entry.type === "0B" && entry.values) {
+      // 주식체결: 10=현재가, 12=등락률, 13=누적거래량, 228=체결강도, 20=체결시각
+      // 현재가는 위와 동일한 이유로 절댓값 처리
+      const rate = parseSignedNumber(entry.values["12"]);
+      // 당일 최고 등락률을 실시간으로 계속 갱신 - 배치(2분 cron)로만 계산하던 isTodayHigh를
+      // relay가 체결 틱마다 즉시 갱신할 수 있게 됨(장 시작 시 리셋은 아래 setInterval 참고)
+      const prevMax = todayMaxRateCache[entry.item];
+      if (prevMax === undefined || rate > prevMax) todayMaxRateCache[entry.item] = rate;
+      const isTodayHigh = rate >= (todayMaxRateCache[entry.item] ?? rate) - 0.001;
+      const existing = realtimeCache.stock[entry.item] || {};
+      realtimeCache.stock[entry.item] = {
+        ...existing,
+        price: Math.abs(parseSignedNumber(entry.values["10"])),
+        rate,
+        volume: parseSignedNumber(entry.values["13"]),
+        cntrStr: parseSignedNumber(entry.values["228"]),
+        time: entry.values["20"] || "",
+        isTodayHigh,
+        updatedAt: new Date().toISOString(),
+      };
+    } else if (entry.type === "0D" && entry.values) {
+      // 주식호가잔량: 121=매도호가총잔량, 125=매수호가총잔량 - 배치(2분 cron)로만 비교하던
+      // 매수전환/매수잔량급증/매도잔량급감을 relay가 호가 변동 틱마다 즉시 계산할 수 있게 됨.
+      const code = entry.item;
+      const buyReq = Math.abs(parseSignedNumber(entry.values["125"]));
+      const selReq = Math.abs(parseSignedNumber(entry.values["121"]));
+      const prev = prevOrderFlowCache[code];
+      let bidTurnedPositive = false, buyReqSpike = false, sellReqThinning = false;
+      if (prev) {
+        // 매수전환: 직전엔 매도잔량이 더 많았는데 지금 막 매수잔량 우위로 뒤집힘
+        bidTurnedPositive = buyReq > selReq && prev.buyReq <= prev.selReq;
+        // 매수잔량급증: 직전 대비 매수잔량이 1.5배 이상
+        buyReqSpike = prev.buyReq > 0 && buyReq / prev.buyReq >= 1.5;
+        // 매도잔량급감: 직전 대비 매도잔량이 절반 이하로 줄어듦
+        sellReqThinning = prev.selReq > 0 && selReq / prev.selReq <= 0.5;
+      }
+      prevOrderFlowCache[code] = { buyReq, selReq };
+      const existing2 = realtimeCache.stock[code] || {};
+      realtimeCache.stock[code] = {
+        ...existing2,
+        buyReq, selReq, bidTurnedPositive, buyReqSpike, sellReqThinning,
+        updatedAt: new Date().toISOString(),
+      };
+    } else if (entry.type === "02" && entry.values) {
+      // 조건검색 실시간: 9001=종목코드, 843=편입(I)/이탈(D), 20=시각
+      // 조건에 새로 들어오거나 빠지는 순간 즉시 통보되므로, 2분 폴링 없이 실시간 포착 가능
+      const rawCode = String(entry.values["9001"] || entry.item || "");
+      const code = rawCode.replace(/^A/, ""); // 응답에 A가 붙어오는 경우가 있어 제거
+      const inOut = entry.values["843"];
+      if (!code) continue;
+
+      const isInsert = inOut === "I"; // I=Insert(편입), D=Delete(이탈)
+      const idx = realtimeCache.condition.codes.indexOf(code);
+      if (isInsert) {
+        if (idx === -1) realtimeCache.condition.codes.push(code);
+      } else {
+        if (idx !== -1) realtimeCache.condition.codes.splice(idx, 1);
+      }
+      // 호가잔량(0D)까지 실시간 구독하는 그룹9을 "지금 조건에 걸려있는 종목"과 항상 일치시킴 -
+      // 예전엔 한 번 편입되면 하루 종일(최대 80종목까지) 구독이 안 빠져서, 시간이 갈수록 실시간
+      // 메시지량이 누적돼 relay(1vCPU) 부하로 장중 갈수록 느려지는 원인이 됐음. 이제는 조건에서
+      // 이탈하면 그 즉시 구독도 같이 빠짐 - 실제 필요한 만큼(보통 몇~수십 개)만 유지됨.
+      scheduleGroup9Resync();
+
+      realtimeCache.condition.lastEventAt = new Date().toISOString();
+      realtimeCache.condition.events.unshift({
+        code: code,
+        action: isInsert ? "편입" : "이탈",
+        time: entry.values["20"] || "",
+        at: realtimeCache.condition.lastEventAt,
+      });
+      if (realtimeCache.condition.events.length > 50) realtimeCache.condition.events.length = 50;
+
+      // 편입 이력은 따로 보관: 조건에서 금방 빠져나가도 "방금 이런 게 있었다"를 놓치지 않게 함.
+      // (현재 조건 만족 목록만 보여주면, 잠깐 스쳐간 종목은 화면에서 그냥 사라져버림)
+      if (isInsert) {
+        const hist = realtimeCache.condition.history;
+        const existing = hist.findIndex((h) => h.code === code);
+        if (existing !== -1) hist.splice(existing, 1); // 재편입이면 맨 위로 올림
+        hist.unshift({
+          code: code,
+          time: entry.values["20"] || "",
+          at: realtimeCache.condition.lastEventAt,
+        });
+        if (hist.length > 60) hist.length = 60;
+        queueNameFetch([code]);
+      }
+    }
+  }
+  scheduleSseBroadcast();
+}
+
+function registerSubscriptions() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  // 요청을 한꺼번에 몰아 보내면 키움이 일부(특히 CNSRREQ)를 처리하지 못하는 현상이 있어,
+  // 조건검색을 가장 먼저 보내고 나머지는 간격을 두고 순차 전송함.
+  const send = (payload, label) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(payload));
+    if (label) console.log(label);
+  };
+
+  let delay = 0;
+  const later = (fn) => {
+    delay += 400;
+    setTimeout(fn, delay);
+  };
+
+  // 1) 조건검색: 목록조회(CNSRLST)를 먼저 보냄.
+  //    CNSRLST 없이 바로 CNSRREQ를 보내면 응답이 오지 않는 현상이 있어(실측),
+  //    CNSRLST 응답을 받은 뒤에 CNSRREQ를 보내도록 함(아래 message 핸들러에서 처리).
+  if (CONDITION_SEQ) {
+    send({ trnm: "CNSRLST" }, "조건검색 목록조회 요청 (seq=" + CONDITION_SEQ + " 등록 준비)");
+  }
+
+  // 2) 지수
+  later(() =>
+    send(
+      { trnm: "REG", grp_no: "1", refresh: "1", data: [{ item: ["001", "101"], type: ["0J"] }] },
+      "실시간 지수 구독 등록 요청"
+    )
+  );
+
+  // 3) 관심종목
+  if (subscribedStocks.length) {
+    later(() =>
+      send(
+        { trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B"] }] },
+        "실시간 관심종목 구독 등록 요청: " + subscribedStocks.length + "종목"
+      )
+    );
+  }
+
+  // 4) 화면 리스트 종목
+  if (subscribedListStocks.length) {
+    later(() =>
+      send(
+        { trnm: "REG", grp_no: "3", refresh: "1", data: [{ item: subscribedListStocks, type: ["0B"] }] },
+        "실시간 리스트종목 구독 등록 요청: " + subscribedListStocks.length + "종목"
+      )
+    );
   }
 }
 
-async function triggerYoutubeUpload(slug, r2Key, env) {
-  const uploadStartMs = Date.now(); // [2026-08-30 19:45] 업로드 소요시간 측정(관리자 표시용)
+async function connectWebSocket() {
+  if (!APP_KEY || !APP_SECRET) {
+    console.log("KIWOOM_APP_KEY_REAL/SECRET 미설정 - 웹소켓 기능 비활성화 (REST 중계는 정상 동작)");
+    return;
+  }
+
+  let token;
   try {
-    const postRaw0 = await env.POSTS.get(`post:${slug}`);
-    if (!postRaw0) return;
-    const post0 = JSON.parse(postRaw0);
+    token = await issueToken();
+  } catch (e) {
+    console.error("웹소켓용 토큰 발급 실패:", e.message);
+    scheduleReconnect();
+    return;
+  }
 
-    // [2026-08-31] 큐 재시도로 다시 불렸을 때, 본편이 이전 시도에서 이미 성공했다면 또 업로드하면 안 됨
-    // (중복 업로드 방지) — 이미 youtubeUrl이 있으면 본편은 건너뛰고 결과를 그대로 재사용.
-    let result;
-    if (post0.youtubeUrl) {
-      result = { ok: true, youtubeId: post0.youtubeId, youtubeUrl: post0.youtubeUrl };
-    } else {
-      const videoObj = await env.MEDIA.get(r2Key);
-      if (!videoObj) {
-        console.log(`[youtube:${slug}] mp4를 MEDIA에서 못 찾음(${r2Key}) — 업로드 스킵`);
+  ws = new WebSocket(WS_URL);
+  wsConnected = false;
+  wsLoggedIn = false;
+
+  ws.on("open", () => {
+    wsConnected = true;
+    console.log("웹소켓 연결됨 - LOGIN 전송");
+    ws.send(JSON.stringify({ trnm: "LOGIN", token: token }));
+  });
+
+  ws.on("message", (raw) => {
+    wsLastMessageAt = Date.now();
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch (e) {
+      return;
+    }
+
+    // PING은 그대로 되돌려줘야 연결이 유지됨
+    if (msg.trnm === "PING") {
+      ws.send(JSON.stringify(msg));
+      return;
+    }
+
+    if (msg.trnm === "LOGIN") {
+      if (msg.return_code !== 0) {
+        console.error("웹소켓 로그인 실패:", msg.return_msg);
+        ws.close();
         return;
       }
-      const videoBuffer = await videoObj.arrayBuffer();
-      result = await uploadVideoToYoutube(post0, videoBuffer, env, (percent) => updateYoutubeUploadPercent(slug, percent, env));
-    }
-    const freshRaw = await env.POSTS.get(`post:${slug}`); // 업로드 도중 post가 또 바뀌었을 수 있으니 최신본에 병합
-    if (!freshRaw) return;
-    const freshPost = JSON.parse(freshRaw);
-    freshPost.youtubeUploadPercent = null; // 끝났으니 진행률 표시는 지우고 youtubeUrl/youtubeError로 결과만 남김
-    if (!post0.youtubeUrl) freshPost.youtubeUploadSec = Math.round((Date.now() - uploadStartMs) / 1000); // 이번에 실제로 업로드했을 때만 갱신
-    let mainStillBlocked = false;
-    if (result.ok) {
-      freshPost.youtubeId = result.youtubeId;
-      freshPost.youtubeUrl = result.youtubeUrl;
-      freshPost.youtubeError = null;
-      freshPost.youtubeQuotaExceeded = false;
-      if (!post0.youtubeUrl) console.log(`[youtube:${slug}] 본편 업로드 성공: ${result.youtubeUrl}`);
-    } else {
-      mainStillBlocked = !!result.quotaExceeded;
-      freshPost.youtubeErrorRaw = result.error;
-      freshPost.youtubeQuotaExceeded = !!result.quotaExceeded;
-      console.log(`[youtube:${slug}] 본편 업로드 실패${result.quotaExceeded ? '(할당량 초과)' : ''}: ${result.error}`);
-      if (!result.quotaExceeded) freshPost.youtubeError = result.error; // 할당량 문구는 아래서 큐 상태 보고 통일해서 채움
+      wsLoggedIn = true;
+      wsLoginAt = Date.now();
+      wsReconnectDelay = 5000; // 성공했으니 백오프 초기화
+      console.log("웹소켓 로그인 성공");
+      registerSubscriptions();
+      return;
     }
 
-    // [2026-08-30 23:56] 숏츠 업로드 — 본편이 아직 막혀있으면(이번에 막혔든, 전부터 막혀있었든) 숏츠도 어차피
-    // 막힐 게 뻔하니 시도 자체를 건너뜀. 본편이 이미 됐으면(이전 성공분 포함) 숏츠 중 "아직 안 된 것만" 시도 —
-    // 이미 성공한 숏츠를 또 올리는 중복 업로드를 막기 위함(큐 재시도 시 특히 중요).
-    const allShortKeys = Array.isArray(freshPost.videoShorts) && freshPost.videoShorts.length
-      ? freshPost.videoShorts : (freshPost.videoShort ? [freshPost.videoShort] : []);
-    const prevShortsUrls = Array.isArray(freshPost.youtubeShortsUrls) ? freshPost.youtubeShortsUrls : [];
-    const mainReady = !!freshPost.youtubeUrl;
-    let anyShortStillBlocked = false;
-    freshPost.youtubeShortsSkippedReason = (!mainReady) ? '본편이 아직 할당량 초과로 막혀있어서 숏츠는 시도하지 않음(본편 성공 시 함께 시도됨)' : null;
+    if (msg.trnm === "REAL") {
+      handleRealtimeMessage(msg);
+      return;
+    }
 
-    if (mainReady && allShortKeys.length) {
-      const nextUrls = new Array(allShortKeys.length).fill(null);
-      const nextErrors = new Array(allShortKeys.length).fill(null);
-      const toAttempt = [];
-      allShortKeys.forEach((k, si) => {
-        if (prevShortsUrls[si]) { nextUrls[si] = prevShortsUrls[si]; return; } // 이미 성공 — 재시도 안 함
-        toAttempt.push(si);
-      });
-      if (toAttempt.length) {
-        const results = await Promise.all(toAttempt.map(async (si) => {
-          const shortKey = allShortKeys[si];
-          try {
-            const shortObj = await env.MEDIA.get(shortKey);
-            if (!shortObj) return { index: si, ok: false, error: 'R2에서 숏츠 파일을 못 찾음', quotaExceeded: false };
-            const shortBuffer = await shortObj.arrayBuffer();
-            const shortResult = await uploadVideoToYoutube(freshPost, shortBuffer, env, null, { shorts: true, partNo: si + 1, partTotal: allShortKeys.length });
-            if (shortResult.ok) {
-              console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 성공: ${shortResult.youtubeUrl}`);
-              return { index: si, ok: true, url: shortResult.youtubeUrl };
-            }
-            console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 실패${shortResult.quotaExceeded ? '(할당량 초과)' : ''}: ${shortResult.error}`);
-            return { index: si, ok: false, error: shortResult.error, quotaExceeded: !!shortResult.quotaExceeded };
-          } catch (e) {
-            console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 예외: ${e.message}`);
-            return { index: si, ok: false, error: e.message, quotaExceeded: false };
-          }
-        }));
-        for (const r of results) {
-          if (r.ok) {
-            nextUrls[r.index] = r.url;
-          } else {
-            nextErrors[r.index] = r.quotaExceeded ? '할당량 초과로 실패 — 대기열에서 차례가 되면 자동 재시도' : r.error;
-            if (r.quotaExceeded) anyShortStillBlocked = true;
-          }
-        }
+    // 조건검색 목록조회 응답 -> 이어서 실시간 등록(CNSRREQ) 요청
+    if (msg.trnm === "CNSRLST") {
+      const list = msg.data || [];
+      const found = list.find((x) => String(Array.isArray(x) ? x[0] : x.seq) === String(CONDITION_SEQ));
+      if (!found) {
+        console.error("조건식 seq=" + CONDITION_SEQ + " 을(를) 목록에서 찾지 못했습니다. 등록된 조건식:", list.length + "개");
+        return;
       }
-      freshPost.youtubeShortsUrls = nextUrls;
-      freshPost.youtubeShortsErrors = nextErrors;
-      freshPost.youtubeShortsUrl = nextUrls[0] || null; // 하위호환
-      freshPost.youtubeShortsError = nextErrors[0] || null;
-    }
-
-    // [2026-08-31] 본편이든 숏츠든 하나라도 여전히 할당량에 막혀있으면 큐에 유지(순번 부여)하고 다음 리셋
-    // 시각을 다시 예약 — 전부 끝났거나(성공) 할당량과 무관한 확정 실패면 큐에서 뺌.
-    const stillBlocked = mainStillBlocked || anyShortStillBlocked;
-    const queueMsg = await updateYoutubeQueue(slug, stillBlocked, env);
-    if (mainStillBlocked) freshPost.youtubeError = queueMsg; // 본편이 막힌 경우 안내 문구를 화면에 노출
-
-    await env.POSTS.put(`post:${slug}`, JSON.stringify(freshPost));
-  } catch (e) {
-    console.log(`[youtube:${slug}] 업로드 처리 중 예외: ${e.message}`);
-  }
-}
-
-// [2026-08-30 19:52] 렌더링 실패 기록 — 실패 이유가 화면에서 사라지지 않도록 KV에 3일간 보관.
-// 특히 오디오 검증 실패(NO_AUDIO_TRACK)는 글 자체가 삭제돼서 이 기록이 유일한 흔적이 됨(관리자 상단에 표시).
-async function recordRenderFailure(slug, errMsg, postDeleted, env) {
-  try {
-    const postRaw = await env.POSTS.get(`post:${slug}`);
-    const title = postRaw ? (JSON.parse(postRaw).title || '') : '';
-    await env.POSTS.put(`renderFail:${slug}`, JSON.stringify({
-      slug, title, error: (errMsg || '').slice(0, 500), postDeleted: !!postDeleted, at: new Date().toISOString(),
-    }), { expirationTtl: 3 * 24 * 3600 });
-  } catch (e) {
-    console.log(`렌더링 실패 기록 실패(무시): ${e.message}`);
-  }
-}
-
-async function finalizeRenderFailed(job, renderJobKeyName, errMsg, env) {
-  // relay.js가 "나레이션은 있었는데 최종 mp4에 오디오 트랙이 없음"을 NO_AUDIO_TRACK 마커로 알려주는 경우엔
-  // 일반 렌더링 실패(videoError만 기록하고 슬라이드쇼로 계속 발행)와 다르게, 글 자체를 완전히 삭제함 —
-  // 음성 없는 영상이 조용히 발행되는 걸 원천 차단.
-  if (errMsg && errMsg.includes('NO_AUDIO_TRACK')) {
-    await recordRenderFailure(job.slug, errMsg, true, env); // 삭제 전에 제목까지 기록
-    await deletePostCompletely(job.slug, env);
-    await env.POSTS.delete(renderJobKeyName);
-    console.log(`[${renderJobKeyName}] 오디오 트랙 검증 실패로 글 삭제됨: ${job.slug} — ${errMsg}`);
-    return;
-  }
-  await recordRenderFailure(job.slug, errMsg, false, env);
-  const failedPostRaw = await env.POSTS.get(`post:${job.slug}`);
-  if (failedPostRaw) {
-    const failedPost = JSON.parse(failedPostRaw);
-    failedPost.videoError = errMsg;
-    await env.POSTS.put(`post:${job.slug}`, JSON.stringify(failedPost));
-  }
-  await env.POSTS.delete(renderJobKeyName);
-  console.log(`[${renderJobKeyName}] 릴레이 렌더링 실패 — ${errMsg}`);
-}
-
-// 글(post)을 관련 미디어(이미지/음성/mp4)까지 포함해서 완전히 삭제 — 음성 검증 실패 시 등
-// "조용히 무음으로 발행되느니 아예 안 나오는 게 낫다" 상황에서 씀.
-async function deletePostCompletely(slug, env) {
-  const postRaw = await env.POSTS.get(`post:${slug}`);
-  if (postRaw) {
-    const post = JSON.parse(postRaw);
-    const toDelete = [...(post.images || []), ...(post.audioSegments || [])];
-    if (post.audio) toDelete.push(post.audio);
-    if (post.video) toDelete.push(post.video);
-    if (post.videoShort) toDelete.push(post.videoShort); // [2026-08-30 22:14] 숏츠도 함께 정리
-    (post.videoShorts || []).forEach((k) => { if (!toDelete.includes(k)) toDelete.push(k); }); // [2026-08-30 22:55] 숏츠 3개 전부
-    if (toDelete.length) {
-      await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
-    }
-  }
-  await env.POSTS.delete(`post:${slug}`);
-  const idxRaw = await env.POSTS.get('index');
-  if (idxRaw) {
-    const idx = JSON.parse(idxRaw);
-    await env.POSTS.put('index', JSON.stringify(idx.filter((s) => s !== slug)));
-  }
-}
-
-// [2026-08-31] relay가 재시작되면(예: 메모리 부족 후 수동 재시작) renderJobs 맵이 메모리에만 있어서 그
-// 안의 진행 중이던 작업 정보가 전부 사라짐 — Worker가 예전 jobId로 계속 물어보면 relay는 "모르는 job"(404)이라고
-// 답하는데, 예전엔 이걸 그냥 무시하고 넘어가서(연결 안 됨) 타임아웃 체크도 안 타고 영원히 "확인 중"에 멈춰있었음.
-// 이제 post:슬러그에 남아있는 원본 재료(이미지/음성/자막 정보)로 렌더링을 새 jobId로 재제출함 — 최대 2번까지만
-// 자동 재시도하고, 그래도 안 되면 명확히 실패 처리(무한 루프 방지).
-async function resubmitLostRenderJob(job, keyInfoName, env) {
-  const slug = job.slug;
-  const resubmitCount = job.resubmitCount || 0;
-  if (resubmitCount >= 2) {
-    console.log(`[${keyInfoName}] relay가 job을 계속 잃어버림 — 2회 재제출해도 실패, 최종 실패 처리`);
-    await finalizeRenderFailed(job, keyInfoName, 'relay가 렌더링 작업 정보를 잃어버렸습니다(재시작 등) — 2회 자동 재제출도 실패했습니다. relay 상태를 확인해주세요.', env);
-    return;
-  }
-  const postRaw = await env.POSTS.get(`post:${slug}`);
-  if (!postRaw) { await env.POSTS.delete(keyInfoName).catch(() => {}); return; }
-  const post = JSON.parse(postRaw);
-  if (post.video) { await env.POSTS.delete(keyInfoName).catch(() => {}); return; } // 이미 완료돼 있으면(드문 경우) 그냥 정리
-  if (!post.images?.length) {
-    await finalizeRenderFailed(job, keyInfoName, 'relay가 job을 잃어버렸는데, 재제출에 필요한 원본 이미지 정보도 없습니다.', env);
-    return;
-  }
-  console.log(`[${keyInfoName}] relay가 job(${job.jobId})을 모름 — post 원본으로 렌더링 재제출 시도 (${resubmitCount + 1}/2)`);
-  const render = await startRelayRender(post.images, post.audio, post.audioSegments, job.r2Key, job.shortKeys, post.captionWeights, post.captionBeats, post.captionFontKey, post.captionColor, env, post.highlightSegRange);
-  if (render.ok) {
-    await env.POSTS.put(keyInfoName, JSON.stringify({ ...job, jobId: render.jobId, resubmitCount: resubmitCount + 1, startedAt: Date.now() }));
-    console.log(`[${keyInfoName}] 재제출 성공, 새 jobId: ${render.jobId}`);
-  } else {
-    await finalizeRenderFailed(job, keyInfoName, `relay job 재제출 실패: ${render.error}`, env);
-  }
-}
-
-async function pollPendingRenderJobs(env, ctx) {
-  const list = await env.POSTS.list({ prefix: 'renderJob:' });
-  if (!list.keys.length) {
-    console.log('대기 중인 릴레이 렌더링 작업 없음.');
-    return;
-  }
-  console.log(`대기 중인 릴레이 렌더링 작업 ${list.keys.length}건 확인.`);
-
-  for (const keyInfo of list.keys) {
-    const rawJob = await env.POSTS.get(keyInfo.name);
-    if (!rawJob) continue;
-    const job = JSON.parse(rawJob);
-
-    let res;
-    try {
-      res = await fetch(`${env.RELAY_URL}/render/status?jobId=${encodeURIComponent(job.jobId)}`, {
-        headers: { 'x-relay-secret': env.RELAY_SECRET },
-        signal: AbortSignal.timeout(10000),
-      });
-    } catch (e) {
-      console.log(`[${keyInfo.name}] 릴레이 상태 조회 네트워크 오류: ${e.message}`);
-      continue;
-    }
-    if (res.status === 404) {
-      // relay 재시작 등으로 job을 잃어버림 — 여기서 그냥 넘어가면 타임아웃 체크도 안 타고 영원히 멈춤
-      await resubmitLostRenderJob(job, keyInfo.name, env);
-      continue;
-    }
-    if (!res.ok) {
-      const bodyText = await res.text();
-      console.log(`[${keyInfo.name}] 릴레이 상태 조회 실패 HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
-      continue;
-    }
-
-    const data = await res.json();
-    const status = data?.status; // processing | done | failed
-    const isDone = status === 'done';
-    const isFailed = status === 'failed';
-
-    if (!isDone && !isFailed) {
-      if (Date.now() - job.startedAt > VIDEO_JOB_TIMEOUT_MS) {
-        console.log(`[${keyInfo.name}] 타임아웃, 정리함. 마지막 상태: ${JSON.stringify(data).slice(0, 300)}`);
-        await env.POSTS.delete(keyInfo.name);
-      } else {
-        console.log(`[${keyInfo.name}] 아직 진행 중 (상태: ${status || '알 수 없음'})`);
-      }
-      continue;
-    }
-
-    if (isFailed) {
-      await finalizeRenderFailed(job, keyInfo.name, data?.error || '알 수 없는 오류', env);
-      continue;
-    }
-
-    await finalizeRenderDone({ ...job, durationSec: data.durationSec }, keyInfo.name, env, ctx);
-  }
-}
-
-// [2026-08-31 07:05] 관리자 페이지(브라우저)가 안 열려있어도 생성이 진행되게 하는 크론 폴백 —
-// runGenerationStep(handleGenerateStep과 완전히 같은 함수)을 그대로 재사용해서 대기 중인 genJob마다
-// 딱 한 단계씩만 진행함. 실패 처리 규칙도 handleGenerateStep과 동일(에러 나면 job.failed=true로 표시해서
-// admin 페이지의 3분 정리 로직이 그대로 정리해줌 — 이 함수는 failed:true인 작업은 건드리지 않음).
-async function pollPendingGenJobs(env) {
-  const list = await env.POSTS.list({ prefix: 'genJob:' });
-  if (!list.keys.length) {
-    console.log('대기 중인 생성 작업 없음.');
-    return;
-  }
-  console.log(`대기 중인 생성 작업 ${list.keys.length}건 확인, 각각 한 단계씩 진행.`);
-
-  for (const keyInfo of list.keys) {
-    const raw = await env.POSTS.get(keyInfo.name);
-    if (!raw) continue;
-    let job = JSON.parse(raw);
-    if (job.failed) continue; // 이미 실패로 끝난 건 admin 페이지의 정리 타이머가 알아서 지움
-    // [2026-09-02 20:21] 동시실행 방지 — 방금 다른 경로(탭 폴링/relay tick)가 이 job을 잡았으면 건너뜀
-    if (job.lockedAt && Date.now() - job.lockedAt < GEN_JOB_LOCK_MS) continue;
-    await env.POSTS.put(keyInfo.name, JSON.stringify({ ...job, lockedAt: Date.now() })).catch(() => {});
-
-    try {
-      job = await runGenerationStep(job, env);
-      if (job.stage === 'done') {
-        await env.POSTS.delete(keyInfo.name);
-        console.log(`[${keyInfo.name}] 크론이 생성 완료시킴: ${job.slug}`);
-        continue;
-      }
-      job.startedAt = Date.now(); // 마지막 갱신 시각(admin 페이지의 "멈춤" 판정과 공유)
-      await env.POSTS.put(keyInfo.name, JSON.stringify(job));
-    } catch (e) {
-      await env.POSTS.put(keyInfo.name, JSON.stringify({ ...job, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() })).catch(() => {});
-      console.log(`[${keyInfo.name}] 크론 진행 중 실패: ${e.message}`);
-    }
-  }
-}
-
-async function pollPendingVideoJobs(env) {
-  const list = await env.POSTS.list({ prefix: 'videoJob:' });
-  if (!list.keys.length) {
-    console.log('대기 중인 영상 작업 없음.');
-    return;
-  }
-  console.log(`대기 중인 영상 작업 ${list.keys.length}건 확인.`);
-
-  for (const keyInfo of list.keys) {
-    const raw = await env.POSTS.get(keyInfo.name);
-    if (!raw) continue;
-    const job = JSON.parse(raw);
-
-    let res;
-    try {
-      res = await fetch(`${VEO_BASE_URL}/${job.operationName}`, { headers: { 'x-goog-api-key': env.GEMINI_API_KEY } });
-    } catch (e) {
-      console.log(`[${keyInfo.name}] 상태 조회 네트워크 오류: ${e.message}`);
-      continue;
-    }
-    if (!res.ok) {
-      const bodyText = await res.text();
-      console.log(`[${keyInfo.name}] 상태 조회 실패 HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
-      continue;
-    }
-
-    const data = await res.json();
-    if (!data.done) {
-      if (Date.now() - job.startedAt > VIDEO_JOB_TIMEOUT_MS) {
-        console.log(`[${keyInfo.name}] 타임아웃, 정리함.`);
-        await env.POSTS.delete(keyInfo.name);
-      }
-      continue;
-    }
-
-    if (data.error) {
-      console.log(`[${keyInfo.name}] Veo 오류: ${JSON.stringify(data.error).slice(0, 300)}`);
-      await env.POSTS.delete(keyInfo.name);
-      continue;
-    }
-
-    const videoUri =
-      data?.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ||
-      data?.response?.generatedVideos?.[0]?.video?.uri ||
-      data?.response?.videos?.[0]?.uri || null;
-    const videoBase64 =
-      data?.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.bytesBase64Encoded ||
-      data?.response?.generatedVideos?.[0]?.video?.videoBytes || null;
-
-    if (!videoUri && !videoBase64) {
-      console.log(`[${keyInfo.name}] 영상 위치 못 찾음.`);
-      await env.POSTS.delete(keyInfo.name);
-      continue;
-    }
-
-    let videoBuffer;
-    try {
-      videoBuffer = await fetchVeoVideoBytes(videoUri, videoBase64, env);
-    } catch (e) {
-      console.log(`[${keyInfo.name}] 다운로드 실패: ${e.message}`);
-      continue;
-    }
-
-    await env.MEDIA.put(job.r2Key, videoBuffer, { httpMetadata: { contentType: 'video/mp4' } });
-
-    const postRaw = await env.POSTS.get(`post:${job.slug}`);
-    if (postRaw) {
-      const post = JSON.parse(postRaw);
-      post.video = job.r2Key;
-      await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
-    }
-    await env.POSTS.delete(keyInfo.name);
-    console.log(`[${keyInfo.name}] 완료 및 저장: ${job.r2Key}`);
-  }
-}
-
-async function serveMedia(request, env, ctx, key) {
-  if (!env.MEDIA) return new Response('Media storage not configured', { status: 500 });
-  const cache = caches.default;
-  const cacheKey = new Request(request.url, request);
-  const cached = await cache.match(cacheKey);
-  if (cached) return cached;
-
-  const object = await env.MEDIA.get(key);
-  if (!object) return new Response('Not Found', { status: 404 });
-  const headers = new Headers();
-  object.writeHttpMetadata(headers);
-  headers.set('etag', object.httpEtag);
-  headers.set('Cache-Control', 'public, max-age=604800');
-  const response = new Response(object.body, { headers });
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
-  return response;
-}
-
-function escapeXml(str) {
-  return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
-}
-
-function arrayBufferToBase64(buffer) {
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
-// 문장을 N개 구간(이미지 개수)으로 나누되, 문장 "개수"가 아니라 "글자수"가 균등해지도록 배분 —
-// 이래야 각 이미지에 배정된 자막 분량이 실제 발화 시간과 비례해서, 나레이션 속도와 슬라이드 전환이 맞아떨어짐.
-// 문장 배열을 그대로 들고 있어야, 한 이미지에 문장이 여러 개 몰렸을 때 그걸 순서대로 갈아끼울 수 있음(자막 잘림 방지).
-// sentenceInfos: [{ text, segIndex }] — segIndex는 그 문장이 몇 번째 음성 세그먼트에서 합성됐는지.
-// 릴레이가 세그먼트별 실제 길이로 자막 타이밍을 정확히 맞출 때 이 매핑을 씀(비트에 그대로 실려감).
-function splitTextIntoNChunks(sentenceInfos, n) {
-  const sentences = Array.isArray(sentenceInfos) ? sentenceInfos : [];
-  if (n <= 0) return [];
-  if (!sentences.length) return Array.from({ length: n }, () => ({ sentences: [], weight: 1 / n }));
-
-  const totalChars = sentences.reduce((sum, s) => sum + s.text.length, 0) || 1;
-  const target = totalChars / n;
-  const chunks = [];
-  let current = [];
-  let currentLen = 0;
-  for (const sentence of sentences) {
-    current.push(sentence);
-    currentLen += sentence.text.length;
-    if (currentLen >= target && chunks.length < n - 1) {
-      chunks.push(current);
-      current = [];
-      currentLen = 0;
-    }
-  }
-  if (current.length) chunks.push(current);
-  while (chunks.length < n) chunks.push([]);
-  if (chunks.length > n) {
-    const overflow = chunks.splice(n - 1).flat();
-    chunks.push(overflow);
-  }
-
-  // [2026-08-31] 실제 버그였음: 위 while(빈 배열 채우기)이나 문장 분포가 치우치는 경우, 어떤 이미지는
-  // 문장이 0개로 남을 수 있었음 — relay.js의 computeSegmentBeatTimeline은 문장 0개인 이미지가 하나라도
-  // 있으면 "폴백 모드"(부정확한 무음구간 추정)로 빠지는데, 이게 자막 씽크 드리프트의 원인이었고, 숏츠는
-  // 폴백 모드에선 segmentCount가 없어서 아예 생성 자체가 스킵됐음(본편만 만들어지던 원인).
-  // → 빈 청크가 있으면 문장이 2개 이상인 이웃(가까운 순서)한테서 하나씩 빌려와 반드시 채움.
-  // 이미지 수(n)보다 문장 수가 항상 훨씬 많으므로(현재 나레이션 기준 100문장 이상 vs 이미지 20장)
-  // 이 보정으로 빈 이미지를 완전히 없앨 수 있음.
-  for (let i = 0; i < chunks.length; i++) {
-    if (chunks[i].length > 0) continue;
-    let donorIdx = -1;
-    for (let d = 1; d < chunks.length; d++) {
-      const left = i - d, right = i + d;
-      if (left >= 0 && chunks[left].length > 1) { donorIdx = left; break; }
-      if (right < chunks.length && chunks[right].length > 1) { donorIdx = right; break; }
-    }
-    if (donorIdx === -1) continue; // 문장이 극단적으로 적은 경우(거의 없음) — 그냥 빈 채로 둠, 폴백이 안전망
-    // 빌려주는 청크가 앞쪽이면 그 청크의 마지막 문장을(순서상 더 가까움), 뒤쪽이면 첫 문장을 넘겨줌
-    const donor = chunks[donorIdx];
-    chunks[i].push(donorIdx < i ? donor.pop() : donor.shift());
-  }
-
-  // 문장이 끝날 때마다 TTS가 짧게 쉬는 시간(정지)이 있는데, 글자수만 세면 이게 빠져서
-  // 문장이 여러 개 들어간 컷일수록 실제보다 더 짧게 잡히는 문제가 있었음.
-  // → 문장 하나당 "정지시간에 해당하는 글자수"를 가상으로 더해서 가중치를 보정.
-  const PAUSE_EQUIVALENT_CHARS = 6;
-  const rawWeights = chunks.map((sents) => {
-    const chars = sents.reduce((sum, s) => sum + s.text.length, 0);
-    const pauseChars = sents.length * PAUSE_EQUIVALENT_CHARS;
-    return Math.max(chars + pauseChars, PAUSE_EQUIVALENT_CHARS); // 빈 칸도 최소 노출시간은 보장
-  });
-  const sumWeights = rawWeights.reduce((a, b) => a + b, 0) || 1;
-  return chunks.map((sentences, i) => ({ sentences, weight: rawWeights[i] / sumWeights }));
-}
-
-// 세그먼트 목록(planAudioSegments 결과)을 "문장+세그먼트 번호" 평면 배열로 펼침 — 자막 배분/비트 생성 입력용.
-function buildSentenceInfos(segSentences) {
-  const infos = [];
-  (segSentences || []).forEach((sentences, segIndex) => {
-    (sentences || []).forEach((text) => infos.push({ text, segIndex }));
-  });
-  return infos;
-}
-
-// 한 이미지에 배정된 문장들을 "자막 비트"로 쪼갬 — 이번엔 문장 단위가 아니라 "줄" 단위로 쪼개서,
-// 화면엔 항상 한 줄만 보이고 그 줄이 순서대로 갈아끼워짐(긴 문장이 여러 줄 한꺼번에 뜨지 않음).
-// 각 줄의 노출시간은 글자수 비례, 문장이 끝나는 마지막 줄에만 정지시간(가상 글자수)을 더해줌.
-// positionIndex: 이 영상 전체에 고정으로 쓸 위치 하나(POSITION_STYLES 참고, renderSlideshow 안) — 예전엔 비트마다
-// 순환했는데 너무 산만하다는 피드백으로 위치/폰트/색 다 영상 하나당 하나로 고정.
-// [2026-08-30 21:55] 자막 비트 = 문장 하나 통째(내부 줄바꿈 포함) — 예전엔 문장을 줄 단위로 쪼개 순서대로
-// 갈아끼웠는데, 줄 전환 시각만은 문장 안에서 글자수 비례 "추정"이라 미세하게 어긋날 수 있었음.
-// 이제 문장 전체를 2~3줄로 줄바꿈해 그 문장의 실측 구간 내내 표시 → 화면의 모든 자막 전환이
-// 음성 조각의 측정된 시작 시각과 정확히 일치(추정 0). segIndex: 이 문장이 합성된 음성 조각 번호.
-// isSentenceEnd: 하위호환(옛 relay의 무음 감지 정렬용) — 문장 단위 비트라 항상 true.
-function buildCaptionBeats(sentences, positionIndex) {
-  if (!sentences.length) return [];
-  const PAUSE_EQUIVALENT_CHARS = 6;
-  const beats = [];
-  for (const s of sentences) {
-    const text = typeof s === 'string' ? s : s.text; // 문자열(옛 형식)과 {text, segIndex} 둘 다 수용
-    const segIndex = typeof s === 'string' ? null : s.segIndex;
-    const wrapped = wrapCaptionLines(text, 20, 5).join('\n'); // 문장 전체를 최대 5줄로 줄바꿈(20~45자 문장이면 보통 1~3줄)
-    const weight = Math.max(text.length + PAUSE_EQUIVALENT_CHARS, 4);
-    beats.push({ text: wrapped, weight, isSentenceEnd: true, segIndex });
-  }
-  const sumWeights = beats.reduce((a, b) => a + b.weight, 0) || 1;
-  return beats.map((b) => ({ text: b.text, weight: b.weight / sumWeights, styleIndex: positionIndex, isSentenceEnd: true, segIndex: b.segIndex }));
-}
-
-function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
-  const words = (text || '').split(/\s+/).filter(Boolean);
-  const lines = [];
-  let current = '';
-  for (const w of words) {
-    const candidate = current ? current + ' ' + w : w;
-    if (candidate.length > maxCharsPerLine && current) {
-      lines.push(current);
-      current = w;
-      if (lines.length >= maxLines - 1) break;
-    } else {
-      current = candidate;
-    }
-  }
-  if (current) lines.push(current);
-  return lines.slice(0, maxLines);
-}
-
-// 동시성 제한된 map — 한꺼번에 다 병렬로 쏘면 Pixabay 초당 요청 제한(429)에 바로 걸림
-async function mapWithConcurrency(items, limit, fn) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-  async function worker() {
-    while (nextIndex < items.length) {
-      const i = nextIndex++;
-      results[i] = await fn(items[i], i);
-    }
-  }
-  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
-  await Promise.all(workers);
-  return results;
-}
-
-async function generateAndSavePost(topic, env, onProgress) {
-  const genStartMs = Date.now(); // [2026-08-30 19:45] 생성 소요시간 측정(관리자 표시용)
-  const report = (stage, percent) => { if (onProgress) onProgress(stage, percent); };
-  if (!env.POSTS) return { ok: false, reason: 'POSTS(KV) 바인딩 없음' };
-
-  report('뉴스 검색 중', 5);
-  // 실제로 운영 중인 사이트(뉴스)가 있는지 최우선으로 검색 — 글 작성 근거이자 이미지 출처로도 재사용
-  const newsResults = await searchNaverNews(topic, env);
-  const usedNews = newsResults.length > 0;
-
-  report('글 작성 중', 15);
-  const { article, error: articleError, modelUsed } = await generateArticle(topic, newsResults, env);
-  if (!article) {
-    return { ok: false, reason: `글 생성 실패 — ${articleError || '알 수 없는 오류'}` };
-  }
-  console.log(`글 생성 성공 (모델: ${modelUsed})`);
-
-  const slug = String(Date.now());
-
-  // 내레이션 텍스트(음성+자막 공용) — 실제 음성으로 변환되는 길이(3000자)로 맞춤
-  // [2026-09-02 21:20] 문장을 5초 단위로 자연스럽게 재편집(reeditForTtsPacing)한 뒤 정규화/자름
-  const rawNarration = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ');
-  const pacedNarration = await reeditForTtsPacing(rawNarration, env);
-  const narrationText = trimNarrationToSentence(normalizeNarrationSpacing(pacedNarration), NARRATION_MAX_CHARS);
-
-  report('음성 생성 중', 30);
-  // 문장 몇 개씩 묶은 세그먼트 단위로 따로 합성 — 릴레이가 각 조각의 실제 길이를 재서 자막을 실측으로 맞춤.
-  // 이 경로(/api/generate)는 한 번의 호출로 전부 처리해야 해서, 요청 수를 아끼려고 스텝 방식(90자)보다
-  // 세그먼트를 크게(220자) 묶음 — 세그먼트 안 오차는 조금 커지지만 경계마다 실측이라 누적은 안 됨.
-  let audioKey = null;
-  let audioError = null;
-  let audioSegmentKeys = [];
-  let segSentencesList = [];
-  if (env.MEDIA) {
-    const segments = planAudioSegments(prepareNarrationSentences(narrationText), 110); // [2026-08-30 21:51] 220→110자: 이 경로는 한 호출로 전부 합성해야 해서 문장 2~3개 묶음까지만
-    const voices = pickTtsVoices(); // 목소리는 영상 전체에 하나로 고정(세그먼트마다 바뀌면 안 됨)
-    const buffers = [];
-    for (let i = 0; i < segments.length; i++) {
-      report(`음성 생성 중 (${i + 1}/${segments.length})`, 25 + Math.round(((i + 1) / segments.length) * 10)); // 25~35%
-      const { buffer, error } = await generateNarrationAudioWithRetry(segments[i].text, env, 2, voices);
-      if (!buffer) {
-        audioError = `음성 세그먼트 ${i + 1}/${segments.length} 합성 최종 실패 — ${error || '알 수 없는 오류'}`;
-        break;
-      }
-      buffers.push(buffer);
-    }
-    if (!audioError && buffers.length === segments.length) {
-      for (let i = 0; i < buffers.length; i++) {
-        const key = `${slug}-narr-${i}.mp3`;
-        await env.MEDIA.put(key, buffers[i], { httpMetadata: { contentType: 'audio/mpeg' } });
-        audioSegmentKeys.push(key);
-      }
-      audioKey = `${slug}-narration.mp3`;
-      await env.MEDIA.put(audioKey, concatAudioBuffers(buffers), { httpMetadata: { contentType: 'audio/mpeg' } });
-      segSentencesList = segments.map((s) => s.sentences);
-      console.log(`내레이션 음성 생성 완료 (세그먼트 ${segments.length}개)`);
-    } else {
-      // 부분적으로 올라간 세그먼트가 있다면 정리(아래 audioKey 없음 분기에서 발행 중단됨)
-      await Promise.all(audioSegmentKeys.map((k) => env.MEDIA.delete(k).catch(() => {})));
-      audioSegmentKeys = [];
-      console.log(`내레이션 음성 생성 실패: ${audioError}`);
-    }
-  }
-
-  report('이미지 준비 중', 40);
-  // 자막 위치/폰트/색은 이 영상 하나에 쓸 값을 미리 하나씩 고정 선택 — 비트마다 안 바뀌고 영상 전체 동일.
-  const { captionFontKey, captionColor, captionPositionIndex } = pickCaptionStyle();
-  let images = [];
-  let captionWeights = [];
-  let captionBeats = []; // 이미지별 자막 "비트" 배열 — 한 이미지에 문장 여러 개면 순서대로 갈아끼울 목록
-  if (env.MEDIA) {
-    // 이미지 소스는 저작권이 명확한 것만 사용: FLUX 우선 생성 → 실패시 Pixabay → Pexels
-    const scenes = await generateScenePrompts(topic, article.title, env);
-    // [2026-08-30 19:10] 이 경로는 병렬 수집이라 "못 찾으면 다음 장면에서 재시도" 같은 순차 슬롯이 안 됨 —
-    // 고정 슬롯(시작/중간/후반 장면)에서만 클립을 시도하고, 실패하면 그 장면은 사진으로 폴백.
-    const clipSlotSet = new Set([0, Math.floor(scenes.length / 3), Math.floor((scenes.length * 2) / 3)].slice(0, CLIP_TARGET));
-    let doneCount = 0;
-    const rawImages = (await mapWithConcurrency(scenes, 3, async (s, si) => {
-      let media = null;
-      let isClip = false;
-      if (clipSlotSet.has(si)) {
-        media = await getSceneClip(s, topic, env);
-        isClip = !!media;
-      }
-      if (!media) media = await getSceneImage(s, topic, env);
-      doneCount++;
-      report(`이미지 수집 중 (${doneCount}/${scenes.length})`, 40 + Math.round((doneCount / scenes.length) * 35)); // 40~75%
-      return media ? { buffer: media, isClip } : null;
-    })).filter(Boolean);
-    console.log(`장면 원본 미디어 ${rawImages.length}/${scenes.length}개 확보(클립 ${rawImages.filter((m) => m.isClip).length}개)`);
-
-    // 내레이션 텍스트를 확보된 이미지 개수만큼 나눠서 각 이미지에 배정 — 자막은 이미지에 직접 굽지 않고
-    // 웹/mp4 둘 다 "그 이미지가 떠 있는 동안 문장을 순서대로 갈아끼우는" 방식으로 오버레이함
-    // (한 이미지에 문장이 여러 개 몰려도 잘려나가지 않고 전부 노출됨). 문장마다 음성 세그먼트 번호를 실음.
-    const perImageChunks = splitTextIntoNChunks(buildSentenceInfos(segSentencesList), rawImages.length || 1);
-    for (let i = 0; i < rawImages.length; i++) {
-      const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (rawImages.length || 1) };
-      const key = `${slug}-scene-${i}.${rawImages[i].isClip ? 'mp4' : 'jpg'}`;
-      await env.MEDIA.put(key, rawImages[i].buffer, { httpMetadata: { contentType: rawImages[i].isClip ? 'video/mp4' : 'image/jpeg' } });
-      images.push(key);
-      captionWeights.push(chunk.weight);
-      const beats = buildCaptionBeats(chunk.sentences, captionPositionIndex);
-      captionBeats.push(beats);
-    }
-    console.log(`장면 이미지 ${images.length}개 저장 완료`);
-  }
-
-  // 음성이 끝내 실패했으면(재시도 다 소진) 무음 영상을 조용히 발행하는 대신 여기서 중단 —
-  // 이미 올려둔 장면 이미지는 정리하고 실패로 반환(글 자체를 안 만듦).
-  if (!audioKey) {
-    if (images.length && env.MEDIA) {
-      await Promise.all(images.map((k) => env.MEDIA.delete(k).catch(() => {})));
-    }
-    return { ok: false, reason: `음성 생성 최종 실패로 발행 중단 — ${audioError || '알 수 없는 오류'}` };
-  }
-
-  report('글 저장 중', 80);
-  // [2026-09-02 21:05] 쇼츠용 하이라이트 구간 — 실패해도 발행은 막지 않음
-  const highlightSegRange = await pickHighlightRange(segSentencesList.flat(), topic, env);
-  const post = {
-    slug, topic, title: article.title, createdAt: new Date().toISOString(),
-    intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
-    images, audio: audioKey, audioSegments: audioSegmentKeys, audioError, usedNews, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange,
-    generationSec: Math.round((Date.now() - genStartMs) / 1000), // [2026-08-30 19:45] 생성 소요시간(관리자 표시용)
-    threadsText: (article.threads_text || '').toString().slice(0, 450), // [2026-08-30 22:20] 스레드 공유용 홍보문
-  };
-  await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
-  const idxRaw = await env.POSTS.get('index');
-  const idx = idxRaw ? JSON.parse(idxRaw) : [];
-  idx.unshift(slug);
-  await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
-
-  report('영상 렌더링 등록 중', 90);
-  // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
-  if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && images.length) {
-    const outputKey = `${slug}.mp4`;
-    const shortKeys = [`${slug}-short.mp4`]; // [2026-08-31 07:29] 3개→1개: 유튜브 일일 업로드 할당량(10,000유닛, 건당 1,600) 절약 위해 축소(사용자 요청)
-    const render = await startRelayRender(images, audioKey, audioSegmentKeys, outputKey, shortKeys, captionWeights, captionBeats, captionFontKey, captionColor, env, highlightSegRange);
-    if (render.ok) {
-      await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
-        jobId: render.jobId, slug, r2Key: outputKey, shortKeys, imageKeys: images, startedAt: Date.now(),
+      const name = Array.isArray(found) ? found[1] : found.name;
+      console.log("조건식 확인: seq=" + CONDITION_SEQ + " name=" + name + " -> 실시간 등록 요청");
+      realtimeCache.condition.name = name || null;
+      ws.send(JSON.stringify({
+        trnm: "CNSRREQ",
+        seq: String(CONDITION_SEQ),
+        search_type: "1",
+        stex_tp: "K",
       }));
-      console.log(`릴레이 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
-    } else {
-      // 시작 자체가 실패한 경우 admin 화면에 이유가 보이게 post에도 남겨둠 (안 그러면 "—"로만 보여서 뭔지 알 수 없음)
-      post.videoError = render.error;
-      await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
-      console.log(`릴레이 렌더링 작업 시작 실패(글 발행은 계속 진행): ${render.error}`);
+      realtimeCache.condition.seq = CONDITION_SEQ;
+      return;
     }
-  } else if (!env.RELAY_URL || !env.RELAY_SECRET) {
-    post.videoError = 'RELAY_URL/RELAY_SECRET 미설정';
-    await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
-  }
 
-  report('완료', 100);
-  console.log(`발행 완료: ${slug}`);
-  return { ok: true, post };
-}
-
-function renderSlideshow(post) {
-  if (!post.images?.length) return '';
-  // 폰트/색은 이 영상에 고정으로 뽑아둔 값 사용(없는 옛날 글은 첫번째 폰트/흰색으로 자동 대체 — 마이그레이션 불필요)
-  const fixedFontChoice = CAPTION_FONT_CHOICES.find((f) => f.key === post.captionFontKey) || CAPTION_FONT_CHOICES[0];
-  const fixedFontCss = fixedFontChoice.css;
-  const fixedColorCss = post.captionColor || CAPTION_COLOR_CHOICES[0];
-  // [2026-08-30 19:10] mp4(실사 클립)는 video 태그로 — muted 자동재생/반복이라 사진과 똑같이 전환됨(.slide CSS 공용)
-  const slides = post.images.map((key, i) => key.endsWith('.mp4')
-    ? `<video class="slide${i === 0 ? ' active' : ''}" src="/media/${key}" muted loop playsinline autoplay></video>`
-    : `<img class="slide${i === 0 ? ' active' : ''}" src="/media/${key}" alt="장면 ${i + 1}">`).join('');
-  const hasAudio = !!post.audio;
-  const audioTag = hasAudio ? `<audio id="narration-${post.slug}" src="/media/${post.audio}" preload="auto"></audio>` : '';
-  // 자동재생 없음 — 항상 이 버튼을 눌러야 슬라이드쇼(+음성)가 시작됨
-  const playBtn = `<button class="playbtn" id="playbtn-${post.slug}">▶ 재생</button>`;
-  const captionBox = `<div class="caption-box" id="caption-${post.slug}"></div>`;
-  const weightsJson = JSON.stringify(Array.isArray(post.captionWeights) ? post.captionWeights : []);
-  // 이미지별 자막 "비트" — 그 이미지가 떠 있는 동안 순서대로 갈아끼울 문장 목록(문장이 여러 개 몰려도 안 잘림)
-  const beatsJson = JSON.stringify(Array.isArray(post.captionBeats) ? post.captionBeats : []);
-  const script = `<script>
-    (function(){
-      var root = document.getElementById('slideshow-${post.slug}');
-      var slides = root.querySelectorAll('.slide');
-      var captionEl = document.getElementById('caption-${post.slug}');
-      var weights = ${weightsJson};
-      var beatsPerSlide = ${beatsJson};
-      var isPlaying = false, rafId = null, startTimestamp = 0;
-      var DEFAULT_MS = 6000;
-      function show(i){ slides.forEach(function(s,idx){ s.classList.toggle('active', idx===i); }); }
-
-      // 위치/폰트/색 전부 영상 하나당 하나로 고정(서버가 미리 뽑아서 내려줌, 비트마다 안 바뀜) — 위치는
-      // captionBeats의 모든 styleIndex가 이미 같은 값으로 와서 자연히 고정됨. 폰트/색은 아래 FIXED_FONT/FIXED_COLOR로 고정.
-      // relay.js(mp4)에도 같은 위치표 + 고정 폰트/색 규칙이 있음(POSITION_STYLES 인덱스 규칙 일치, styleIndex 그대로 재사용).
-      // [2026-08-30 20:13] 자막 크기 2/3로 축소(사용자 요청, mp4쪽 CAPTION_POSITIONS와 같은 비율)
-      var POSITION_STYLES = [
-        { pos:'bottom', size:23 },
-        { pos:'top',    size:22 },
-        { pos:'bl',     size:29 },
-        { pos:'br',     size:27 },
-        { pos:'middle', size:28 }
-      ];
-      var FIXED_FONT = ${JSON.stringify(fixedFontCss)};
-      var FIXED_COLOR = ${JSON.stringify(fixedColorCss)};
-      function applyCaptionStyle(idx){
-        var st = POSITION_STYLES[idx % POSITION_STYLES.length];
-        captionEl.style.color = FIXED_COLOR;
-        captionEl.style.fontFamily = FIXED_FONT;
-        captionEl.style.fontSize = st.size + 'px';
-        captionEl.style.top = captionEl.style.bottom = captionEl.style.left = captionEl.style.right = 'auto';
-        captionEl.style.textAlign = 'center';
-        captionEl.style.transform = 'none';
-        if (st.pos === 'bottom') { captionEl.style.bottom = '80px'; captionEl.style.left = '24px'; captionEl.style.right = '24px'; }
-        else if (st.pos === 'top') { captionEl.style.top = '60px'; captionEl.style.left = '24px'; captionEl.style.right = '24px'; }
-        else if (st.pos === 'bl') { captionEl.style.bottom = '90px'; captionEl.style.left = '20px'; captionEl.style.right = '45%'; captionEl.style.textAlign = 'left'; }
-        else if (st.pos === 'br') { captionEl.style.bottom = '90px'; captionEl.style.right = '20px'; captionEl.style.left = '45%'; captionEl.style.textAlign = 'right'; }
-        else if (st.pos === 'middle') { captionEl.style.top = '42%'; captionEl.style.left = '24px'; captionEl.style.right = '24px'; }
+    // 조건검색 등록 응답 - 현재 조건을 만족하는 종목 목록이 한 번에 옴
+    if (msg.trnm === "CNSRREQ") {
+      if (msg.return_code !== 0) {
+        console.error("조건검색 등록 실패:", msg.return_code, msg.return_msg);
+        return;
       }
+      const codes = (msg.data || [])
+        .map((d) => String(d.jmcode || "").replace(/^A/, ""))
+        .filter(Boolean);
+      realtimeCache.condition.codes = codes;
+      realtimeCache.condition.lastEventAt = new Date().toISOString();
 
-      // 이미지별 노출시간(가중치 비율대로) — 웹/mp4 공통 로직과 동일
-      function durationsFor(totalMs){
-        if (weights.length === slides.length && slides.length) {
-          var sum = weights.reduce(function(a,b){ return a+b; }, 0) || 1;
-          return weights.map(function(w){ return Math.max(1500, (w/sum)*totalMs); });
-        }
-        return slides.length ? Array.from({length:slides.length}, function(){ return totalMs/slides.length; }) : [];
-      }
+      // 초기 목록도 이력에 넣어둠. 안 그러면 relay 재시작 직후 화면이 텅 비어 보임
+      // (이력은 편입 이벤트로만 쌓이는데, 재시작 시점엔 이미 조건에 들어와 있던 종목은 이벤트가 안 옴)
+      const nowIso = realtimeCache.condition.lastEventAt;
+      const nowHHMMSS = new Date(Date.now() + 9 * 3600 * 1000)
+        .toISOString()
+        .slice(11, 19)
+        .replace(/:/g, "");
+      realtimeCache.condition.history = codes.slice(0, 60).map((c) => ({
+        code: c,
+        time: nowHHMMSS,
+        at: nowIso,
+        initial: true, // 실시간 편입이 아니라 시작 시점 스냅샷임을 표시
+      }));
 
-      // 절대 시간표(schedule)를 한 번에 통째로 미리 계산 — "이 구간(start~end)엔 이 슬라이드의 이 자막"
-      // 형태로 전부 펼쳐두고, 재생 중엔 지금 시각(오디오 currentTime 또는 경과시간)이 어느 구간에 속하는지만
-      // 찾아서 반영함. setTimeout을 연쇄로 걸지 않아서 타이머 오차가 누적될 일이 없음(= 뒤로 갈수록 밀리는 문제 원천 차단).
-      var schedule = [];
-      var totalScheduleMs = 0;
-      function buildSchedule(totalMs){
-        var durations = durationsFor(totalMs);
-        var list = [];
-        var cursor = 0;
-        for (var i = 0; i < slides.length; i++) {
-          var slideStart = cursor;
-          var slideDur = durations[i] || 0;
-          var beats = beatsPerSlide[i];
-          if (beats && beats.length) {
-            var sum = beats.reduce(function(a,b){ return a + (b.weight || 1); }, 0) || 1;
-            var t = slideStart;
-            for (var j = 0; j < beats.length; j++) {
-              var d = Math.max(800, (beats[j].weight / sum) * slideDur);
-              list.push({ start: t, end: t + d, slideIdx: i, text: beats[j].text || '', styleIndex: beats[j].styleIndex || 0 });
-              t += d;
-            }
-          } else {
-            list.push({ start: slideStart, end: slideStart + slideDur, slideIdx: i, text: '' });
-          }
-          cursor = slideStart + slideDur;
-        }
-        totalScheduleMs = cursor;
-        return list;
-      }
-      schedule = buildSchedule(DEFAULT_MS * slides.length);
+      queueNameFetch(codes.slice(0, 40)); // 초기 목록도 이름을 미리 받아둠(초당1건이라 상위 일부만)
+      console.log("조건검색 초기 종목:", codes.length + "종목 (seq=" + msg.seq + ")");
+      return;
+    }
 
-      var cursorIdx = 0, lastSlideIdx = -1, lastText = null;
-      function resetCursor(){ cursorIdx = 0; lastSlideIdx = -1; lastText = null; }
+    // 예상 못한 응답만 로그로 남김. REG/REMOVE 정상응답(0)은 너무 잦아서 제외하되,
+    // 실패는 반드시 남겨서 200 초과 같은 문제를 놓치지 않게 함.
+    if (msg.trnm && msg.trnm !== "REAL") {
+      const isRoutineOk = (msg.trnm === "REG" || msg.trnm === "REMOVE") && msg.return_code === 0;
+      if (!isRoutineOk) console.log("미처리 메시지:", JSON.stringify(msg).slice(0, 300));
+    }
+  });
 
-      var btn = document.getElementById('playbtn-${post.slug}');
-      ${hasAudio ? "var audio = document.getElementById('narration-" + post.slug + "');" : ''}
+  ws.on("error", (e) => {
+    console.error("웹소켓 에러:", e.message);
+  });
 
-      function tick(){
-        if (!isPlaying) return;
-        var elapsedMs = ${hasAudio ? 'audio.currentTime * 1000' : '(Date.now() - startTimestamp)'};
-        while (cursorIdx < schedule.length - 1 && elapsedMs >= schedule[cursorIdx].end) cursorIdx++;
-        var seg = schedule[cursorIdx];
-        if (seg) {
-          if (seg.slideIdx !== lastSlideIdx) { show(seg.slideIdx); lastSlideIdx = seg.slideIdx; }
-          if (seg.text !== lastText) {
-            captionEl.textContent = seg.text;
-            lastText = seg.text;
-            applyCaptionStyle(typeof seg.styleIndex === 'number' ? seg.styleIndex : 0);
-          }
-        }
-        ${hasAudio ? '' : `
-        if (elapsedMs >= totalScheduleMs) { pause(); resetCursor(); show(0); captionEl.textContent=''; return; }
-        `}
-        rafId = requestAnimationFrame(tick);
-      }
-
-      function play(){
-        isPlaying = true;
-        btn.textContent = '⏸ 정지';
-        startTimestamp = Date.now();
-        ${hasAudio ? 'audio.play();' : ''}
-        rafId = requestAnimationFrame(tick);
-      }
-      function pause(){
-        isPlaying = false;
-        btn.textContent = '▶ 재생';
-        if (rafId) cancelAnimationFrame(rafId);
-        ${hasAudio ? 'audio.pause();' : ''}
-      }
-      btn.addEventListener('click', function(){
-        if (isPlaying) pause(); else play();
-      });
-      ${hasAudio ? `
-      audio.addEventListener('loadedmetadata', function(){
-        // 실제 음성 길이를 알면 그 길이 기준으로 전체 시간표를 다시 계산(나레이션과 싱크)
-        schedule = buildSchedule(Math.max(4000 * slides.length, audio.duration * 1000));
-        resetCursor();
-      });
-      audio.addEventListener('ended', function(){
-        resetCursor(); show(0); captionEl.textContent = '';
-        pause();
-      });
-      ` : ''}
-    })();
-  </script>`;
-  return `<div class="slideshow" id="slideshow-${post.slug}">${slides}${captionBox}${playBtn}</div>${audioTag}${script}`;
-}
-
-async function renderHomePage(env) {
-  const idxRaw = await env.POSTS.get('index');
-  const idx = idxRaw ? JSON.parse(idxRaw) : [];
-  const posts = [];
-  for (const slug of idx.slice(0, 30)) {
-    const raw = await env.POSTS.get(`post:${slug}`);
-    if (raw) posts.push(JSON.parse(raw));
-  }
-
-  const entries = posts.map((p) => {
-    const excerpt = makeExcerpt(p.intro);
-    const dateStr = new Date(p.createdAt).toLocaleDateString('ko-KR', { month: 'long', day: 'numeric', timeZone: 'Asia/Seoul' });
-    const thumb = p.images?.[0] ? `<div class="entry-thumb"><img src="/media/${p.images[0]}" alt="${escapeHtml(p.title)}"></div>` : '';
-    return `<a class="entry" href="/${p.slug}">
-      <div class="entry-main">
-        <div class="entry-eyebrow">[ ${escapeHtml(p.topic)} ]</div>
-        <h2 class="entry-title">${escapeHtml(p.title)}</h2>
-        ${excerpt ? `<p class="entry-excerpt">${escapeHtml(excerpt)}</p>` : ''}
-        <div class="entry-meta">${dateStr}${p.audio ? ' · 🔊 내레이션 포함' : ''}</div>
-      </div>
-      ${thumb}
-    </a>`;
-  }).join('');
-
-  const body = `${siteHeader()}
-    <div class="hero"><div class="wrap">
-      <span class="eyebrow">Life & News</span>
-      <h1>생활 속 이야기를 글과 슬라이드쇼로</h1>
-      <p class="sub">주제 하나를 던지면 AI가 글을 쓰고, 장면 이미지와 내레이션 음성까지 함께 만듭니다.</p>
-    </div></div>
-    <div class="wrap"><div class="index">${entries || '<p style="color:var(--muted)">아직 글이 없습니다.</p>'}</div></div>
-    <footer><div class="wrap">life.news — 이 사이트의 글과 이미지/음성은 AI가 자동 생성한 참고용 콘텐츠입니다.</div></footer>`;
-
-  return new Response(page('life.news - 생활뉴스', body), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-}
-
-async function renderPostPage(env, slug) {
-  const raw = await env.POSTS.get(`post:${slug}`);
-  if (!raw) return new Response('Not Found', { status: 404 });
-  const p = JSON.parse(raw);
-
-  const sectionsHtml = (p.sections || []).map((s) => `<h2>${escapeHtml(s.heading)}</h2>${s.body_html}`).join('');
-  // mp4가 완성된 글은 SVG/mp3가 이미 삭제된 상태라 슬라이드쇼를 그리면 깨진 이미지만 남음 — 영상 하나만 보여줌
-  const slideshow = p.video ? '' : renderSlideshow(p);
-  // 유튜브는 렌더링 완료 직후 자동 업로드됨(백그라운드) — 성공하면 링크, 실패하면 사유, 아직이면 업로드 중/진행률 표시.
-  // needsYoutubePoll: 아직 결과(링크도 실패도)가 없다는 뜻 — 이 페이지를 계속 보고 있어도 업로드가 끝나는 걸
-  // 알 방법이 없었던 게 문제였음("업로드 대기 중"에서 새로고침 전까진 영원히 안 바뀜) → 아래 스크립트로 폴링해서 자동 갱신.
-  const needsYoutubePoll = p.video && !p.youtubeUrl && !p.youtubeError;
-  // [2026-08-30 22:20] 스레드 공유 링크 — 홍보문+글 링크가 미리 채워진 스레드 작성창을 엶
-  const threadsShareHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(buildThreadsCaption(p))}`; // [2026-08-30 23:31] 예쁜 형식 공용 빌더 사용
-  // [2026-08-31] 스레드 웹 공유창은 이미지 자동 첨부가 안 돼서(메타 앱 심사 필요) 대표 이미지 다운로드 링크를 따로 둠
-  const threadsImageDlHref = p.images?.[0] ? `/media/${escapeHtml(p.images[0])}` : null;
-  const youtubeStatusText = p.youtubeUrl
-    ? `· <a href="${escapeHtml(p.youtubeUrl)}" target="_blank" rel="noopener">▶ 유튜브에서 보기</a>${(p.youtubeShortsUrls && p.youtubeShortsUrls.length) ? p.youtubeShortsUrls.map((u, si) => u ? ` · <a href="${escapeHtml(u)}" target="_blank" rel="noopener">🩳${si + 1}</a>` : ` · ⚠️ 숏츠${si + 1}실패`).join('') : p.youtubeShortsUrl ? ` · <a href="${escapeHtml(p.youtubeShortsUrl)}" target="_blank" rel="noopener">🩳 숏츠</a>` : ''} · <a href="${escapeHtml(threadsShareHref)}" target="_blank" rel="noopener">🧵 스레드 공유</a>${threadsImageDlHref ? ` · <a href="${threadsImageDlHref}" download>⬇️ 스레드이미지</a>` : ''}`
-    : p.youtubeQuotaExceeded
-      ? `· ⏳ ${escapeHtml((p.youtubeError || '').slice(0, 200))}` // [2026-08-31] 할당량 초과 — 자동 재시도 예정이라는 게 명확히 보이게(⚠️ 대신 ⏳)
-      : p.youtubeError
-        ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 200))})`
-        : `· 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}`;
-  const veoVideoBlock = p.video
-    ? `<div style="margin:20px 0;">
-        <video controls preload="metadata" style="width:100%;border-radius:10px;background:#000;" src="/media/${p.video}"></video>
-        <p class="mono" style="font-size:12px;color:var(--muted);margin-top:8px;">🎬 실제 영상 파일(mp4) <span id="yt-status" data-slug="${p.slug}">${youtubeStatusText}</span></p>
-      </div>`
-    : '';
-  // 관리자 페이지의 pollRender()와 같은 원리의 초경량 폴링 — 결과가 나올 때까지(또는 진행이 멈춰서 포기할 때까지)만 돎.
-  const youtubePollScript = needsYoutubePoll ? `<script>
-    (function(){
-      var el = document.getElementById('yt-status');
-      if (!el) return;
-      var slug = el.dataset.slug;
-      var lastPct = -1, stallTries = 0, timer = null;
-      function poll(){
-        fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
-          .then(function(r){ return r.json(); })
-          .then(function(data){
-            if (data.youtubeUrl) {
-              el.textContent = '· ';
-              var a = document.createElement('a'); a.href = data.youtubeUrl; a.target = '_blank'; a.rel = 'noopener'; a.textContent = '▶ 유튜브에서 보기';
-              el.appendChild(a);
-              if (timer) clearInterval(timer);
-              return;
-            }
-            if (data.youtubeError) {
-              // [2026-08-31] 할당량 초과면 ⏳(재시도 예정), 그 외 실패면 ⚠️로 구분 — 헷갈리지 않게
-              el.textContent = '· ' + (data.youtubeQuotaExceeded ? '⏳ ' : '⚠️ 유튜브 업로드 실패(') + String(data.youtubeError).slice(0, 200) + (data.youtubeQuotaExceeded ? '' : ')');
-              if (timer) clearInterval(timer);
-              return;
-            }
-            var pct = (typeof data.youtubeUploadPercent === 'number') ? data.youtubeUploadPercent : null;
-            el.textContent = '· 유튜브 업로드 중' + (pct !== null ? ' ' + pct + '%' : '…');
-            var stalled = (pct !== null && pct === lastPct);
-            if (pct !== null) lastPct = pct;
-            stallTries = stalled ? stallTries + 1 : 0;
-            if (stallTries >= 20) { // 진행률이 약 1분간 그대로면 포기하고 새로고침 안내(업로드 자체는 서버에서 계속 진행됨)
-              el.textContent = '· 유튜브 업로드 확인은 새로고침 후 봐주세요';
-              if (timer) clearInterval(timer);
-            }
-          })
-          .catch(function(){});
-      }
-      poll();
-      timer = setInterval(poll, 3000);
-    })();
-  </script>` : '';
-
-  const body = `${siteHeader()}
-    <div class="wrap post-body">
-      <h1>${escapeHtml(p.title)}</h1>
-      <div class="meta">${escapeHtml(p.topic)} · ${new Date(p.createdAt).toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul' })} · 제로지${p.videoDurationSec ? ` · ${fmtDurSec(p.videoDurationSec)}` : ''}</div>
-      ${veoVideoBlock}
-      ${slideshow}
-      ${p.intro}
-      ${sectionsHtml}
-      ${p.outro}
-      <div style="display:flex;gap:12px;align-items:flex-start;background:#FFFBEB;border:1.5px solid var(--amber);border-radius:10px;padding:16px 18px;margin:32px 0 0;">
-        <span style="font-size:20px;line-height:1;">⚠️</span>
-        <p style="margin:0;font-size:14px;line-height:1.6;color:#7C2D12;">이 글과 이미지/음성은 AI가 자동 생성한 참고용 콘텐츠이며, 실제 사실과 다를 수 있습니다.${p.usedNews ? ' 실제 뉴스 검색 결과를 참고해 작성했지만, 원문과 대조 확인을 권장합니다.' : ' 실시간 뉴스 검색 없이 작성된 내용이니 최신성이 중요한 정보는 별도로 확인해주세요.'}</p>
-      </div>
-    </div>
-    <footer><div class="wrap">life.news</div></footer>${youtubePollScript}`;
-
-  return new Response(page(`${p.title} - life.news`, body, { description: makeExcerpt(p.intro, 150) }), {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+  ws.on("close", () => {
+    wsConnected = false;
+    wsLoggedIn = false;
+    console.log("웹소켓 연결 종료 - 재연결 예약");
+    scheduleReconnect();
   });
 }
 
-async function renderAdminPage(env, requestUrl) {
-  const idxRaw = await env.POSTS.get('index');
-  const idx = idxRaw ? JSON.parse(idxRaw) : [];
-  const posts = [];
-  for (const slug of idx.slice(0, 50)) {
-    const raw = await env.POSTS.get(`post:${slug}`);
-    if (raw) posts.push(JSON.parse(raw));
-  }
-  const pendingVideoJobs = await env.POSTS.list({ prefix: 'videoJob:' });
-  const pendingVeoSlugs = new Set(pendingVideoJobs.keys.map((k) => k.name.split(':')[1]));
-  const pendingRenderJobs = await env.POSTS.list({ prefix: 'renderJob:' });
-  const pendingRenderSlugs = new Set(pendingRenderJobs.keys.map((k) => k.name.split(':')[1]));
-  // [2026-08-31] 유튜브 할당량 대기열 — 슬러그별 순번(1부터)을 미리 맵으로 만들어둠(목록 렌더링 중 매번 KV 조회하지 않도록)
-  const ytQueue = await getYoutubeQueue(env);
-  const ytQueuePos = new Map(ytQueue.items.map((it, i) => [it.slug, i + 1]));
+function scheduleReconnect() {
+  setTimeout(connectWebSocket, wsReconnectDelay);
+  wsReconnectDelay = Math.min(wsReconnectDelay * 2, 60000); // 지수 백오프 (최대 60초)
+}
 
-  // 생성 중인(글+이미지+음성 아직 안 끝난) 작업들 — 완료되면 post로 바뀌면서 이 목록에서 빠짐
-  const pendingGenJobsRaw = await env.POSTS.list({ prefix: 'genJob:' });
-  const STALE_MS = 3 * 60 * 1000; // 3분 넘게 갱신 없으면 "멈춤" 경고 표시
-  const CLEANUP_MS = 10 * 60 * 1000; // 10분 넘게 멈춰있으면 자동으로 지워서 목록에서 치움
-  const FAILED_CLEANUP_MS = 3 * 60 * 1000; // 실패는 3분 정도 보여주고 나서 정리 (읽을 시간은 주되 계속 쌓이지 않게)
-  const genJobs = [];
-  const seenGenIds = new Set();
-  for (const k of pendingGenJobsRaw.keys) {
-    const raw = await env.POSTS.get(k.name);
-    if (!raw) continue;
-    const job = JSON.parse(raw);
-    const cleanupThreshold = job.failed ? FAILED_CLEANUP_MS : CLEANUP_MS;
-    const isVeryStale = Date.now() - (job.startedAt || 0) > cleanupThreshold;
-    if (isVeryStale) {
-      await env.POSTS.delete(k.name).catch(() => {}); // 죽은/실패한 작업 자동 정리 — 화면엔 아예 안 보여줌
-      continue;
+// 좀비 연결 감지: 소켓은 열려있는데 데이터가 한참 안 오면 강제로 끊고 재연결
+// (키움 웹소켓은 장중 계속 푸시가 오므로, 3분 침묵은 비정상)
+setInterval(() => {
+  if (!wsConnected || !wsLastMessageAt) return;
+  if (Date.now() - wsLastMessageAt > 3 * 60 * 1000) {
+    console.log("웹소켓 3분간 무응답 - 강제 재연결");
+    try {
+      ws.terminate();
+    } catch (e) {}
+  }
+}, 60000);
+
+connectWebSocket();
+
+// ---------- 관심종목 손절/익절 자동체크 (10초 주기) ----------
+// Worker의 2분 cron(checkWatchlistRiskLevels)보다 훨씬 빠르게 -1.5%/+1.5% 트리거.
+// relay는 이미 웹소켓으로 실시간가를 들고 있으므로 키움 TR 호출 없이 즉시 계산 가능.
+const AUTO_REMOVE_PNL_PCT = -1.5; // 손절
+const AUTO_TAKE_PROFIT_PNL_PCT = 3.5; // 익절
+
+// 15:50 이후 자동매매(익절/손절) 중지 - Worker도 동일 기준으로 403 처리하지만
+// relay 쪽에서 먼저 걸러서 불필요한 요청/로그 방지.
+function isTradingActiveKST() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const day = kst.getDay();
+  if (day === 0 || day === 6) return false;
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  return minutes >= 9 * 60 + 1 && minutes < 15 * 60 + 50;
+}
+function workerRequest(path, method, body) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(WORKER_URL + path);
+    const data = body ? JSON.stringify(body) : null;
+    const req = https.request(
+      {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method,
+        agent: workerAgent,
+        headers: Object.assign(
+          { "X-Admin-Key": ADMIN_KEY },
+          data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {}
+        ),
+        timeout: 8000,
+      },
+      (res) => {
+        let chunks = "";
+        res.on("data", (c) => (chunks += c));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(chunks));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+// entries(코드+진입가) 자체는 자주 안 바뀌므로 5초 TTL로 캐싱 -> 2초 틱마다 Worker를
+// 두드리지 않고, 실시간가 비교(로컬 연산)만 매 틱 수행. 관심종목 추가/삭제는 몇 초 지연되어
+// 반영되지만 손익 판단 정확도에는 영향 없음(가격은 항상 최신 realtimeCache 사용).
+let entriesCache = { items: [], fetchedAt: 0 };
+const ENTRIES_TTL_MS = 5000;
+let entriesCacheHits = 0;
+let entriesCacheMisses = 0;
+async function getWatchlistEntriesCached() {
+  if (Date.now() - entriesCache.fetchedAt < ENTRIES_TTL_MS) {
+    entriesCacheHits++;
+    return entriesCache.items;
+  }
+  entriesCacheMisses++;
+  const entries = await workerRequest("/api/watchlist-entries", "GET");
+  if (entries.ok) {
+    entriesCache = { items: entries.items, fetchedAt: Date.now() };
+  }
+  return entriesCache.items;
+}
+// 10분마다 캐시 히트율 로그 - watchlist-entries 실제 호출 빈도 확인용
+setInterval(() => {
+  const total = entriesCacheHits + entriesCacheMisses;
+  if (total === 0) return;
+  console.log(`entries 캐시 통계(10분): 히트 ${entriesCacheHits} / 미스(실제호출) ${entriesCacheMisses} / 히트율 ${((entriesCacheHits / total) * 100).toFixed(1)}%`);
+  entriesCacheHits = 0;
+  entriesCacheMisses = 0;
+}, 600000);
+
+// ---------- 관심종목 미니차트(1분봉) 백그라운드 캐시 ----------
+// 원래 Worker가 화면 로드 때마다 종목당 1.1초씩 순차조회(ka10080)했던 게 관심종목 수만큼
+// 누적되어 체감 로딩이 느렸음(10종목이면 11초+). relay가 백그라운드에서 미리 갱신해두고
+// Worker는 그 캐시를 즉시 반환하게 바꿔 - 화면에서는 사실상 즉시(0.1초 이내) 뜨게 됨.
+// 파일로도 영속화해서 relay 재시작(배포 등)에도 캐시가 날아가지 않게 함 - 장마감 후에도
+// 마지막 장중 데이터를 그대로 즉시 서빙 가능(어차피 그 시점 이후로 안 바뀌는 데이터라 유효함).
+const miniCandleCache = {}; // { code: { candles: [...], tradingDate, updatedAt } }
+const MINI_CANDLE_CACHE_PATH = path.join(__dirname, "mini-candle-cache.json");
+function saveMiniCandleCache() {
+  try {
+    fs.writeFileSync(MINI_CANDLE_CACHE_PATH, JSON.stringify(miniCandleCache));
+  } catch (e) {
+    console.log("미니차트 캐시 저장 실패: " + e.message);
+  }
+}
+function loadMiniCandleCache() {
+  try {
+    if (!fs.existsSync(MINI_CANDLE_CACHE_PATH)) return;
+    const raw = JSON.parse(fs.readFileSync(MINI_CANDLE_CACHE_PATH, "utf8"));
+    Object.assign(miniCandleCache, raw);
+    console.log(`미니차트 캐시 복구: 종목 ${Object.keys(raw).length}개`);
+  } catch (e) {
+    console.log("미니차트 캐시 복구 실패: " + e.message);
+  }
+}
+loadMiniCandleCache();
+setInterval(saveMiniCandleCache, 60000); // 갱신 주기와 맞춰 1분마다 저장
+
+function todayYYYYMMDDRelay() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const y = kst.getFullYear();
+  const m = String(kst.getMonth() + 1).padStart(2, "0");
+  const d = String(kst.getDate()).padStart(2, "0");
+  return `${y}${m}${d}`;
+}
+function parseKiwoomChartOHLCRelay(json) {
+  let rows = [];
+  for (const key of Object.keys(json)) {
+    if (Array.isArray(json[key])) {
+      rows = json[key];
+      break;
     }
-    genJobs.push({ id: k.name.split(':')[1], ...job });
-    seenGenIds.add(k.name.split(':')[1]);
   }
-
-  // 방금 생성 버튼을 눌러 리다이렉트돼온 경우 — KV list()의 전세계 전파 지연으로 위 목록에 아직 안 잡혔을 수 있어서,
-  // URL에 실어온 genId를 exact get으로 직접 확인해서 놓치지 않고 화면에 끼워넣음
-  const freshGenId = requestUrl?.searchParams?.get('genId');
-  if (freshGenId && !seenGenIds.has(freshGenId)) {
-    const freshRaw = await env.POSTS.get(`genJob:${freshGenId}`);
-    if (freshRaw) genJobs.unshift({ id: freshGenId, ...JSON.parse(freshRaw) });
-  }
-
-  // [2026-08-30 19:52] 최근 렌더링 실패 기록(3일 보관) — 이유를 그대로 보여줌. 글이 삭제된 실패는 여기서만 보임.
-  const renderFailsRaw = await env.POSTS.list({ prefix: 'renderFail:' });
-  const renderFails = [];
-  for (const k of renderFailsRaw.keys.slice(0, 5)) {
-    const raw = await env.POSTS.get(k.name);
-    if (raw) renderFails.push(JSON.parse(raw));
-  }
-  renderFails.sort((a, b) => new Date(b.at) - new Date(a.at));
-  const renderFailCards = renderFails.map((f) => `<div class="admin-card is-failed" style="grid-column:1/-1;display:block;">
-    <div class="body">
-      <div class="status-line" style="color:#92400E;">🎬❌ 렌더링 실패(${new Date(f.at).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}) — ${escapeHtml(f.title || f.slug)}${f.postDeleted ? ' · 글 자동삭제됨(오디오 검증)' : ''}<br>
-      사유: ${escapeHtml(f.error || '기록 없음')}</div>
-      <div class="actions"><form method="POST" action="/admin/dismiss-fail"><input type="hidden" name="slug" value="${escapeHtml(f.slug)}"><button type="submit">확인(지우기)</button></form></div>
-    </div>
-  </div>`).join('');
-
-  // [2026-09-02 20:30] 전체진행률(0~100)을 하나의 바로 계산 — 글쓰기/음성/이미지(0~50%) → mp4 렌더링(50~80%) →
-  // 유튜브 업로드(80~100%) 세 단계를 이어붙여서 보여줌. 서버 렌더링 시점의 초기값이고, 이후엔 클라이언트
-  // 폴링(pollRender/stepGen)이 실측값으로 계속 갱신함.
-  function genOverallPercent(genPercent) { return Math.round((genPercent || 0) * 0.5); }
-
-  const genJobCards = genJobs.map((j) => {
-    const isStale = !j.failed && (Date.now() - (j.startedAt || 0) > STALE_MS);
-    const label = j.failed
-      ? `❌ 생성 실패 — ${escapeHtml(truncErrText(j.error))}`
-      : isStale
-        ? `⚠️ 응답 없음(멈춤) — 마지막 상태: ${escapeHtml(j.stage || '')} ${j.percent || 0}% (10분 지나면 자동 정리)`
-        : `📝 ${escapeHtml(j.stage || '진행 중')} · ${j.percent || 0}%`;
-    const cancelBtn = j.failed ? '' : `<form method="POST" action="/admin/cancel-gen" onsubmit="return confirm('생성 취소할까요? 지금까지 만든 이미지·음성이 삭제됩니다.');"><input type="hidden" name="id" value="${j.id}"><button type="submit">🛑 취소</button></form>`;
-    const thumb = j.images?.[0]
-      ? `<img src="/media/${escapeHtml(j.images[0])}" alt="">`
-      : `<div class="placeholder">📝</div>`;
-    return `<div class="admin-card ${j.failed ? 'is-failed' : 'is-pending'}">
-    <div class="thumb">${thumb}</div>
-    <div class="body">
-      <div class="title">${escapeHtml(j.topic)}</div>
-      <span class="gen-progress status-line" data-id="${j.id}" data-stale="${isStale ? '1' : '0'}">${label}</span>
-      ${j.failed ? '' : `<div class="progress-track"><div class="progress-fill" style="width:${genOverallPercent(j.percent)}%"></div></div>`}
-      <div class="actions">${cancelBtn}</div>
-    </div>
-  </div>`;
-  }).join('');
-
-  const postCards = posts.map((p) => {
-    const truncErr = (msg) => { const s = String(msg || ''); return s.length <= 260 ? s : s.slice(0, 100) + ' … ' + s.slice(-150); };
-    const clipN = (p.images || []).filter((k) => k.endsWith('.mp4')).length;
-    const photoN = (p.images || []).length - clipN;
-    const mediaLabel = p.images?.length ? (clipN ? `🎞️ ${clipN}·🖼️ ${photoN}장` : `🖼️ ${photoN}장`) : '이미지 없음';
-    const mediaStatus = p.video
-      ? `✅ mp4로 통합됨${p.usedNews ? ' · 📰 뉴스참고' : ''}`
-      : `${mediaLabel}${p.audio ? ' · 🔊 음성' : p.audioError ? ` · ⚠️ 음성실패` : ' · 🔇 음성없음'}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
-    const isRendering = pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug);
-    const needsYoutubePoll = p.video && !p.youtubeUrl && !p.youtubeError;
-    const shortsCountNum = (p.videoShorts && p.videoShorts.length) ? p.videoShorts.length : (p.videoShort ? 1 : 0);
-
-    let statusLine, progressPct, isFailedCard, isPendingCard;
-    if (p.video) {
-      if (needsYoutubePoll) {
-        statusLine = `<span class="render-progress" data-slug="${p.slug}">🎬 mp4 완료 · 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}</span>`;
-        progressPct = 80 + Math.round((p.youtubeUploadPercent || 0) * 0.2);
-        isPendingCard = true;
-      } else {
-        const shareCaption = buildThreadsCaption(p);
-        const threadsHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(shareCaption)}`;
-        const qPos = ytQueuePos.get(p.slug);
-        const mainLine = p.youtubeUrl
-          ? `<a href="${escapeHtml(p.youtubeUrl)}" target="_blank">▶ 본편</a>${p.youtubeUploadSec ? ` (${fmtDurSec(p.youtubeUploadSec)})` : ''}`
-          : p.youtubeQuotaExceeded
-            ? `⏳ 본편(할당량 초과·대기열 ${qPos || '?'}번째)`
-            : `❌ 본편 실패(${escapeHtml((p.youtubeError || '').slice(0, 100))})`;
-        const shortsUrls = p.youtubeShortsUrls && p.youtubeShortsUrls.length ? p.youtubeShortsUrls : (p.youtubeShortsUrl ? [p.youtubeShortsUrl] : []);
-        const shortsErrors = p.youtubeShortsErrors && p.youtubeShortsErrors.length ? p.youtubeShortsErrors : (p.youtubeShortsError ? [p.youtubeShortsError] : []);
-        const shortsCount = Math.max(shortsUrls.length, shortsErrors.length);
-        let shortsLine = '';
-        if (p.youtubeShortsSkippedReason) {
-          shortsLine = ` · ⏳ 숏츠`;
-        } else if (shortsCount) {
-          shortsLine = Array.from({ length: shortsCount }, (_, si) => {
-            if (shortsUrls[si]) return ` · <a href="${escapeHtml(shortsUrls[si])}" target="_blank">🩳${si + 1}</a>`;
-            const errText = shortsErrors[si] || '';
-            return errText.includes('할당량') ? ` · ⏳ 숏츠${si + 1}` : ` · ❌ 숏츠${si + 1}실패`;
-          }).join('');
-        }
-        const shareBits = [
-          `<a href="${escapeHtml(threadsHref)}" target="_blank">🧵</a>`,
-          p.images?.[0] ? `<a href="/media/${escapeHtml(p.images[0])}" download>⬇️이미지</a>` : '',
-          ...((p.videoShorts && p.videoShorts.length ? p.videoShorts : (p.videoShort ? [p.videoShort] : [])).map((k, si) => `<a href="/media/${escapeHtml(k)}" download>⬇️쇼츠${si + 1}</a>`)),
-          `<button type="button" class="copy-cap" data-cap="${escapeHtml(shareCaption)}">📋</button>`,
-        ].filter(Boolean).join('');
-        statusLine = `${mainLine}${shortsLine}`;
-        progressPct = 100;
+  const abs = (v) => Math.abs(parseInt(String(v ?? "0").replace(/[^\d-]/g, ""), 10)) || 0;
+  return rows
+    .map((row) => ({
+      open: abs(row.open_pric),
+      high: abs(row.high_pric),
+      low: abs(row.low_pric),
+      close: abs(row.cur_prc ?? row.close_pric),
+      volume: abs(row.trde_qty ?? row.now_trde_qty),
+      time: row.cntr_tm || "",
+    }))
+    .filter((r) => r.close > 0 && r.high > 0 && r.low > 0)
+    .reverse();
+}
+async function refreshMiniCandlesForWatchlist() {
+  if (!ADMIN_KEY) return;
+  if (!isMarketHoursKST()) return; // 장시간 외엔 갱신 불필요(어차피 안 바뀜)
+  try {
+    const entries = await getWatchlistEntriesCached();
+    if (!entries.length) return;
+    const token = await issueTokenCached();
+    for (const item of entries) {
+      try {
+        const raw = await kiwoomRest("/api/dostk/chart", "ka10080", { stk_cd: item.code, tic_scope: "1", upd_stkpc_tp: "1" }, token);
+        const parsed = parseKiwoomChartOHLCRelay(raw);
+        const todayStr = todayYYYYMMDDRelay();
+        const hasToday = parsed.some((c) => c.time.slice(0, 8) === todayStr);
+        const targetDate = hasToday ? todayStr : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
+        const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
+        miniCandleCache[item.code] = { candles, tradingDate: targetDate || null, updatedAt: Date.now() };
+      } catch (e) {
+        // 개별 종목 실패는 건너뜀 - 다음 갱신 주기에 재시도
       }
-    } else if (isRendering) {
-      statusLine = `<span class="render-progress" data-slug="${p.slug}">⏳ 렌더링 대기 중</span>`;
-      progressPct = 50;
-      isPendingCard = true;
-    } else if (p.videoError) {
-      statusLine = `❌ 실패: ${escapeHtml(truncErr(p.videoError))}`;
-      progressPct = 0;
-      isFailedCard = true;
-    } else {
-      statusLine = '—';
-      progressPct = 0;
+      await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+    }
+  } catch (e) {
+    console.log("미니차트 캐시 갱신 실패: " + e.message);
+  }
+}
+
+// ---------- 관심종목 추가/삭제 즉시 반영 ----------
+// 새로 추가된 종목은 다음 60초 정기갱신을 기다리지 않고 바로(장시작~현재까지 전체 1분봉을) 채워서
+// 화면에서 "아직 캐시 안 됨" 공백이 최소화되게 함. 삭제된 종목은 캐시에서 즉시 제거해서
+// 메모리가 무한정 쌓이지 않게 함(관심종목 아닌 종목의 낡은 데이터가 계속 파일에 남는 것 방지).
+let prevWatchlistCodes = new Set();
+let newCodeFetchRunning = false;
+const newCodeFetchQueue = [];
+async function processNewCodeFetchQueue() {
+  if (newCodeFetchRunning) return;
+  newCodeFetchRunning = true;
+  while (newCodeFetchQueue.length) {
+    const code = newCodeFetchQueue.shift();
+    try {
+      const token = await issueTokenCached();
+      const raw = await kiwoomRest("/api/dostk/chart", "ka10080", { stk_cd: code, tic_scope: "1", upd_stkpc_tp: "1" }, token);
+      const parsed = parseKiwoomChartOHLCRelay(raw);
+      const todayStr = todayYYYYMMDDRelay();
+      const hasToday = parsed.some((c) => c.time.slice(0, 8) === todayStr);
+      const targetDate = hasToday ? todayStr : parsed.reduce((max, c) => (c.time.slice(0, 8) > max ? c.time.slice(0, 8) : max), "");
+      const candles = parsed.filter((c) => c.time.slice(0, 8) === targetDate && c.time.slice(8, 12) >= "0900");
+      miniCandleCache[code] = { candles, tradingDate: targetDate || null, updatedAt: Date.now() };
+      console.log(`신규 관심종목 차트 즉시조회 완료: ${code} (${candles.length}봉)`);
+    } catch (e) {
+      console.log(`신규 관심종목 차트 즉시조회 실패: ${code} - ${e.message}`);
+    }
+    await new Promise((r) => setTimeout(r, 1100)); // 키움 TR 초당1건 제한
+  }
+  newCodeFetchRunning = false;
+}
+async function checkWatchlistMembershipChanges() {
+  if (!ADMIN_KEY) return;
+  try {
+    const entries = await getWatchlistEntriesCached();
+    const currentCodes = new Set(entries.map((e) => e.code));
+
+    // 삭제된 종목: 캐시에서 즉시 제거
+    for (const code of prevWatchlistCodes) {
+      if (!currentCodes.has(code)) {
+        delete miniCandleCache[code];
+        console.log(`관심종목 삭제 감지 - 캐시 제거: ${code}`);
+      }
     }
 
-    const thumb = p.video
-      ? `<video muted preload="metadata" src="/media/${p.video}#t=0.1"></video>`
-      : p.images?.[0]
-        ? (p.images[0].endsWith('.mp4') ? `<video muted preload="metadata" src="/media/${p.images[0]}#t=0.1"></video>` : `<img src="/media/${p.images[0]}" alt="">`)
-        : `<div class="placeholder">📄</div>`;
-    const durBadge = p.videoDurationSec && p.video ? `<span class="dur-badge">${fmtDurSec(p.videoDurationSec)}${shortsCountNum ? ` · 🩳${shortsCountNum}` : ''}</span>` : '';
-
-    const retryBtn = (!p.video && !isRendering && p.videoError) ? `<form method="POST" action="/admin/retry-render"><input type="hidden" name="slug" value="${escapeHtml(p.slug)}"><button type="submit">🔁재시도</button></form>` : '';
-    const shareBtnsHtml = (p.video && !needsYoutubePoll) ? (() => {
-      const shareCaption = buildThreadsCaption(p);
-      const threadsHref = `https://www.threads.net/intent/post?text=${encodeURIComponent(shareCaption)}`;
-      return `<a href="${escapeHtml(threadsHref)}" target="_blank">🧵</a><button type="button" class="copy-cap" data-cap="${escapeHtml(shareCaption)}">📋</button>`;
-    })() : '';
-
-    return `<div class="admin-card ${isFailedCard ? 'is-failed' : isPendingCard ? 'is-pending' : ''}" data-post-slug="${escapeHtml(p.slug)}">
-    <a class="thumb" href="/${p.slug}" target="_blank">${thumb}${durBadge}</a>
-    <div class="body">
-      <div class="title">${escapeHtml(p.title)}</div>
-      <div class="topic">${escapeHtml(p.topic)}</div>
-      <div class="status-line media-status">${mediaStatus}</div>
-      <div class="status-line yt-status">${statusLine}</div>
-      ${(isPendingCard || isFailedCard) ? `<div class="progress-track"><div class="progress-fill" style="width:${progressPct}%"></div></div>` : ''}
-      <div class="date">${new Date(p.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}</div>
-      <div class="actions">
-        <a href="/${p.slug}" target="_blank">보기</a>
-        ${shareBtnsHtml}
-        ${retryBtn}
-        <form method="POST" action="/admin/delete"><input type="hidden" name="slug" value="${p.slug}"><button class="danger" type="submit">삭제</button></form>
-      </div>
-    </div>
-  </div>`;
-  }).join('');
-
-  const hasPending = posts.some((p) => (!p.video && (pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug))) || (p.video && !p.youtubeUrl && !p.youtubeError));
-  const hasGenPending = genJobs.some((j) => !j.failed);
-  const progressScript = (hasPending || hasGenPending) ? `<script>
-    (function(){
-      function bumpCount(delta){
-        var h2 = document.querySelector('h2');
-        if (!h2) return;
-        var m = h2.textContent.match(/\\d+/);
-        if (m) h2.textContent = h2.textContent.replace(/\\d+/, (parseInt(m[0], 10) + delta));
-      }
-      function esc(s){ return (s == null ? '' : String(s)); }
-      function setBar(card, pct){
-        if (!card) return;
-        var bar = card.querySelector('.progress-fill');
-        if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
-      }
-      function insertPostCard(p){
-        var emptyMsg = document.getElementById('empty-row');
-        if (emptyMsg) emptyMsg.remove();
-        var anchor = document.getElementById('posts-anchor');
-        if (!anchor) return;
-        var card = document.createElement('div');
-        card.className = 'admin-card is-pending';
-        card.dataset.postSlug = p.slug;
-        card.innerHTML = '<a class="thumb" href="/' + p.slug + '" target="_blank"><div class="placeholder">🎬</div></a>' +
-          '<div class="body">' +
-          '<div class="title"></div>' +
-          '<div class="topic"></div>' +
-          '<div class="status-line media-status">' + ((p.imageCount ? ('🖼️ ' + p.imageCount + '장') : '이미지 없음') + (p.audio ? ' · 🔊 음성' : (p.audioError ? ' · ⚠️ 음성실패' : ' · 🔇 음성없음')) + (p.usedNews ? ' · 📰 뉴스참고' : '')) + '</div>' +
-          '<div class="status-line yt-status"><span class="render-progress" data-slug="' + p.slug + '">⏳ 렌더링 대기 중</span></div>' +
-          '<div class="progress-track"><div class="progress-fill" style="width:50%"></div></div>' +
-          '<div class="date"></div>' +
-          '<div class="actions"><a href="/' + p.slug + '" target="_blank">보기</a>' +
-          '<form method="POST" action="/admin/delete"><input type="hidden" name="slug" value="' + p.slug + '"><button class="danger" type="submit">삭제</button></form></div>' +
-          '</div>';
-        card.querySelector('.title').textContent = esc(p.title);
-        card.querySelector('.topic').textContent = esc(p.topic);
-        card.querySelector('.date').textContent = esc(p.createdAtText);
-        anchor.insertAdjacentElement('afterend', card);
-      }
-      function pollRender(){
-        var renderEls = document.querySelectorAll('.render-progress');
-        renderEls.forEach(function(el){
-          if (el.dataset.terminal === '1') return;
-          var slug = el.dataset.slug;
-          var card = el.closest('.admin-card');
-          fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
-            .then(function(r){ return r.json(); })
-            .then(function(data){
-              if (data.status === 'done') {
-                var mediaEl = card ? card.querySelector('.media-status') : null;
-                if (mediaEl) mediaEl.textContent = '✅ mp4로 통합됨';
-                if (data.youtubeUrl) {
-                  el.textContent = '';
-                  var a = document.createElement('a'); a.href = data.youtubeUrl; a.target = '_blank'; a.textContent = '▶ 본편';
-                  el.appendChild(a);
-                  var shortsUrls = data.youtubeShortsUrls || (data.youtubeShortsUrl ? [data.youtubeShortsUrl] : []);
-                  var shortsErrors = data.youtubeShortsErrors || [];
-                  var shortsCount = Math.max(shortsUrls.length, shortsErrors.length);
-                  var shortsStillQueued = false;
-                  for (var si = 0; si < shortsCount; si++) {
-                    el.appendChild(document.createTextNode(' · '));
-                    if (shortsUrls[si]) {
-                      var sa = document.createElement('a'); sa.href = shortsUrls[si]; sa.target = '_blank'; sa.textContent = '🩳' + (si + 1);
-                      el.appendChild(sa);
-                    } else if (shortsErrors[si] && shortsErrors[si].indexOf('할당량') !== -1) {
-                      shortsStillQueued = true;
-                      el.appendChild(document.createTextNode('⏳숏츠' + (si + 1)));
-                    } else {
-                      el.appendChild(document.createTextNode('❌숏츠' + (si + 1) + '실패'));
-                    }
-                  }
-                  if (data.youtubeShortsSkippedReason) { shortsStillQueued = true; el.appendChild(document.createTextNode(' · ⏳숏츠')); }
-                  el.dataset.terminal = shortsStillQueued ? '0' : '1';
-                  setBar(card, 100);
-                  if (card) card.classList.remove('is-pending');
-                  if (!shortsStillQueued) refreshAdminList();
-                } else if (data.youtubeError) {
-                  el.textContent = data.youtubeQuotaExceeded ? '⏳ 본편(할당량 초과)' : ('❌ 본편실패(' + String(data.youtubeError).slice(0, 100) + ')');
-                  el.dataset.terminal = '1';
-                  setBar(card, 100);
-                  refreshAdminList();
-                } else {
-                  var pct = (typeof data.youtubeUploadPercent === 'number') ? data.youtubeUploadPercent : null;
-                  el.textContent = '🎬 mp4 완료 · 유튜브 업로드 중' + (pct !== null ? ' ' + pct + '%' : '…');
-                  setBar(card, 80 + (pct || 0) * 0.2);
-                  var lastPct = el.dataset.ytLastPct !== undefined ? parseInt(el.dataset.ytLastPct, 10) : -1;
-                  var stalled = (pct !== null && pct === lastPct);
-                  el.dataset.ytLastPct = pct === null ? '-1' : String(pct);
-                  var stallTries = stalled ? (parseInt(el.dataset.ytStallTries || '0', 10) + 1) : 0;
-                  el.dataset.ytStallTries = String(stallTries);
-                  if (stallTries >= 20) { el.dataset.terminal = '1'; refreshAdminList(); }
-                }
-                return;
-              }
-              if (data.status === 'failed') {
-                el.textContent = '❌ 렌더링 실패' + (data.error ? ': ' + String(data.error).slice(0, 150) : '');
-                el.dataset.terminal = '1';
-                if (card) { card.classList.remove('is-pending'); card.classList.add('is-failed'); }
-                setBar(card, 0);
-                refreshAdminList();
-                return;
-              }
-              // relay가 주는 자체 percent(0~100)를 50~80% 구간으로 매핑
-              var relayPct = typeof data.percent === 'number' ? data.percent : 0;
-              el.textContent = (data.stage || '렌더링 중') + ' · ' + relayPct + '%';
-              setBar(card, 50 + relayPct * 0.3);
-            })
-            .catch(function(){});
-        });
-      }
-      function stepGen(){
-        var genEls = document.querySelectorAll('.gen-progress');
-        genEls.forEach(function(el){
-          if (el.dataset.terminal === '1') return;
-          if (el.dataset.inflight === '1') return;
-          el.dataset.inflight = '1';
-          var card = el.closest('.admin-card');
-          var baseText = el.textContent;
-          var waitStarted = Date.now();
-          var tickId = setInterval(function(){
-            var sec = Math.floor((Date.now() - waitStarted) / 1000);
-            el.textContent = baseText + ' · ' + sec + '초';
-          }, 500);
-
-          var id = el.dataset.id;
-          fetch('/admin/generate-step', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: id }),
-          })
-            .then(function(r){ return r.json(); })
-            .then(function(data){
-              clearInterval(tickId);
-              el.dataset.inflight = '0';
-              if (data.status === 'done') {
-                el.dataset.terminal = '1';
-                if (card) card.remove();
-                if (data.post) insertPostCard(data.post);
-                bumpCount(1);
-                refreshAdminList();
-                return;
-              }
-              if (data.status === 'not_found') {
-                el.textContent = '(사라진 작업)';
-                el.dataset.terminal = '1';
-                refreshAdminList();
-                return;
-              }
-              if (data.status === 'failed') {
-                el.textContent = '❌ 생성 실패: ' + (function(s){ s = String(s || ''); return s.length <= 300 ? s : s.slice(0, 150) + ' … ' + s.slice(-150); })(data.error);
-                el.dataset.terminal = '1';
-                if (card) { card.classList.remove('is-pending'); card.classList.add('is-failed'); }
-                setBar(card, 0);
-                refreshAdminList();
-                return;
-              }
-              el.textContent = (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
-              setBar(card, (data.percent || 0) * 0.5);
-            })
-            .catch(function(){
-              clearInterval(tickId);
-              el.dataset.inflight = '0';
-            });
-        });
-      }
-      pollRender();
-      stepGen();
-      setInterval(pollRender, 3000);
-      setInterval(stepGen, 1500);
-    })();
-  </script>` : '';
-
-  const body = `${siteHeader()}<div class="wrap" style="padding:32px 0;">
-    <h2>관리자 (총 ${idx.length}건)</h2>
-    <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아와요. 이 페이지를 열어두면 1.5초마다 빠르게 진행되고, 닫아도 1분마다 크론이 대신 이어서 진행해요(다만 느려요).</p>
-    <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;flex-wrap:wrap;" id="gen-form" onsubmit="this.querySelector('button[type=submit]').disabled=true; this.querySelector('button[type=submit]').textContent='생성 중...';">
-      <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;min-width:200px;" required>
-      <button type="button" id="media-upload-btn">📎 미디어 추가</button>
-      <button type="submit">글+슬라이드쇼 생성</button>
-      <input type="hidden" name="userMediaKeys" id="user-media-keys-input" value="[]">
-      <input type="file" id="media-upload-input" accept="image/*,video/*" multiple style="display:none;">
-      <div id="media-upload-list" style="width:100%;"></div>
-    </form>
-    <div class="admin-grid" id="admin-tbody">${renderFailCards}${genJobCards}<div id="posts-anchor" style="display:none;"></div>${postCards || '<p id="empty-row" style="grid-column:1/-1;color:var(--muted);">글이 없습니다.</p>'}</div>
-  </div><script>
-    // [2026-09-02 20:45] 첨부 미디어 업로드 — 사진은 canvas로 리사이즈(전송 용이)해서 보내고,
-    // 동영상은 어차피 relay가 최종 렌더링 때 다시 인코딩하므로 원본 그대로 올림.
-    (function(){
-      var uploadBtn = document.getElementById('media-upload-btn');
-      var fileInput = document.getElementById('media-upload-input');
-      var listEl = document.getElementById('media-upload-list');
-      var keysInput = document.getElementById('user-media-keys-input');
-      if (!uploadBtn || !fileInput) return;
-      var uploadedFiles = []; // {key, isVideo, name}
-      var UPLOAD_MAX = 10;
-
-      function resizeImageFile(file, maxDim){
-        return new Promise(function(resolve){
-          var img = new Image();
-          var url = URL.createObjectURL(file);
-          img.onload = function(){
-            var w = img.width, h = img.height;
-            var scale = Math.min(1, maxDim / Math.max(w, h));
-            var cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
-            var canvas = document.createElement('canvas');
-            canvas.width = cw; canvas.height = ch;
-            var ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0, cw, ch);
-            canvas.toBlob(function(blob){ URL.revokeObjectURL(url); resolve(blob || file); }, 'image/jpeg', 0.85);
-          };
-          img.onerror = function(){ URL.revokeObjectURL(url); resolve(file); };
-          img.src = url;
-        });
-      }
-
-      function renderList(){
-        listEl.innerHTML = '';
-        keysInput.value = JSON.stringify(uploadedFiles.map(function(f){ return f.key; }));
-        uploadedFiles.forEach(function(f, idx){
-          var chip = document.createElement('span');
-          chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:3px 8px;margin:4px 4px 0 0;font-size:11px;';
-          var label = document.createElement('span');
-          label.textContent = (f.isVideo ? '🎞️ ' : '🖼️ ') + (f.name || '').slice(0, 14);
-          chip.appendChild(label);
-          var rm = document.createElement('button');
-          rm.type = 'button'; rm.textContent = '✕';
-          rm.style.cssText = 'border:none;background:none;cursor:pointer;font-size:11px;padding:0;margin-left:2px;color:var(--muted);';
-          rm.addEventListener('click', function(){ uploadedFiles.splice(idx, 1); renderList(); });
-          chip.appendChild(rm);
-          listEl.appendChild(chip);
-        });
-      }
-
-      uploadBtn.addEventListener('click', function(){ fileInput.click(); });
-      fileInput.addEventListener('change', async function(e){
-        var files = Array.prototype.slice.call(e.target.files || []);
-        if (!files.length) return;
-        if (uploadedFiles.length + files.length > UPLOAD_MAX) {
-          alert('최대 ' + UPLOAD_MAX + '개까지 첨부할 수 있어요');
-          fileInput.value = '';
-          return;
+    // 신규 종목: 장중이면 즉시조회 큐에 추가(60초 정기갱신을 기다리지 않음)
+    if (isMarketHoursKST()) {
+      for (const code of currentCodes) {
+        if (!prevWatchlistCodes.has(code) && !miniCandleCache[code] && !newCodeFetchQueue.includes(code)) {
+          newCodeFetchQueue.push(code);
         }
-        uploadBtn.disabled = true;
-        var origText = uploadBtn.textContent;
-        uploadBtn.textContent = '업로드 중...';
+      }
+      if (newCodeFetchQueue.length) processNewCodeFetchQueue();
+    }
+
+    // 웹소켓 실시간가 구독도 관심종목 변경에 맞춰 자체 갱신 - 브라우저가 페이지를 안 열어놔도
+    // (아무도 /realtime/subscribe를 호출 안 해도) 관심종목은 항상 최신 상태로 구독 유지됨.
+    // 구독 등록은 웹소켓 메시지라 키움 REST 초당1건 제한과 무관 - 걸릴 일 없음.
+    const codesArr = [...currentCodes];
+    const changed = codesArr.length !== subscribedStocks.length || codesArr.some((c) => !subscribedStocks.includes(c));
+    if (changed && ws && ws.readyState === WebSocket.OPEN && wsLoggedIn) {
+      subscribedStocks = codesArr;
+      ws.send(JSON.stringify({ trnm: "REG", grp_no: "2", refresh: "1", data: [{ item: subscribedStocks, type: ["0B"] }] }));
+      console.log("관심종목 변경 감지 - 웹소켓 구독 자체 갱신: " + subscribedStocks.length + "종목");
+    }
+
+    prevWatchlistCodes = currentCodes;
+  } catch (e) {
+    // entries 조회 실패는 다음 틱에 재시도
+  }
+}
+setInterval(checkWatchlistMembershipChanges, 3000); // entries 자체는 5초 캐시라 3초 체크해도 실제 호출은 그만큼 안 늘어남
+
+// 1분마다 갱신 - 1분봉 데이터라 이보다 자주 갱신해도 의미 없음
+setInterval(refreshMiniCandlesForWatchlist, 60000);
+setTimeout(refreshMiniCandlesForWatchlist, 8000); // 재시작 직후 워밍업 (토큰발급/entries조회 여유)
+
+// 매일 장 시작 전(09:00 KST) 캐시 초기화 - 어제 데이터가 오늘 장중에도 잠깐 보이는 걸 방지.
+// 09:01부터 refreshMiniCandlesForWatchlist가 새 거래일 데이터로 다시 채움.
+let miniCandleCacheClearedDate = null;
+setInterval(() => {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  if (minutes >= 9 * 60 && minutes < 9 * 60 + 1 && miniCandleCacheClearedDate !== dateKey) {
+    Object.keys(miniCandleCache).forEach((k) => delete miniCandleCache[k]);
+    saveMiniCandleCache();
+    Object.keys(todayMaxRateCache).forEach((k) => delete todayMaxRateCache[k]);
+    Object.keys(prevOrderFlowCache).forEach((k) => delete prevOrderFlowCache[k]);
+    group9LastCodes = [];
+    miniCandleCacheClearedDate = dateKey;
+    console.log("미니차트 캐시 초기화 (새 거래일 시작)");
+  }
+}, 30000);
+
+async function checkWatchlistStopLoss() {
+  if (!ADMIN_KEY) return; // 키 미설정이면 조용히 스킵 (fail closed)
+  if (!isTradingActiveKST()) return; // 15:50 이후 자동매매 중지
+  try {
+    const items = await getWatchlistEntriesCached();
+    if (!items.length) return;
+    for (const item of items) {
+      const q = realtimeCache.stock[item.code];
+      if (!q || !q.price) continue; // 아직 실시간가 미수신 - 다음 틱에 재시도
+      const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
+      if (pnlPct <= AUTO_REMOVE_PNL_PCT || pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT) {
+        const reason = pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT ? "익절" : "손절";
         try {
-          var fd = new FormData();
-          for (var i = 0; i < files.length; i++) {
-            var f = files[i];
-            if (f.type.indexOf('image/') === 0) {
-              var blob = await resizeImageFile(f, 1600);
-              fd.append('files', blob, (f.name || 'image').replace(/\\.[^.]+$/, '') + '.jpg');
-            } else {
-              fd.append('files', f, f.name);
-            }
-          }
-          var res = await fetch('/admin/upload-media', { method: 'POST', body: fd });
-          var data = await res.json();
-          if (data.ok && data.files) {
-            uploadedFiles = uploadedFiles.concat(data.files);
-            renderList();
-          } else {
-            alert(data.error || '업로드 실패');
-          }
-        } catch (err) {
-          alert('업로드 실패');
+          await workerRequest("/api/watchlist/auto-remove", "POST", { code: item.code, pnlPct, name: stockNameCache[item.code] });
+          entriesCache.items = entriesCache.items.filter((x) => x.code !== item.code); // 즉시 캐시에서도 제거(중복삭제 요청 방지)
+          console.log(`${reason} 자동삭제: ${item.code} (${pnlPct.toFixed(2)}%)`);
+        } catch (e) {
+          console.log(`${reason} 자동삭제 요청 실패: ${item.code} - ${e.message}`);
         }
-        uploadBtn.disabled = false;
-        uploadBtn.textContent = origText;
-        fileInput.value = '';
-      });
-    })();
-    document.addEventListener('click', function(e){
-      var btn = e.target.closest('.copy-cap');
-      if (!btn) return;
-      navigator.clipboard.writeText(btn.dataset.cap || '').then(function(){
-        var orig = btn.textContent;
-        btn.textContent = '✅';
-        setTimeout(function(){ btn.textContent = orig; }, 1500);
-      });
+      }
+    }
+  } catch (e) {
+    console.log("관심종목 손절체크 실패: " + e.message);
+  }
+}
+setInterval(checkWatchlistStopLoss, 2000);
+
+// ---------- 15:50 일괄정리 (하루 1회) ----------
+// 15:50부터는 신규 매매/자동삭제가 전부 중지되는데, 그 직전 시점 기준으로 조건(+3.5%/-1.5%)에
+// 걸려있는 종목들은 중지되기 전에 한 번 정리해줌. 이후(15:50~장마감)엔 다시 매매중지 유지.
+let finalSweepDoneToday = null;
+async function runFinalSweep() {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const dateKey = `${kst.getFullYear()}-${String(kst.getMonth() + 1).padStart(2, "0")}-${String(kst.getDate()).padStart(2, "0")}`;
+  if (finalSweepDoneToday === dateKey) return;
+  if (!ADMIN_KEY) return;
+  try {
+    const entries = await workerRequest("/api/watchlist-entries", "GET");
+    if (!entries.ok || !entries.items.length) {
+      finalSweepDoneToday = dateKey;
+      return;
+    }
+    const items = [];
+    for (const item of entries.items) {
+      const q = realtimeCache.stock[item.code];
+      if (!q || !q.price) continue;
+      const pnlPct = ((q.price - item.entry_price) / item.entry_price) * 100;
+      if (pnlPct >= AUTO_TAKE_PROFIT_PNL_PCT || pnlPct <= AUTO_REMOVE_PNL_PCT) {
+        items.push({ code: item.code, pnlPct });
+      }
+    }
+    const result = await workerRequest("/api/watchlist/final-sweep", "POST", { items });
+    if (result.ok) {
+      console.log(`15:50 일괄정리 완료: ${result.removed}종목 삭제 (대상 ${items.length}건 중)`);
+      finalSweepDoneToday = dateKey;
+    } else {
+      console.log("15:50 일괄정리 실패: " + (result.error || "unknown"));
+    }
+  } catch (e) {
+    console.log("15:50 일괄정리 실패: " + e.message);
+  }
+}
+// 15:50 정각을 정확히 맞추기보다 15:50~15:52 구간에서 1분 간격 체크 (매매중지 게이트가 15:50부터
+// 걸리므로, 이 구간이 지나기 전에 반드시 한 번은 실행되어야 함).
+setInterval(() => {
+  const kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const minutes = kst.getHours() * 60 + kst.getMinutes();
+  if (minutes >= 15 * 60 + 50 && minutes <= 15 * 60 + 52) {
+    runFinalSweep();
+  }
+}, 30000);
+
+// ---------- HTTP 서버 (기존 REST 중계 + 신규 실시간 캐시 조회) ----------
+// 조건검색 편입 이력에 이름/현재가를 붙여서 반환 - /realtime/all과 /realtime/condition 둘 다에서 씀
+function buildConditionHistory() {
+  const cond = realtimeCache.condition;
+  return cond.history.map((h) => {
+    const q = realtimeCache.stock[h.code];
+    return {
+      code: h.code,
+      name: stockNameCache[h.code] || null,
+      time: h.time,
+      at: h.at,
+      initial: !!h.initial,
+      price: q ? q.price : null,
+      rate: q ? q.rate : null,
+      stillIn: cond.codes.indexOf(h.code) !== -1, // 아직 조건을 만족 중인지
+    };
+  });
+}
+
+const server = http.createServer((req, res) => {
+  if (req.headers["x-relay-secret"] !== RELAY_SECRET) {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: false, error: "relay secret mismatch" }));
+    return;
+  }
+
+  // 영상 렌더링 시작 - 이미지+음성 URL 받아서 백그라운드로 ffmpeg 렌더링, 즉시 202 응답
+  if (req.url === "/render" && req.method === "POST") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid json" }));
+        return;
+      }
+      const images = Array.isArray(body.images) ? body.images : [];
+      const audioUrl = body.audioUrl || null;
+      // 세그먼트별 음성 원본 목록 — 있으면 각각의 실제 길이를 재서 이어붙이고 자막 타이밍을 실측으로 맞춤
+      const audioSegments = Array.isArray(body.audioSegments) ? body.audioSegments.filter((u) => typeof u === "string") : null;
+      const outputKey = body.outputKey;
+      // [2026-08-30 22:55] 숏츠 출력 키: 배열(최대 3개, 도입/중간/결론) — 옛 워커가 단일 문자열로 보내도 배열로 수용
+      const shortOutputKeys = Array.isArray(body.shortOutputKeys)
+        ? body.shortOutputKeys.filter((k) => typeof k === "string").slice(0, 3)
+        : (typeof body.shortOutputKey === "string" ? [body.shortOutputKey] : null);
+      const weights = Array.isArray(body.weights) ? body.weights.filter((w) => typeof w === "number") : null;
+      const captionBeats = Array.isArray(body.captionBeats) ? body.captionBeats : null;
+      // 이 영상 전체에 고정으로 쓸 자막 폰트 키/색 — Worker가 영상당 하나씩 랜덤으로 뽑아서 넘겨줌.
+      const captionFontKey = typeof body.captionFontKey === "string" ? body.captionFontKey : null;
+      const captionColor = typeof body.captionColor === "string" ? body.captionColor : null;
+      // [2026-09-02 21:05] highlightSegRange: Worker가 AI로 고른 쇼츠 하이라이트 문장 구간 {start,end}
+      const highlightSegRange = (body.highlightSegRange && Number.isInteger(body.highlightSegRange.start) && Number.isInteger(body.highlightSegRange.end))
+        ? { start: body.highlightSegRange.start, end: body.highlightSegRange.end }
+        : null;
+      if (!images.length || !outputKey) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "images/outputKey 필요" }));
+        return;
+      }
+      const jobId = crypto.randomUUID();
+      renderJobs.set(jobId, { status: "processing", stage: "대기열 대기 중", percent: 0, startedAt: Date.now() });
+      // 큐에 넣고 기다리지 않고 바로 응답 — 앞에 진행 중인 렌더링이 있으면 그거 끝나야 시작됨(VM 자원 보호)
+      enqueueRender(() => runRender(jobId, images, audioUrl, audioSegments, outputKey, shortOutputKeys, weights, captionBeats, captionFontKey, captionColor, highlightSegRange));
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, jobId }));
     });
-    var refreshingList = false;
-    function refreshAdminList() {
-      if (refreshingList) return;
-      refreshingList = true;
-      fetch(location.pathname + location.search)
-        .then(function(r){ return r.text(); })
-        .then(function(html){
-          var doc = new DOMParser().parseFromString(html, 'text/html');
-          var freshGrid = doc.getElementById('admin-tbody');
-          var curGrid = document.getElementById('admin-tbody');
-          if (freshGrid && curGrid) curGrid.innerHTML = freshGrid.innerHTML;
-        })
-        .catch(function(){})
-        .finally(function(){ refreshingList = false; });
-    }
-  </script>${progressScript}`;
-
-  return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-}
-
-// 생성 과정을 "한 단계씩" 잘게 쪼갠 상태머신 — 매 호출마다 딱 한 걸음만 진행하고 KV에 상태를 저장.
-// 각 단계가 몇 초 안에 끝나서 Workers/waitUntil 시간제한에 안 걸림. 관리자 페이지가 이걸 반복 호출해서 진행시킴.
-async function runGenerationStep(job, env) {
-  const topic = job.topic;
-
-  if (job.stage === 'start') {
-    const slug = String(Date.now());
-    const newsResults = await searchNaverNews(topic, env);
-    const { article, error: articleError } = await generateArticle(topic, newsResults, env);
-    if (!article) throw new Error(`글 생성 실패 — ${articleError || '알 수 없는 오류'}`);
-    // [2026-09-02 21:20] 문장을 5초 단위로 자연스럽게 재편집(reeditForTtsPacing)한 뒤 정규화/자름
-    const rawNarration = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ');
-    const pacedNarration = await reeditForTtsPacing(rawNarration, env);
-    const narrationText = trimNarrationToSentence(normalizeNarrationSpacing(pacedNarration), NARRATION_MAX_CHARS);
-    // 음성은 문장 몇 개씩 묶은 "세그먼트" 단위로 따로 합성(자막-음성 싱크를 실측으로 맞추기 위함).
-    // 목소리는 여기서 한 번 뽑아 영상 전체에 고정 — 세그먼트마다 목소리가 바뀌면 안 되니까.
-    const segments = planAudioSegments(prepareNarrationSentences(narrationText), 1); // [2026-08-30 21:51] 문장 하나 = 조각 하나: 모든 문장 시작마다 타이밍이 실측값으로 리셋돼 싱크가 엉킬 수 없음(사용자 제안)
-    return {
-      ...job, slug, article, usedNews: newsResults.length > 0, narrationText,
-      segTexts: segments.map((s) => s.text), segSentences: segments.map((s) => s.sentences),
-      ttsVoices: pickTtsVoices(), segDone: 0, audioSegmentKeys: [],
-      stage: 'audio', percent: 15,
-    };
+    return;
   }
 
-  if (job.stage === 'audio') {
-    // 세그먼트를 몇 개씩(배치) 합성해 R2에 저장 — 한 스텝이 몇 초 안에 끝나도록 나눠서 진행.
-    // 세그먼트 하나라도 최종 실패하면 무음/불일치 영상을 만들 수 없으니 여기서 중단(이미 올린 조각 정리).
-    const AUDIO_BATCH = 4;
-    if (!env.MEDIA) return { ...job, audioKey: null, audioError: 'MEDIA(R2) 바인딩 없음', scenes: [], sceneIndex: 0, images: [], stage: 'finalize', percent: 30 };
-    const keys = job.audioSegmentKeys.slice();
-    let segDone = job.segDone;
-    const batchEnd = Math.min(segDone + AUDIO_BATCH, job.segTexts.length);
-    for (; segDone < batchEnd; segDone++) {
-      const { buffer, error } = await generateNarrationAudioWithRetry(job.segTexts[segDone], env, 2, job.ttsVoices);
-      if (!buffer) {
-        await Promise.all(keys.map((k) => env.MEDIA.delete(k).catch(() => {})));
-        // [2026-09-02 20:45] 사용자가 첨부한 미디어는 이 시점엔 아직 job.images에 안 들어가 있어서
-        // (audio-concat 단계에서 시딩됨) 여기서 따로 지워줘야 고아 파일이 안 남음
-        if (job.userMediaKeys?.length) {
-          await Promise.all(job.userMediaKeys.map((k) => env.MEDIA.delete(k).catch(() => {})));
-        }
-        throw new Error(`음성 세그먼트 ${segDone + 1}/${job.segTexts.length} 합성 최종 실패로 발행 중단 — ${error || '알 수 없는 오류'}`);
-      }
-      const key = `${job.slug}-narr-${segDone}.mp3`;
-      await env.MEDIA.put(key, buffer, { httpMetadata: { contentType: 'audio/mpeg' } });
-      keys.push(key);
-    }
-    const allDone = segDone >= job.segTexts.length;
-    return {
-      ...job, segDone, audioSegmentKeys: keys,
-      stage: allDone ? 'audio-concat' : 'audio',
-      percent: 15 + Math.round((segDone / (job.segTexts.length || 1)) * 13), // 15~28%
-    };
-  }
-
-  if (job.stage === 'audio-concat') {
-    // 세그먼트들을 이어붙인 전체 나레이션 mp3 하나를 만들어 저장 — 웹 슬라이드쇼 재생용(post.audio).
-    // 실제 mp4 렌더링은 이 파일이 아니라 세그먼트 원본들을 릴레이가 직접 이어붙여 씀(그래야 실측 타이밍이 정확).
-    const buffers = [];
-    for (const key of job.audioSegmentKeys) {
-      const obj = await env.MEDIA.get(key);
-      if (!obj) throw new Error(`음성 세그먼트 유실(${key}) — 발행 중단`);
-      buffers.push(await obj.arrayBuffer());
-    }
-    const audioKey = `${job.slug}-narration.mp3`;
-    await env.MEDIA.put(audioKey, concatAudioBuffers(buffers), { httpMetadata: { contentType: 'audio/mpeg' } });
-    // [2026-09-02 20:45] 사용자가 직접 첨부한 미디어(job.userMediaKeys)를 images 맨 앞에 그대로 배치하고,
-    // AI는 나머지 자리(SCENE_COUNT - 첨부 개수)만 생성하도록 요청 장면 수를 줄임
-    const userMediaKeys = Array.isArray(job.userMediaKeys) ? job.userMediaKeys : [];
-    const wantAiScenes = Math.max(0, SCENE_COUNT - userMediaKeys.length);
-    const scenes = wantAiScenes ? await generateScenePrompts(topic, job.article.title, env, wantAiScenes) : [];
-    return { ...job, audioKey, audioError: null, scenes, sceneIndex: 0, images: userMediaKeys.slice(), stage: scenes.length ? 'images' : 'finalize', percent: 30 };
-  }
-
-  if (job.stage === 'images') {
-    // [2026-08-30 19:10] 장면 일부는 사진 대신 실사 클립(mp4) 사용 — CLIP_TARGET개를 영상 전체에 고르게 분산.
-    // 슬롯 규칙: k번째 클립은 sceneIndex ≥ k*(전체/CLIP_TARGET)부터 시도 — 해당 장면에서 연관 클립을 못
-    // 찾으면 사진으로 넘어가고, 다음 장면들에서 계속 클립을 노림(찾을 때까지). 확장자(.mp4/.jpg)로 종류 구분.
-    const scene = job.scenes[job.sceneIndex];
-    const images = job.images.slice();
-    let clipCount = job.clipCount || 0;
-    if (scene) {
-      const slotStart = clipCount * Math.max(1, Math.floor(job.scenes.length / CLIP_TARGET));
-      const wantClip = clipCount < CLIP_TARGET && job.sceneIndex >= slotStart;
-      let stored = false;
-      if (wantClip) {
-        const clip = await getSceneClip(scene, topic, env);
-        if (clip) {
-          const key = `${job.slug}-scene-${images.length}.mp4`;
-          await env.MEDIA.put(key, clip, { httpMetadata: { contentType: 'video/mp4' } });
-          images.push(key);
-          clipCount++;
-          stored = true;
-        }
-      }
-      if (!stored) {
-        const img = await getSceneImage(scene, topic, env);
-        if (img) {
-          const key = `${job.slug}-scene-${images.length}.jpg`;
-          await env.MEDIA.put(key, img, { httpMetadata: { contentType: 'image/jpeg' } });
-          images.push(key);
-        }
-      }
-    }
-    const nextIndex = job.sceneIndex + 1;
-    const done = nextIndex >= job.scenes.length;
-    return {
-      ...job, images, clipCount, sceneIndex: nextIndex,
-      stage: done ? 'finalize' : 'images',
-      percent: 30 + Math.round((nextIndex / job.scenes.length) * 45), // 30~75%
-    };
-  }
-
-  if (job.stage === 'finalize') {
-    // 음성이 끝내 실패했으면(재시도 다 소진) 무음 영상을 조용히 발행하는 대신 여기서 중단 —
-    // 이미 올려둔 장면 이미지는 정리하고 실패로 처리(글 자체를 안 만듦, handleGenerateStep의 catch가 job.failed 처리).
-    if (!job.audioKey) {
-      if (job.images?.length && env.MEDIA) {
-        await Promise.all(job.images.map((k) => env.MEDIA.delete(k).catch(() => {})));
-      }
-      if (job.audioSegmentKeys?.length && env.MEDIA) {
-        await Promise.all(job.audioSegmentKeys.map((k) => env.MEDIA.delete(k).catch(() => {})));
-      }
-      throw new Error(`음성 생성 최종 실패로 발행 중단 — ${job.audioError || '알 수 없는 오류'}`);
-    }
-    // 자막 위치/폰트/색은 이 영상 하나에 쓸 값을 미리 하나씩 고정 선택 — 비트마다 안 바뀌고 영상 전체 동일.
-    const { captionFontKey, captionColor, captionPositionIndex } = pickCaptionStyle();
-    // 문장마다 어떤 음성 세그먼트에서 나왔는지(segIndex)를 자막 비트에 실어 보냄 — 릴레이가 실측 타이밍에 씀.
-    const sentenceInfos = buildSentenceInfos(job.segSentences);
-    const perImageChunks = splitTextIntoNChunks(sentenceInfos, job.images.length || 1);
-    const captionWeights = [];
-    const captionBeats = [];
-    for (let i = 0; i < job.images.length; i++) {
-      const chunk = perImageChunks[i] || { sentences: [], weight: 1 / (job.images.length || 1) };
-      captionWeights.push(chunk.weight);
-      const beats = buildCaptionBeats(chunk.sentences, captionPositionIndex);
-      captionBeats.push(beats);
-    }
-    // [2026-09-02 21:05] 쇼츠용 하이라이트 구간 — 실패해도 발행은 막지 않음(null이면 relay가 예전 로직으로 폴백)
-    const highlightSegRange = await pickHighlightRange(job.segTexts || [], topic, env);
-    const post = {
-      slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
-      intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
-      images: job.images, audio: job.audioKey, audioSegments: job.audioSegmentKeys, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange,
-      generationSec: job.createdAt ? Math.round((Date.now() - job.createdAt) / 1000) : null, // [2026-08-30 19:45] 생성 버튼 → 글 저장까지 걸린 시간(관리자 표시용)
-      threadsText: (job.article.threads_text || '').toString().slice(0, 450), // [2026-08-30 22:20] 스레드 공유용 홍보문(글 생성 때 같이 만들어짐)
-    };
-    await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
-    const idxRaw = await env.POSTS.get('index');
-    const idx = idxRaw ? JSON.parse(idxRaw) : [];
-    // [2026-09-02 20:21] 최후의 안전장치 — 위 락으로 거의 다 막히지만 KV 왕복시간만큼의 아주 좁은 경쟁
-    // 창이 여전히 이론상 남아있어서, finalize가 혹시 겹쳐 실행돼도 같은 slug가 index에 두 번 안 쌓이게 함
-    if (!idx.includes(job.slug)) idx.unshift(job.slug);
-    await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
-    return { ...job, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange, stage: 'render', percent: 90 };
-  }
-
-  if (job.stage === 'render') {
-    if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && job.images.length) {
-      const outputKey = `${job.slug}.mp4`;
-      // [2026-08-31 07:29] 3개→1개: 유튜브 일일 업로드 할당량(10,000유닛, 건당 1,600) 절약 위해 축소(사용자 요청)
-      const shortKeys = [`${job.slug}-short.mp4`];
-      const render = await startRelayRender(job.images, job.audioKey, job.audioSegmentKeys, outputKey, shortKeys, job.captionWeights, job.captionBeats, job.captionFontKey, job.captionColor, env, job.highlightSegRange);
-      if (render.ok) {
-        await env.POSTS.put(`renderJob:${job.slug}`, JSON.stringify({
-          jobId: render.jobId, slug: job.slug, r2Key: outputKey, shortKeys, startedAt: Date.now(),
-        }));
-      } else {
-        const postRaw = await env.POSTS.get(`post:${job.slug}`);
-        if (postRaw) {
-          const post = JSON.parse(postRaw);
-          post.videoError = render.error;
-          await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
-        }
-      }
-    }
-    return { ...job, stage: 'done', percent: 100 };
-  }
-
-  if (job.stage === 'done') return job;
-
-  // 예전 방식으로 만들어지다 만 유령 작업(형식이 안 맞음) — 계속 살려두면 정리 타이머가 매번 리셋돼서
-  // 영원히 "진행 중"처럼 보이게 됨. 여기서 확실히 실패로 끊어서 정리 대상이 되게 함.
-  throw new Error('알 수 없는 상태 — 예전 버전에서 만들다 만 작업으로 보입니다. 삭제하고 다시 시도해주세요.');
-}
-
-async function handleGenerateStep(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch (e) {
-    return new Response(JSON.stringify({ error: 'invalid json' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-  }
-  const id = body.id;
-  if (!id) return new Response(JSON.stringify({ error: 'id 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-
-  const raw = await env.POSTS.get(`genJob:${id}`);
-  if (!raw) return new Response(JSON.stringify({ status: 'not_found' }), { headers: { 'Content-Type': 'application/json' } });
-  let job = JSON.parse(raw);
-
-  if (job.failed) {
-    return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: job.error }), { headers: { 'Content-Type': 'application/json' } });
-  }
-
-  // [2026-09-02 20:21] 동시실행 방지 — 방금 다른 경로(1분 크론/relay tick)가 이 job을 잡았으면
-  // 이번 호출은 아무것도 안 하고 현재 상태만 그대로 돌려줌(진행률 표시는 계속 자연스럽게 보임)
-  if (job.lockedAt && Date.now() - job.lockedAt < GEN_JOB_LOCK_MS) {
-    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent }), { headers: { 'Content-Type': 'application/json' } });
-  }
-  await env.POSTS.put(`genJob:${id}`, JSON.stringify({ ...job, lockedAt: Date.now() })).catch(() => {});
-
-  try {
-    job = await runGenerationStep(job, env);
-    if (job.stage === 'done') {
-      await env.POSTS.delete(`genJob:${id}`);
-      const postRaw = await env.POSTS.get(`post:${job.slug}`);
-      const post = postRaw ? JSON.parse(postRaw) : null;
-      return new Response(JSON.stringify({
-        status: 'done',
-        slug: job.slug,
-        post: post ? {
-          title: post.title, topic: post.topic, slug: post.slug,
-          imageCount: post.images?.length || 0, audio: !!post.audio, audioError: post.audioError || null, usedNews: !!post.usedNews,
-          createdAtText: new Date(post.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }),
-        } : null,
-      }), { headers: { 'Content-Type': 'application/json' } });
-    }
-    job.startedAt = Date.now(); // 마지막 갱신 시각(멈춤 판정용)
-    await env.POSTS.put(`genJob:${id}`, JSON.stringify(job));
-    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (e) {
-    await env.POSTS.put(`genJob:${id}`, JSON.stringify({ ...job, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() }));
-    return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: e.message }), { headers: { 'Content-Type': 'application/json' } });
-  }
-}
-
-async function handleRenderProgress(request, env, ctx) {
-  const url = new URL(request.url);
-  const slug = url.searchParams.get('slug');
-  if (!slug) return new Response(JSON.stringify({ error: 'slug 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-
-  const jobRaw = await env.POSTS.get(`renderJob:${slug}`);
-  if (!jobRaw) {
-    // renderJob이 이미 없어졌다는 건 크론이 처리 완료(또는 정리)했다는 뜻 — post.video 유무로 결과 판단.
-    // 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행되므로, 여기서도 최신 post의 youtubeUrl/youtubeError를 같이 내려줘야
-    // 관리자 화면이 "mp4 완료"에서 멈추지 않고 업로드 결과(링크/실패)까지 이어서 보여줄 수 있음.
-    const postRaw = await env.POSTS.get(`post:${slug}`);
-    const post = postRaw ? JSON.parse(postRaw) : null;
-    // [2026-08-30 19:52] 실패 이유 전달 — post의 videoError, 글이 삭제된 경우(오디오 검증 실패)엔 renderFail 기록에서
-    let failReason = post?.videoError || null;
-    if (!post?.video && !failReason) {
-      const failRaw = await env.POSTS.get(`renderFail:${slug}`);
-      if (failRaw) failReason = JSON.parse(failRaw).error;
-    }
-    return new Response(JSON.stringify({
-      status: post?.video ? 'done' : 'failed',
-      percent: post?.video ? 100 : 0,
-      error: failReason,
-      youtubeUrl: post?.youtubeUrl || null,
-      youtubeError: post?.youtubeError || null,
-      youtubeUploadPercent: post?.youtubeUploadPercent ?? null,
-      youtubeUploadSec: post?.youtubeUploadSec ?? null,
-      youtubeShortsUrl: post?.youtubeShortsUrl || null,
-      youtubeShortsUrls: post?.youtubeShortsUrls || null,
-    }), { headers: { 'Content-Type': 'application/json' } });
-  }
-  const job = JSON.parse(jobRaw);
-  if (!env.RELAY_URL || !env.RELAY_SECRET) {
-    return new Response(JSON.stringify({ status: 'processing', stage: '진행 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
-  }
-  try {
-    const res = await fetch(`${env.RELAY_URL}/render/status?jobId=${encodeURIComponent(job.jobId)}`, {
-      headers: { 'x-relay-secret': env.RELAY_SECRET },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.status === 404) {
-      // [2026-08-31] relay가 job을 잃어버림(재시작 등) — 너무 잦은 재제출을 막기 위해 마지막 제출로부터
-      // 15초는 지나야 여기서 재제출(빠른 폴링 중 중복 제출 방지, 그보다 짧은 간격은 1분 크론이 처리).
-      if (Date.now() - (job.startedAt || 0) > 15000) {
-        await resubmitLostRenderJob(job, `renderJob:${slug}`, env);
-      }
-      return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중(재제출 시도)', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
-    }
-    if (!res.ok) {
-      await res.text().catch(() => {});
-      return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
-    }
-    const data = await res.json();
-    // 릴레이가 done/failed라고 하면 여기서 바로 post에 반영 — 5분 크론까지 기다리게 하지 않음
-    let youtubeUrl = null;
-    let youtubeError = null;
-    let youtubeQuotaExceeded = false;
-    let youtubeUploadPercent = null;
-    let youtubeUploadSec = null;
-    let youtubeShortsUrl = null;
-    let youtubeShortsUrls = null;
-    let youtubeShortsErrors = null;
-    let youtubeShortsSkippedReason = null;
-    let youtubeQueuePosition = null;
-    if (data.status === 'done') {
-      await finalizeRenderDone({ ...job, durationSec: data.durationSec }, `renderJob:${slug}`, env, ctx);
-      // finalizeRenderDone 안의 유튜브 업로드는 ctx.waitUntil로 백그라운드 진행돼서 이 시점엔 보통 아직 안 끝남 —
-      // 그래도 혹시 바로 끝났으면 즉시 링크를 내려주고, 아니면 클라이언트가 계속 폴링하며 기다림.
-      const freshPostRaw = await env.POSTS.get(`post:${slug}`);
-      const freshPost = freshPostRaw ? JSON.parse(freshPostRaw) : null;
-      youtubeUrl = freshPost?.youtubeUrl || null;
-      youtubeError = freshPost?.youtubeError || null;
-      youtubeQuotaExceeded = !!freshPost?.youtubeQuotaExceeded;
-      youtubeUploadPercent = freshPost?.youtubeUploadPercent ?? null;
-      youtubeUploadSec = freshPost?.youtubeUploadSec ?? null;
-      youtubeShortsUrl = freshPost?.youtubeShortsUrl || null;
-      youtubeShortsUrls = freshPost?.youtubeShortsUrls || null;
-      youtubeShortsErrors = freshPost?.youtubeShortsErrors || null;
-      youtubeShortsSkippedReason = freshPost?.youtubeShortsSkippedReason || null;
-      if (youtubeQuotaExceeded || (youtubeShortsErrors || []).some((e) => e && e.includes('할당량'))) {
-        youtubeQueuePosition = await getYoutubeQueuePosition(slug, env); // [2026-08-31] 대기열 순번
-      }
-    } else if (data.status === 'failed') {
-      await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
-    }
-    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, youtubeUrl, youtubeError, youtubeQuotaExceeded, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl, youtubeShortsUrls, youtubeShortsErrors, youtubeShortsSkippedReason, youtubeQueuePosition }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (e) {
-    return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
-  }
-}
-
-async function handleRetryRender(request, env) {
-  // [2026-09-02 18:45] 실패한 렌더를 원본 이미지·오디오로 재시도
-  const form = await request.formData();
-  const slug = (form.get('slug') || '').toString();
-  if (!slug) return new Response('slug 필요', { status: 400 });
-  const postRaw = await env.POSTS.get(`post:${slug}`);
-  if (!postRaw) return new Response(null, { status: 302, headers: { Location: '/admin' } });
-  const post = JSON.parse(postRaw);
-  if (post.video || !post.images?.length) return new Response(null, { status: 302, headers: { Location: '/admin' } });
-  const existingJobRaw = await env.POSTS.get(`renderJob:${slug}`);
-  if (existingJobRaw) return new Response(null, { status: 302, headers: { Location: '/admin' } });
-  const outputKey = `${slug}.mp4`;
-  const shortKeys = [`${slug}-short.mp4`];
-  const render = await startRelayRender(post.images, post.audio, post.audioSegments, outputKey, shortKeys, post.captionWeights, post.captionBeats, post.captionFontKey, post.captionColor, env, post.highlightSegRange);
-  if (render.ok) {
-    post.videoError = null;
-    await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
-    await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
-      jobId: render.jobId, slug, r2Key: outputKey, shortKeys, startedAt: Date.now(),
+  // [2026-08-31 00:07] Health check — Worker가 주기적으로 폴링해서 relay 상태 확인 (자동 재시작 판단용)
+  if (req.url === "/health") {
+    const processingJobs = Array.from(renderJobs.values()).filter((j) => j.status === "processing");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      uptime: Math.round(process.uptime()),
+      timestamp: new Date().toISOString(),
+      status: processingJobs.length > 0 ? "rendering" : "idle",
+      processingJobCount: processingJobs.length,
+      totalJobsInMemory: renderJobs.size,
     }));
-  } else {
-    post.videoError = render.error;
-    await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
+    return;
   }
-  return new Response(null, { status: 302, headers: { Location: '/admin' } });
-}
 
-async function handleCancelGen(request, env) {
-  // [2026-09-02 18:45] 생성 중 취소 — 지금까지 쌓인 R2 미디어와 genJob 정리
-  const form = await request.formData();
-  const id = (form.get('id') || '').toString();
-  if (id) {
-    const raw = await env.POSTS.get(`genJob:${id}`);
-    if (raw) {
-      const job = JSON.parse(raw);
-      // [2026-09-02 20:45] job.images엔 이미 반영된 첨부 미디어도 있고(images 단계 이후) 아직 안 들어간
-      // 경우(start/audio 단계에서 취소)도 있어서, userMediaKeys도 같이 지워야 고아 파일이 안 남음
-      const toDelete = [...(job.images || []), ...(job.audioSegmentKeys || []), ...(job.userMediaKeys || [])];
-      if (job.audioKey) toDelete.push(job.audioKey);
-      if (toDelete.length && env.MEDIA) {
-        await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
-      }
-      await env.POSTS.delete(`genJob:${id}`);
-      // renderJob은 일부러 안 지움 — relay에 이미 제출됐다면 끝까지 돌게 두고,
-      // finalizeRenderDone의 고아청소 로직이 post 없는 걸 보고 결과물을 알아서 지운다
-      if (job.slug) {
-        const postRaw = await env.POSTS.get(`post:${job.slug}`);
-        if (postRaw) await deletePostCompletely(job.slug, env);
+  // [2026-08-31 00:33] Memory cleanup — 렌더링 전에 호출해서 오래된 작업 제거 + 가비지 컬렉션 강제 실행
+  if (req.url === "/cleanup" && req.method === "POST") {
+    const beforeJobCount = renderJobs.size;
+    const cutoff = Date.now() - 30 * 60 * 1000; // 30분 이상 된 완료/실패 작업만
+    let removedCount = 0;
+    for (const [id, job] of renderJobs) {
+      // 완료/실패된 작업 중 30분 이상 지난 것만 정리 (processing은 절대 안 건드림)
+      if (job.status !== "processing" && (job.completedAt || job.startedAt) < cutoff) {
+        renderJobs.delete(id);
+        removedCount++;
       }
     }
-  }
-  return new Response(null, { status: 302, headers: { Location: '/admin' } });
-}
-
-// [2026-09-02 20:45] 생성 시작 전에 사용자가 직접 첨부한 사진/동영상을 R2에 올려둠 — 실제 생성은 나중에
-// genJob이 만들어질 때 이 키 목록(userMediaKeys)을 넘겨받아 장면 맨 앞에 그대로 씀. 사진은 클라이언트에서
-// canvas로 리사이즈해서 보내지만(전송 용이), 동영상은 어차피 relay가 최종 렌더링 때 다시 인코딩하므로
-// 브라우저 단에서 변환하지 않고 원본 그대로 받음.
-const UPLOAD_MEDIA_MAX_FILES = 10; // 전체 장면이 20장이라 AI 생성분도 남겨둬야 함
-async function handleUploadMedia(request, env) {
-  if (!env.MEDIA) return new Response(JSON.stringify({ ok: false, error: 'MEDIA(R2) 바인딩 없음' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-  let form;
-  try {
-    form = await request.formData();
-  } catch (e) {
-    return new Response(JSON.stringify({ ok: false, error: '요청을 읽을 수 없음' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-  }
-  const files = form.getAll('files').filter((f) => f && typeof f === 'object' && typeof f.arrayBuffer === 'function');
-  if (!files.length) return new Response(JSON.stringify({ ok: false, error: '파일 없음' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-  if (files.length > UPLOAD_MEDIA_MAX_FILES) return new Response(JSON.stringify({ ok: false, error: `한 번에 최대 ${UPLOAD_MEDIA_MAX_FILES}개까지` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-
-  const uploaded = [];
-  for (const f of files) {
-    const type = f.type || '';
-    const isVideo = type.startsWith('video/');
-    if (!isVideo && !type.startsWith('image/')) continue; // 사진/동영상 외 파일 타입은 건너뜀
-    const buf = await f.arrayBuffer();
-    if (!buf || !buf.byteLength) continue;
-    const ext = isVideo ? 'mp4' : (type === 'image/png' ? 'png' : 'jpg');
-    const key = `upload-${crypto.randomUUID()}.${ext}`;
-    await env.MEDIA.put(key, buf, { httpMetadata: { contentType: type || (isVideo ? 'video/mp4' : 'image/jpeg') } });
-    uploaded.push({ key, isVideo, name: (f.name || '').slice(0, 60) });
-  }
-  if (!uploaded.length) return new Response(JSON.stringify({ ok: false, error: '올릴 수 있는 사진/동영상이 없음' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-  return new Response(JSON.stringify({ ok: true, files: uploaded }), { headers: { 'Content-Type': 'application/json' } });
-}
-
-async function handleGenerate(request, env) {
-  const form = await request.formData();
-  const topic = (form.get('topic') || '').toString().trim().slice(0, 100);
-  if (!topic) return new Response('주제를 입력해주세요', { status: 400 });
-
-  // 같은 주제로 최근에 이미 처리 중이거나 방금 만들어진 게 있으면 중복 생성 막음
-  // (진행 상황이 안 보여서 여러 번 누르는 경우가 많았음 — 서버가 대신 걸러줌)
-  const DUP_WINDOW_MS = 10 * 60 * 1000;
-  const pendingGenJobsRaw = await env.POSTS.list({ prefix: 'genJob:' });
-  for (const k of pendingGenJobsRaw.keys) {
-    const raw = await env.POSTS.get(k.name);
-    if (!raw) continue;
-    const job = JSON.parse(raw);
-    if (!job.failed && job.topic === topic && Date.now() - (job.startedAt || 0) < DUP_WINDOW_MS) {
-      const existingId = k.name.split(':')[1];
-      return new Response(null, { status: 302, headers: { Location: '/admin?genId=' + existingId + '&msg=' + encodeURIComponent(`"${topic}"은(는) 이미 처리 중이에요 — 아래에서 진행 상황 확인하세요`) } });
+    // Node.js 가비지 컬렉션 강제 실행 (--expose-gc 플래그가 필요)
+    if (global.gc) {
+      try {
+        global.gc();
+      } catch (e) {
+        // gc() 실패는 무시 (플래그 미설정 또는 에러)
+      }
     }
+    const memUsage = process.memoryUsage();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      cleaned: {
+        jobsRemoved: removedCount,
+        jobsRemainingInMemory: renderJobs.size,
+        beforeCount: beforeJobCount,
+      },
+      memory: {
+        heapUsedMb: Math.round(memUsage.heapUsed / 1024 / 1024),
+        heapTotalMb: Math.round(memUsage.heapTotal / 1024 / 1024),
+        rssMemMb: Math.round(memUsage.rss / 1024 / 1024),
+      },
+      timestamp: new Date().toISOString(),
+    }));
+    return;
   }
-  const idxRaw = await env.POSTS.get('index');
-  const idx = idxRaw ? JSON.parse(idxRaw) : [];
-  for (const slug of idx.slice(0, 5)) { // 최근 몇 개만 확인 — 너무 오래된 글까지 다 볼 필요 없음
-    const raw = await env.POSTS.get(`post:${slug}`);
-    if (!raw) continue;
-    const post = JSON.parse(raw);
-    if (post.topic === topic && Date.now() - new Date(post.createdAt).getTime() < DUP_WINDOW_MS) {
-      return new Response(null, { status: 302, headers: { Location: '/admin?msg=' + encodeURIComponent(`"${topic}"은(는) 방금 이미 만들어졌어요 — 목록에서 확인하세요`) } });
+
+  // 영상 렌더링 상태 조회
+  if (req.url.startsWith("/render/status")) {
+    const q = new URL(req.url, "http://localhost").searchParams;
+    const jobId = q.get("jobId");
+    const job = jobId ? renderJobs.get(jobId) : null;
+    if (!job) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "job not found" }));
+      return;
     }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, ...job }));
+    return;
   }
 
-  // [2026-09-02 20:45] 사용자가 미리 업로드해둔 첨부 미디어 키(JSON 문자열 배열) — 실제로 R2에 있는지
-  // head()로 확인해서 유령 키는 걸러냄(업로드 실패했는데 목록에만 남아있던 경우 등 방어)
-  let userMediaKeys = [];
-  try {
-    const raw = (form.get('userMediaKeys') || '').toString();
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) {
-      const candidates = parsed.filter((k) => typeof k === 'string' && k.startsWith('upload-')).slice(0, UPLOAD_MEDIA_MAX_FILES);
-      const checks = await Promise.all(candidates.map((k) => (env.MEDIA ? env.MEDIA.head(k).then((h) => (h ? k : null)).catch(() => null) : Promise.resolve(null))));
-      userMediaKeys = checks.filter(Boolean);
+  // SSE 스트리밍 - Worker가 이 연결을 열어두고 받는 대로 브라우저에 그대로 릴레이함.
+  // 연결 직후 현재 스냅샷을 1회 즉시 보내고, 이후엔 값이 바뀔 때마다(최대 200ms 간격) push.
+  if (req.url === "/realtime/stream") {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      "connection": "keep-alive",
+    });
+    const cond = realtimeCache.condition;
+    const initHistory = buildConditionHistory();
+    res.write(`data: ${JSON.stringify({
+      index: buildIndexPayload(),
+      stocks: realtimeCache.stock,
+      condition: { seq: cond.seq, name: cond.name, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history: initHistory },
+    })}\n\n`);
+    sseClients.add(res);
+    const keepAlive = setInterval(() => {
+      try { res.write(": ping\n\n"); } catch (e) { clearInterval(keepAlive); sseClients.delete(res); }
+    }, 20000); // 중간 프록시/타임아웃 방지용 주기적 코멘트 핑
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    });
+    return;
+  }
+
+  // 실시간 지수 조회 - 웹소켓으로 받아둔 최신값을 즉시 반환 (키움 TR 호출 없음)
+  // 지수+종목시세+조건검색을 한 번에 반환 - Worker가 이전엔 3개 엔드포인트를 따로 호출했는데,
+  // 다 relay 메모리에서 읽는 거라 굳이 나눌 이유가 없어서 하나로 합침 (Worker<->relay 왕복 3번 -> 1번)
+  if (req.url === "/realtime/all") {
+    const cond = realtimeCache.condition;
+    const history = buildConditionHistory();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        wsConnected: wsConnected,
+        wsLoggedIn: wsLoggedIn,
+        index: buildIndexPayload(),
+        stocks: relevantStocksPayload(),
+        condition: { seq: cond.seq, name: cond.name, codes: cond.codes, count: cond.codes.length, lastEventAt: cond.lastEventAt, history },
+      })
+    );
+    return;
+  }
+
+  if (req.url === "/realtime/index") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        wsConnected: wsConnected,
+        wsLoggedIn: wsLoggedIn,
+        ...buildIndexPayload(),
+      })
+    );
+    return;
+  }
+
+  // 실시간 종목 구독 목록 갱신 - Worker가 종목 목록을 보내면 그걸로 교체
+  // POST body: {"codes":[...], "listCodes":[...]}
+  //   codes     -> 관심종목 (그룹2)
+  //   listCodes -> 화면 리스트 종목 (그룹3)
+  if (req.url === "/realtime/subscribe" && req.method === "POST") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      let codes = [];
+      let listCodes = [];
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+        const valid = (arr) => (Array.isArray(arr) ? arr.filter((c) => /^[0-9A-Za-z]{6}$/.test(c)) : []);
+        codes = valid(parsed.codes).slice(0, WATCH_RESERVED); // 관심종목 우선
+        // 리스트는 총량에서 관심종목을 뺀 만큼만. 중복 종목은 제외(같은 종목 두 번 등록 방지)
+        const remain = Math.max(0, TOTAL_STOCK_LIMIT - codes.length);
+        listCodes = valid(parsed.listCodes)
+          .filter((c) => !codes.includes(c))
+          .slice(0, remain);
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid json" }));
+        return;
+      }
+
+      // 순서만 바뀐 경우는 재등록 불필요 - 정렬해서 내용이 실제로 달라졌을 때만 갱신
+      const sameSet = (a, b) => {
+        if (a.length !== b.length) return false;
+        const sa = [...a].sort(), sb = [...b].sort();
+        return sa.every((v, i) => v === sb[i]);
+      };
+      const changedWatch = !sameSet(codes, subscribedStocks);
+      const changedList = !sameSet(listCodes, subscribedListStocks);
+
+      subscribedStocks = codes;
+      subscribedListStocks = listCodes;
+
+      const canSend = ws && ws.readyState === WebSocket.OPEN && wsLoggedIn;
+      // 로그인 직후 3초는 registerSubscriptions()가 순차 전송 중이라, 여기서 끼어들면
+      // 조건검색(CNSRREQ) 응답을 못 받는 경우가 있어 잠시 미룸 (목록은 이미 저장됐으니 다음 요청 때 반영됨)
+      const settling = wsLoginAt && Date.now() - wsLoginAt < 3000;
+
+      if (canSend && !settling && changedWatch && codes.length) {
+        // refresh:"1"만으로는 기존 등록이 남아 누적되는 현상이 있어(200 초과 에러), 먼저 명시적으로 해제
+        ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "2" }));
+        ws.send(JSON.stringify({
+          trnm: "REG", grp_no: "2", refresh: "1",
+          data: [{ item: codes, type: ["0B"] }],
+        }));
+        console.log("관심종목 구독 갱신:", codes.length + "종목");
+      }
+      if (canSend && !settling && changedList && listCodes.length) {
+        ws.send(JSON.stringify({ trnm: "REMOVE", grp_no: "3" }));
+        ws.send(JSON.stringify({
+          trnm: "REG", grp_no: "3", refresh: "1",
+          data: [{ item: listCodes, type: ["0B"] }],
+        }));
+        console.log("리스트종목 구독 갱신:", listCodes.length + "종목");
+      }
+
+      // 세 그룹(관심종목/화면리스트/조건검색 실시간포착) 어디에도 없는 종목의 캐시만 정리
+      if (changedWatch || changedList) {
+        const keep = new Set([...codes, ...listCodes, ...realtimeCache.condition.codes]);
+        for (const cached of Object.keys(realtimeCache.stock)) {
+          if (!keep.has(cached)) delete realtimeCache.stock[cached];
+        }
+      }
+
+      // 로그인 직후라 미뤘던 경우, 안정화된 뒤 한 번 자동으로 등록해줌
+      if (canSend && settling && (changedWatch || changedList)) {
+        setTimeout(() => {
+          if (!ws || ws.readyState !== WebSocket.OPEN || !wsLoggedIn) return;
+          if (subscribedStocks.length) {
+            ws.send(JSON.stringify({
+              trnm: "REG", grp_no: "2", refresh: "1",
+              data: [{ item: subscribedStocks, type: ["0B"] }],
+            }));
+          }
+          if (subscribedListStocks.length) {
+            ws.send(JSON.stringify({
+              trnm: "REG", grp_no: "3", refresh: "1",
+              data: [{ item: subscribedListStocks, type: ["0B"] }],
+            }));
+          }
+          console.log("지연 구독 등록 완료 (관심 " + subscribedStocks.length + " / 리스트 " + subscribedListStocks.length + ")");
+        }, 3500);
+      }
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        subscribedWatch: subscribedStocks.length,
+        subscribedList: subscribedListStocks.length,
+      }));
+    });
+    return;
+  }
+
+  // 실시간 종목 시세 조회 - 웹소켓으로 받아둔 최신 체결값 반환
+  if (req.url === "/realtime/stocks") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        wsConnected: wsConnected,
+        wsLoggedIn: wsLoggedIn,
+        subscribed: subscribedStocks.length,
+        subscribedList: subscribedListStocks.length,
+        stocks: relevantStocksPayload(),
+      })
+    );
+    return;
+  }
+
+  // 조건검색 실시간 결과 조회 - 현재 조건을 만족하는 종목 목록 + 최근 편입/이탈 이벤트
+  if (req.url === "/realtime/condition") {
+    const cond = realtimeCache.condition;
+    const history = buildConditionHistory();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        wsConnected: wsConnected,
+        wsLoggedIn: wsLoggedIn,
+        seq: cond.seq,
+        name: cond.name,
+        codes: cond.codes,
+        count: cond.codes.length,
+        lastEventAt: cond.lastEventAt,
+        names: stockNameCache,
+        history: history,
+        events: cond.events.slice(0, 20),
+      })
+    );
+    return;
+  }
+
+  // 관심종목 현재가 즉시조회 - realtimeCache.stock에 값이 없는 종목(웹소켓 구독 전, 장마감 후
+  // 재시작 등)을 Worker가 요청하면 그 자리에서 키움 개별시세(ka10007)를 조회해서 바로 채워줌.
+  // 조회 결과는 realtimeCache.stock에도 반영해서 다음 요청부턴 캐시로 즉시 응답됨.
+  // 이미 최근(30초 이내) 조회한 값이 있으면 재조회하지 않고 그대로 반환 - /api/latest가 반복
+  // 호출될 때마다 매번 키움을 다시 두드리는 낭비 방지.
+  if (req.url.startsWith("/realtime/quote-now")) {
+    const q = new URL(req.url, "http://localhost").searchParams;
+    const code = q.get("code");
+    if (!code) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "code 누락" }));
+      return;
     }
-  } catch (e) {
-    userMediaKeys = [];
+    const existing = realtimeCache.stock[code];
+    if (existing && existing.updatedAt && Date.now() - new Date(existing.updatedAt).getTime() < 30000) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, price: existing.price, rate: existing.rate, volume: existing.volume || 0 }));
+      return;
+    }
+    (async () => {
+      try {
+        const token = await issueTokenCached();
+        const raw = await kiwoomQuoteRelay(code, token);
+        const parsed = parseKiwoomQuoteRelay(raw);
+        if (parsed.price > 0) {
+          realtimeCache.stock[code] = { ...parsed, cntrStr: 0, time: "", updatedAt: new Date().toISOString() };
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: parsed.price > 0, price: parsed.price, rate: parsed.rate, volume: parsed.volume }));
+      } catch (e) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    })();
+    return;
   }
 
-  // ctx.waitUntil()은 응답 보낸 뒤 최대 30초까지만 보장돼서, 전체 생성(몇십 초~1분 이상)엔 부족함 —
-  // 여기선 작업 "등록"만 하고, 실제 진행은 관리자 페이지가 /admin/generate-step을 반복 호출하며
-  // 한 단계씩(글쓰기/음성/이미지 1장씩/저장/렌더링등록) 진행시킴. 각 단계는 몇 초 안에 끝나서 시간제한에 안 걸림.
-  const jobId = crypto.randomUUID();
-  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, stage: 'start', percent: 0, startedAt: Date.now(), createdAt: Date.now(), userMediaKeys /* [2026-08-30 19:45] 생성 소요시간 측정용(startedAt은 스텝마다 갱신됨) */ }));
+  // 관심종목 미니차트(1분봉) 캐시 조회 - Worker의 /api/mini-candles가 이걸 우선 사용해서
+  // 매번 종목당 1.1초 순차조회하던 걸 즉시 응답으로 바꿈 (relay가 백그라운드로 미리 갱신해둠).
+  if (req.url.startsWith("/realtime/mini-candles")) {
+    const q = new URL(req.url, "http://localhost").searchParams;
+    const code = q.get("code");
+    const cached = code && miniCandleCache[code];
+    res.writeHead(200, { "content-type": "application/json" });
+    if (cached) {
+      res.end(JSON.stringify({ ok: true, candles: cached.candles, tradingDate: cached.tradingDate, updatedAt: cached.updatedAt }));
+    } else {
+      res.end(JSON.stringify({ ok: false, error: "캐시 없음(관심종목이 아니거나 아직 미갱신)" }));
+    }
+    return;
+  }
 
-  return new Response(null, { status: 302, headers: { Location: '/admin?genId=' + jobId + '&msg=' + encodeURIComponent(`생성 시작됨: ${topic} (진행률은 아래 목록에서 확인)`) } });
-}
+  // 관심종목 미니차트 전체 일괄조회 - Worker의 /api/latest가 페이지 로드 시 이걸 한 번에 받아가서
+  // 응답에 포함시킴. 종목별로 /api/mini-candles를 따로따로 부르던 왕복(브라우저<->Worker<->relay)을
+  // 아예 없애서 첫 로드 시 차트가 별도 요청 없이 즉시 뜨게 함(가장 빠른 경로).
+  if (req.url === "/realtime/mini-candles-all") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, cache: miniCandleCache }));
+    return;
+  }
 
-// 다른 워커(zerozistocks 등)가 프로그램적으로 영상 생성을 트리거하는 용도 — API 키 인증 필요.
-// 동기 응답으로 slug/url을 바로 돌려줌(글+이미지+음성까지는 동기 완료, mp4 렌더링만 백그라운드로 이어짐) —
-// 호출한 쪽은 이 url을 그 자리에서 바로 자기 콘텐츠에 링크로 박아 넣으면 됨.
-async function handleApiGenerate(request, env) {
-  if (!env.VIDEO_API_KEY) return new Response(JSON.stringify({ ok: false, error: 'VIDEO_API_KEY 미설정' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-  const key = request.headers.get('x-api-key');
-  if (key !== env.VIDEO_API_KEY) return new Response(JSON.stringify({ ok: false, error: 'unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+  // 웹소켓 상태 확인용 (헬스체크에서 씀)
+  if (req.url === "/realtime/status") {
+    const mem = process.memoryUsage();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        wsConnected: wsConnected,
+        wsLoggedIn: wsLoggedIn,
+        lastMessageAt: wsLastMessageAt ? new Date(wsLastMessageAt).toISOString() : null,
+        cachedIndexCount: Object.keys(realtimeCache.index).length,
+        subscribedStockCount: subscribedStocks.length,
+        subscribedListCount: subscribedListStocks.length,
+        cachedStockCount: Object.keys(realtimeCache.stock).length,
+        conditionSeq: realtimeCache.condition.seq,
+        conditionCount: realtimeCache.condition.codes.length,
+        sseClientCount: sseClients.size,
+        memoryRssMb: Math.round(mem.rss / 1024 / 1024),
+        memoryHeapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+        keepAliveSockets: {
+          kiwoom: Object.values(kiwoomAgent.sockets).reduce((s, a) => s + a.length, 0),
+          worker: Object.values(workerAgent.sockets).reduce((s, a) => s + a.length, 0),
+        },
+      })
+    );
+    return;
+  }
 
-  let body;
+  // 그 외는 기존대로 키움 REST로 그대로 중계
+  const chunks = [];
+  req.on("data", (chunk) => chunks.push(chunk));
+  req.on("end", () => {
+    const body = Buffer.concat(chunks);
+
+    const forwardHeaders = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (["content-type", "authorization", "cont-yn", "next-key", "api-id"].includes(key.toLowerCase())) {
+        forwardHeaders[key] = value;
+      }
+    }
+    if (body.length) forwardHeaders["content-length"] = Buffer.byteLength(body);
+
+    const upstreamReq = https.request(
+      {
+        hostname: KIWOOM_REAL_HOST,
+        path: req.url,
+        method: req.method,
+        agent: kiwoomAgent,
+        headers: forwardHeaders,
+      },
+      (upstreamRes) => {
+        res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+        upstreamRes.pipe(res);
+      }
+    );
+
+    upstreamReq.on("error", (err) => {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "중계서버 -> 키움 요청 실패: " + err.message }));
+    });
+
+    upstreamReq.end(body);
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`키움 중계서버 실행 중: 포트 ${PORT}`);
+});
+
+// [2026-08-31] Cloudflare Worker의 /admin/cron-tick을 20초마다 호출 — 1분 Cloudflare Cron보다 훨씬
+// 자주 폴링해서 관리자 탭을 안 열어놔도 생성/렌더/유튜브 재시도 단계가 빠르게 진행되게 함.
+// setTimeout으로 자기 자신을 재귀 예약(setInterval 대신) — 이전 호출이 안 끝났는데 다음 게 겹쳐서
+// 같은 작업을 두 번 동시에 건드리는 걸 막기 위함(호출이 20초보다 오래 걸리면 그만큼 다음 호출이 밀림).
+const WORKER_CRON_TICK_URL = 'https://videos.usb.kr/admin/cron-tick';
+const WORKER_CRON_TICK_INTERVAL_MS = 20000;
+async function scheduleWorkerCronTick() {
   try {
-    body = await request.json();
+    const res = await fetch(WORKER_CRON_TICK_URL, {
+      method: 'POST',
+      headers: { 'x-relay-secret': RELAY_SECRET },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) console.log(`[cron-tick] Worker 응답 실패: HTTP ${res.status}`);
   } catch (e) {
-    return new Response(JSON.stringify({ ok: false, error: 'invalid json' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    console.log(`[cron-tick] 호출 실패: ${e.message}`);
+  } finally {
+    setTimeout(scheduleWorkerCronTick, WORKER_CRON_TICK_INTERVAL_MS);
   }
-  const topic = (body.topic || '').toString().trim().slice(0, 100);
-  if (!topic) return new Response(JSON.stringify({ ok: false, error: 'topic 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-
-  const result = await generateAndSavePost(topic, env);
-  if (!result.ok) return new Response(JSON.stringify({ ok: false, error: result.reason }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-
-  return new Response(JSON.stringify({
-    ok: true,
-    slug: result.post.slug,
-    title: result.post.title,
-    url: `${SITE_ORIGIN}/${result.post.slug}`,
-  }), { headers: { 'Content-Type': 'application/json' } });
 }
-
-async function handleDelete(request, env) {
-  // [2026-09-02 18:45] deletePostCompletely로 교체 — 기존 코드는 KV만 지우고 R2 미디어를 안 지워서 고아 파일이 계속 쌓이던 버그
-  const form = await request.formData();
-  const slug = (form.get('slug') || '').toString();
-  if (slug) await deletePostCompletely(slug, env);
-  return new Response(null, { status: 302, headers: { Location: '/admin' } });
+if (RELAY_SECRET) {
+  setTimeout(scheduleWorkerCronTick, WORKER_CRON_TICK_INTERVAL_MS); // 시작 직후 한 텀 쉬고 첫 호출
+  console.log(`[cron-tick] ${WORKER_CRON_TICK_INTERVAL_MS / 1000}초 간격으로 Worker 폴링 시작 예정`);
+} else {
+  console.log('[cron-tick] RELAY_SECRET 없음 — Worker 폴링 루프 비활성화');
 }
