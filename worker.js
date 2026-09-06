@@ -1,7 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 16:35 (KST) — 관리자 페이지에 렌더링 중 relay 실시간 로그 패널 추가
- * (SSH+journalctl 없이도 진행 상황 상세 확인 가능) — /admin/render-progress 응답에 relay의
- * /render/status가 내려주는 logs 배열을 그대로 전달, 카드에 검정 로그창으로 표시
+ * 생성(마지막 작업): 2026-09-06 16:50 (KST) — 글 생성 과정(글쓰기/음성/장면/이미지/저장/렌더링요청)도
+ * 단계마다 실시간 로그를 남기도록 확장 — genJob에 logs 배열 추가(pushLog), 관리자 카드에 검정
+ * 로그창 표시(렌더링 로그와 동일한 방식)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2808,6 +2808,7 @@ async function renderAdminPage(env, requestUrl) {
       <div class="title">${escapeHtml(j.topic)}</div>
       <span class="gen-progress status-line" data-id="${j.id}" data-stale="${isStale ? '1' : '0'}">${label}</span>
       ${j.failed ? '' : `<div class="progress-track"><div class="progress-fill" style="width:${genOverallPercent(j.percent)}%"></div></div>`}
+      ${(j.logs && j.logs.length) ? `<pre class="gen-log" data-id="${j.id}" style="margin:6px 0 0;padding:6px 8px;background:#0b0b0b;color:#8f8;font-size:10px;line-height:1.4;max-height:90px;overflow-y:auto;border-radius:6px;white-space:pre-wrap;word-break:break-all;">${escapeHtml(j.logs.join('\n'))}</pre>` : `<pre class="gen-log" data-id="${j.id}" style="margin:6px 0 0;padding:6px 8px;background:#0b0b0b;color:#8f8;font-size:10px;line-height:1.4;max-height:90px;overflow-y:auto;border-radius:6px;white-space:pre-wrap;word-break:break-all;display:none;"></pre>`}
       <div class="actions">${cancelBtn}</div>
     </div>
   </div>`;
@@ -3054,6 +3055,13 @@ async function renderAdminPage(env, requestUrl) {
             .then(function(data){
               clearInterval(tickId);
               el.dataset.inflight = '0';
+              // [2026-09-06 16:50] 실시간 로그 패널 갱신
+              var logEl = card ? card.querySelector('.gen-log') : null;
+              if (logEl && Array.isArray(data.logs) && data.logs.length) {
+                logEl.style.display = 'block';
+                logEl.textContent = data.logs.join('\n');
+                logEl.scrollTop = logEl.scrollHeight;
+              }
               if (data.status === 'done') {
                 el.dataset.terminal = '1';
                 if (card) card.remove();
@@ -3255,6 +3263,14 @@ async function renderAdminPage(env, requestUrl) {
 
 // 생성 과정을 "한 단계씩" 잘게 쪼갠 상태머신 — 매 호출마다 딱 한 걸음만 진행하고 KV에 상태를 저장.
 // 각 단계가 몇 초 안에 끝나서 Workers/waitUntil 시간제한에 안 걸림. 관리자 페이지가 이걸 반복 호출해서 진행시킴.
+// [2026-09-06 16:50] 글 생성 과정 실시간 로그 — 관리자 페이지에서 바로 보여주기 위해 각 단계마다
+// 짧은 진행 기록을 job.logs에 쌓음(최근 40개만 유지, KV에 그대로 저장되므로 폴링할 때마다 같이 옴).
+function pushLog(job, msg) {
+  const logs = Array.isArray(job.logs) ? job.logs.slice(-39) : [];
+  logs.push(msg);
+  return logs;
+}
+
 async function runGenerationStep(job, env) {
   const topic = job.topic;
 
@@ -3275,6 +3291,7 @@ async function runGenerationStep(job, env) {
       segTexts: segments.map((s) => s.text), segSentences: segments.map((s) => s.sentences),
       ttsVoices: pickTtsVoices(), segDone: 0, audioSegmentKeys: [],
       stage: 'audio', percent: 15,
+      logs: pushLog(job, `📝 글쓰기 완료: "${article.title}" (${narrationText.length}자, 문장 ${segments.length}개${newsResults.length ? `, 뉴스 ${newsResults.length}건 참고` : ''})`),
     };
   }
 
@@ -3306,6 +3323,7 @@ async function runGenerationStep(job, env) {
       ...job, segDone, audioSegmentKeys: keys,
       stage: allDone ? 'audio-concat' : 'audio',
       percent: 15 + Math.round((segDone / (job.segTexts.length || 1)) * 13), // 15~28%
+      logs: pushLog(job, `🔊 음성 합성 ${segDone}/${job.segTexts.length} 완료`),
     };
   }
 
@@ -3325,7 +3343,10 @@ async function runGenerationStep(job, env) {
     const userMediaKeys = Array.isArray(job.userMediaKeys) ? job.userMediaKeys : [];
     const wantAiScenes = Math.max(0, SCENE_COUNT - userMediaKeys.length);
     const scenes = wantAiScenes ? await generateScenePrompts(topic, job.article.title, env, wantAiScenes, buildArticleDigestForScenes(job.article)) : [];
-    return { ...job, audioKey, audioError: null, scenes, sceneIndex: 0, images: userMediaKeys.slice(), stage: scenes.length ? 'images' : 'finalize', percent: 30 };
+    return {
+      ...job, audioKey, audioError: null, scenes, sceneIndex: 0, images: userMediaKeys.slice(), stage: scenes.length ? 'images' : 'finalize', percent: 30,
+      logs: pushLog(job, `🎬 장면 구상 완료: AI 장면 ${scenes.length}개${userMediaKeys.length ? ` + 첨부 미디어 ${userMediaKeys.length}개` : ''}`),
+    };
   }
 
   if (job.stage === 'images') {
@@ -3335,6 +3356,7 @@ async function runGenerationStep(job, env) {
     const scene = job.scenes[job.sceneIndex];
     const images = job.images.slice();
     let clipCount = job.clipCount || 0;
+    let resultKind = '실패(건너뜀)';
     if (scene) {
       const slotStart = clipCount * Math.max(1, Math.floor(job.scenes.length / CLIP_TARGET));
       const wantClip = clipCount < CLIP_TARGET && job.sceneIndex >= slotStart;
@@ -3347,6 +3369,7 @@ async function runGenerationStep(job, env) {
           images.push(key);
           clipCount++;
           stored = true;
+          resultKind = '실사 클립';
         }
       }
       if (!stored) {
@@ -3355,6 +3378,7 @@ async function runGenerationStep(job, env) {
           const key = `${job.slug}-scene-${images.length}.jpg`;
           await env.MEDIA.put(key, img, { httpMetadata: { contentType: 'image/jpeg' } });
           images.push(key);
+          resultKind = '이미지';
         }
       }
     }
@@ -3364,6 +3388,7 @@ async function runGenerationStep(job, env) {
       ...job, images, clipCount, sceneIndex: nextIndex,
       stage: done ? 'finalize' : 'images',
       percent: 30 + Math.round((nextIndex / job.scenes.length) * 45), // 30~75%
+      logs: pushLog(job, `🖼️ 장면 ${nextIndex}/${job.scenes.length}: ${resultKind}${scene?.keyword ? ` ("${scene.keyword}")` : ''}`),
     };
   }
 
@@ -3408,10 +3433,14 @@ async function runGenerationStep(job, env) {
     // 창이 여전히 이론상 남아있어서, finalize가 혹시 겹쳐 실행돼도 같은 slug가 index에 두 번 안 쌓이게 함
     if (!idx.includes(job.slug)) idx.unshift(job.slug);
     await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
-    return { ...job, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange, stage: 'render', percent: 90 };
+    return {
+      ...job, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange, stage: 'render', percent: 90,
+      logs: pushLog(job, `💾 글 저장 완료 — 이미지 ${job.images.length}장, 렌더링 대기열 등록 중`),
+    };
   }
 
   if (job.stage === 'render') {
+    let renderLogMsg = '⚠️ 렌더링 시작 조건 미충족(relay 미설정 또는 이미지 없음)';
     if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && job.images.length) {
       const outputKey = `${job.slug}.mp4`;
       // [2026-08-31 07:29] 3개→1개: 유튜브 일일 업로드 할당량(10,000유닛, 건당 1,600) 절약 위해 축소(사용자 요청)
@@ -3421,6 +3450,7 @@ async function runGenerationStep(job, env) {
         await env.POSTS.put(`renderJob:${job.slug}`, JSON.stringify({
           jobId: render.jobId, slug: job.slug, r2Key: outputKey, shortKeys, startedAt: Date.now(),
         }));
+        renderLogMsg = `🎞️ relay에 렌더링 요청 완료(jobId: ${render.jobId}) — 이후 진행률은 렌더링 카드에서 확인`;
       } else {
         const postRaw = await env.POSTS.get(`post:${job.slug}`);
         if (postRaw) {
@@ -3428,9 +3458,10 @@ async function runGenerationStep(job, env) {
           post.videoError = render.error;
           await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
         }
+        renderLogMsg = `❌ relay 렌더링 요청 실패: ${render.error || '알 수 없는 오류'}`;
       }
     }
-    return { ...job, stage: 'done', percent: 100 };
+    return { ...job, stage: 'done', percent: 100, logs: pushLog(job, renderLogMsg) };
   }
 
   if (job.stage === 'done') return job;
@@ -3461,7 +3492,7 @@ async function handleGenerateStep(request, env) {
   // [2026-09-02 20:21] 동시실행 방지 — 방금 다른 경로(1분 크론/relay tick)가 이 job을 잡았으면
   // 이번 호출은 아무것도 안 하고 현재 상태만 그대로 돌려줌(진행률 표시는 계속 자연스럽게 보임)
   if (job.lockedAt && Date.now() - job.lockedAt < GEN_JOB_LOCK_MS) {
-    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent, logs: job.logs || [] }), { headers: { 'Content-Type': 'application/json' } });
   }
   await env.POSTS.put(`genJob:${id}`, JSON.stringify({ ...job, lockedAt: Date.now() })).catch(() => {});
 
@@ -3474,6 +3505,7 @@ async function handleGenerateStep(request, env) {
       return new Response(JSON.stringify({
         status: 'done',
         slug: job.slug,
+        logs: job.logs || [],
         post: post ? {
           title: post.title, topic: post.topic, slug: post.slug,
           imageCount: post.images?.length || 0, audio: !!post.audio, audioError: post.audioError || null, usedNews: !!post.usedNews,
@@ -3483,7 +3515,7 @@ async function handleGenerateStep(request, env) {
     }
     job.startedAt = Date.now(); // 마지막 갱신 시각(멈춤 판정용)
     await env.POSTS.put(`genJob:${id}`, JSON.stringify(job));
-    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent, logs: job.logs || [] }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     await env.POSTS.put(`genJob:${id}`, JSON.stringify({ ...job, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() }));
     return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: e.message }), { headers: { 'Content-Type': 'application/json' } });
