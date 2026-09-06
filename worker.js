@@ -1,7 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-06 16:50 (KST) — 글 생성 과정(글쓰기/음성/장면/이미지/저장/렌더링요청)도
- * 단계마다 실시간 로그를 남기도록 확장 — genJob에 logs 배열 추가(pushLog), 관리자 카드에 검정
- * 로그창 표시(렌더링 로그와 동일한 방식)
+ * 생성(마지막 작업): 2026-09-06 17:00 (KST) — 관리자 페이지 진행바 폴링 주기 단축(렌더링 3초→1초,
+ * 생성 1.5초→1초) — 더 실시간처럼 느껴지게 함
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -3095,8 +3094,8 @@ async function renderAdminPage(env, requestUrl) {
       }
       pollRender();
       stepGen();
-      setInterval(pollRender, 3000);
-      setInterval(stepGen, 1500);
+      setInterval(pollRender, 1000);
+      setInterval(stepGen, 1000);
     })();
   </script>` : '';
 
