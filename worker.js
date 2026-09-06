@@ -1,9 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 20:15 (KST) — 진짜 원인 발견/수정: 자막이 "깨진다"던 게 사실은
- * ffmpeg 단독 테스트로 확인해보니 화면 폭(1280px) 넘는 줄이 그냥 프레임 밖으로 계속 그려져서 안
- * 보이는 것뿐이었음(폰트/인코딩 문제 아니었음). 예전에 "마지막 줄에 남은 단어 다 몰아넣기"로 고친
- * 게 재발 원인 — 그 몰아넣은 줄이 가끔 폭을 넘었음. maxLines 제한을 아예 없애고 줄당 글자수만
- * 지켜서 계속 줄바꿈하도록 wrapCaptionLines 재작성(세로로 길어질 순 있어도 가로 폭은 절대 안 넘침)
+ * 생성(마지막 작업): 2026-09-06 22:00 (KST) — 진짜 원인 발견/수정: relay.js가 파이썬(PIL)으로 자막을
+ * 그리는 방식으로 바뀐 뒤에도 자막이 네모(□)로 깨지는 게 남아있었던 이유 — fonttools로 실측 검사
+ * 해보니 songmyung/gaegu/cutefont/yeonsung/gugi/sunflower 6개 폰트가 완성형 한글 11,172자 중
+ * 2,350자(21%)만 담고 있었음. CAPTION_FONT_CHOICES에서 6개 제거, 100% 커버리지인 9개만 남김
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -56,26 +55,19 @@ const NARRATION_MAX_CHARS = 3300;
 const CAPTION_STYLE_COUNT = 5; // 자막 "위치" 종류 개수 — 웹(CSS)과 mp4(relay.js drawtext) 둘 다 같은 인덱스 규칙을 씀
 // 자막 위치/폰트/색 전부 영상 하나당 하나씩만 랜덤 고정(비트마다 안 바뀜 — 계속 바뀌면 산만해서 전부 고정으로 변경).
 // font key는 relay.js가 실제로 서버에 설치해둔 폰트 파일과 매칭되는 키만 사용(웹/mp4 폰트 일치 보장).
-// [2026-08-30 20:46] 두꺼운 폰트(도현/검은고딕) 제거 + 예쁜 폰트 4종 추가(고운바탕/송명/개구/하이멜로디)
-// 전부 구글폰트 무료(OFL). relay.js의 CAPTION_FONT_PATHS와 key가 일치해야 하고, VM에 TTF 설치 필요(미설치면 있는 폰트로 폴백).
+// [2026-09-06 22:00] 진짜 원인 발견/수정 — fonttools로 실측 검사한 결과, songmyung/gaegu/cutefont/
+// yeonsung/gugi/sunflower 6개가 완성형 한글 11,172자 중 2,350자(21%)만 담고 있었음(자주 쓰는
+// "울" 같은 흔한 글자도 빠져있어서 자막이 네모로 깨지던 진짜 원인). 커버리지 100%인 폰트만 남김.
 const CAPTION_FONT_CHOICES = [
   { key: 'gowun', css: "'Gowun Dodum','Noto Sans KR',sans-serif" },
   { key: 'nanumpen', css: "'Nanum Pen Script','Gowun Dodum',cursive" },
   { key: 'gowunbatang', css: "'Gowun Batang',serif" },
-  { key: 'songmyung', css: "'Song Myung',serif" },
-  { key: 'gaegu', css: "'Gaegu',cursive" },
   { key: 'himelody', css: "'Hi Melody',cursive" },
-  // [2026-08-30 22:02] 아기자기한 폰트 4종 추가(사용자 요청) — 전부 구글폰트 무료(OFL), relay 키와 일치
   { key: 'poorstory', css: "'Poor Story',cursive" },
   { key: 'gamjaflower', css: "'Gamja Flower',cursive" },
   { key: 'singleday', css: "'Single Day',cursive" },
-  { key: 'cutefont', css: "'Cute Font',cursive" },
-  // [2026-08-30 23:31] 예쁜 폰트 5종 추가(사용자 요청, 두꺼운 폰트 제외) — 전부 구글폰트 무료(OFL), relay 키와 일치
   { key: 'stylish', css: "'Stylish',sans-serif" },
-  { key: 'yeonsung', css: "'Yeon Sung',cursive" },
-  { key: 'gugi', css: "'Gugi',cursive" },
   { key: 'nanumbrush', css: "'Nanum Brush Script',cursive" },
-  { key: 'sunflower', css: "'Sunflower',sans-serif" }, // Light(300) 웨이트만 로드 — 얇고 깔끔
 ];
 const CAPTION_COLOR_CHOICES = ['#ffffff', '#FFD93D', '#FF6FA5', '#4FC3F7', '#6EE7B7', '#FFA94D', '#B197FC', '#FF8787'];
 function pickCaptionStyle() {
