@@ -1,7 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 03:30 (KST) — 유튜브 업로드 성공 시 R2의 mp4/숏츠를 삭제하도록 변경
- * (R2 용량 절약, 유튜브가 원본 보관소 역할) — 삭제 후엔 글 페이지에서 유튜브 임베드로, 관리자
- * 썸네일은 유튜브 썸네일 이미지로 자동 대체
+ * 생성(마지막 작업): 2026-09-06 04:00 (KST) — R2 삭제 시점 변경: 유튜브 업로드 성공 즉시 삭제하던 것을
+ * 큐에 등록해두고, 이후 폴링에서 유튜브 조회수가 2회 이상 확인된 뒤에 삭제하도록 변경(유튜브 처리
+ * 대기 중 어디서도 재생 안 되는 공백 방지). r2CleanupQueue/pollR2CleanupQueue 추가, runVideoPollTick에 등록
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -228,6 +228,7 @@ async function runVideoPollTick(env, ctx) {
   await pollYoutubeQuotaRetries(env); // [2026-08-31] 유튜브 할당량 초과로 막혔던 업로드, 리셋 시각 지나면 자동 재시도
   await pollPendingVideoJobs(env);
   await pollPendingRenderJobs(env, ctx);
+  await pollR2CleanupQueue(env); // [2026-09-06 04:00] 유튜브 조회수 2회 이상 확인되면 R2 mp4/숏츠 삭제
 }
 
 function escapeHtml(str) {
@@ -1291,6 +1292,77 @@ async function getYoutubeAccessToken(env) {
   return data.access_token;
 }
 
+// ---------- R2 정리 큐 — 작업: 2026-09-06 04:00 ----------
+// 유튜브 업로드가 성공해도 유튜브 쪽에서 처리(인코딩)가 끝나기 전까지는 실제로 재생이 안 될 수 있음.
+// 그 틈에 R2 원본까지 지워버리면 어디서도 재생 안 되는 공백이 생길 수 있어서, 업로드 성공 직후 바로
+// 지우지 않고 큐에 넣어둠 — 이후 폴링에서 유튜브 조회수가 실제로 2회 이상 찍힌 걸 확인한 뒤에야
+// (= 유튜브에서 정상 재생되고 있다는 증거) R2에서 지움.
+const R2_CLEANUP_QUEUE_KEY = 'r2CleanupQueue';
+const R2_CLEANUP_VIEW_THRESHOLD = 2;
+async function getR2CleanupQueue(env) {
+  const raw = await env.POSTS.get(R2_CLEANUP_QUEUE_KEY);
+  if (!raw) return [];
+  try {
+    const q = JSON.parse(raw);
+    return Array.isArray(q) ? q : [];
+  } catch {
+    return [];
+  }
+}
+async function saveR2CleanupQueue(items, env) {
+  await env.POSTS.put(R2_CLEANUP_QUEUE_KEY, JSON.stringify(items)).catch(() => {});
+}
+async function enqueueR2Cleanup(item, env) {
+  const queue = await getR2CleanupQueue(env);
+  queue.push(item);
+  await saveR2CleanupQueue(queue, env);
+}
+async function getYoutubeViewCount(videoId, env) {
+  try {
+    const accessToken = await getYoutubeAccessToken(env);
+    const res = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${encodeURIComponent(videoId)}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      await res.text().catch(() => {});
+      return null;
+    }
+    const data = await res.json();
+    const stats = data?.items?.[0]?.statistics;
+    return stats ? (parseInt(stats.viewCount, 10) || 0) : null;
+  } catch (e) {
+    console.log(`유튜브 조회수 확인 실패(${videoId}): ${e.message}`);
+    return null;
+  }
+}
+// 1분 크론(및 relay의 20초 cron-tick)이 호출 — 큐에 쌓인 항목마다 조회수를 확인해서 기준 넘으면 R2 삭제.
+async function pollR2CleanupQueue(env) {
+  const queue = await getR2CleanupQueue(env);
+  if (!queue.length) return;
+  const remaining = [];
+  for (const item of queue) {
+    const postRaw = await env.POSTS.get(`post:${item.slug}`);
+    if (!postRaw) continue; // 글 자체가 이미 삭제됨(R2도 그때 같이 정리됐을 것) — 큐에서도 그냥 제거
+    const viewCount = await getYoutubeViewCount(item.youtubeId, env);
+    if (viewCount != null && viewCount >= R2_CLEANUP_VIEW_THRESHOLD) {
+      await env.MEDIA.delete(item.r2Key).catch(() => {});
+      const post = JSON.parse(postRaw);
+      if (item.kind === 'main') {
+        post.videoDeletedFromR2 = true;
+      } else {
+        if (!Array.isArray(post.videoShortsDeletedFromR2)) post.videoShortsDeletedFromR2 = [];
+        post.videoShortsDeletedFromR2[item.idx] = true;
+      }
+      await env.POSTS.put(`post:${item.slug}`, JSON.stringify(post)).catch(() => {});
+      console.log(`[r2-cleanup] ${item.slug} ${item.kind} 조회수 ${viewCount}회 확인 — R2 삭제: ${item.r2Key}`);
+    } else {
+      remaining.push(item); // 아직 기준 미달(또는 조회 실패) — 다음 틱에 재확인
+    }
+  }
+  if (remaining.length !== queue.length) await saveR2CleanupQueue(remaining, env);
+}
+
 // YouTube Data API v3 resumable upload — 세션을 먼저 열고(POST) 실제 영상 바이트를 청크 단위로 PUT함.
 // 예전엔 한 번에 통째로 PUT했지만, 그러면 업로드 도중 진행률을 전혀 알 수 없어서(관리자 화면이 "업로드 중"에서
 // 멈춰있음) 8MiB씩 나눠 순차 PUT하고, 청크가 성공할 때마다 onProgress(percent)로 진행률을 알려줌.
@@ -1688,13 +1760,12 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
       freshPost.youtubeError = null;
       freshPost.youtubeQuotaExceeded = false;
       if (!post0.youtubeUrl) console.log(`[youtube:${slug}] 본편 업로드 성공: ${result.youtubeUrl}`);
-      // [2026-09-06 03:30] R2 용량 절약 — 유튜브 업로드 성공하면 mp4는 유튜브가 원본 보관소 역할을
-      // 하므로 R2에서 지움(사이트는 이제 유튜브 임베드로 재생). 큐 재시도 등으로 이 함수가 다시
-      // 불려도 이미 지웠으면(videoDeletedFromR2) 또 지우려 하지 않음.
-      if (!post0.videoDeletedFromR2 && r2Key) {
-        await env.MEDIA.delete(r2Key).catch(() => {});
-        freshPost.videoDeletedFromR2 = true;
-        console.log(`[youtube:${slug}] R2 mp4 삭제(유튜브가 원본 보관): ${r2Key}`);
+      // [2026-09-06 04:00] 유튜브 업로드 직후 바로 R2를 지우지 않음 — 유튜브 쪽 처리(인코딩)가 아직
+      // 안 끝났으면 그 사이엔 어디서도 재생이 안 되는 공백이 생길 수 있음. 대신 큐에 등록해서, 이후
+      // 폴링에서 실제로 조회수가 쌓인 걸 확인(=유튜브에서 정상 재생 중이라는 증거)한 뒤에 R2 삭제.
+      if (!post0.videoDeletedFromR2 && !post0.videoR2CleanupQueued && r2Key) {
+        await enqueueR2Cleanup({ slug, kind: 'main', youtubeId: result.youtubeId, r2Key }, env);
+        freshPost.videoR2CleanupQueued = true;
       }
     } else {
       mainStillBlocked = !!result.quotaExceeded;
@@ -1732,7 +1803,7 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
             const shortResult = await uploadVideoToYoutube(freshPost, shortBuffer, env, null, { shorts: true, partNo: si + 1, partTotal: allShortKeys.length });
             if (shortResult.ok) {
               console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 성공: ${shortResult.youtubeUrl}`);
-              return { index: si, ok: true, url: shortResult.youtubeUrl };
+              return { index: si, ok: true, url: shortResult.youtubeUrl, youtubeId: shortResult.youtubeId };
             }
             console.log(`[youtube:${slug}] 숏츠 ${si + 1} 업로드 실패${shortResult.quotaExceeded ? '(할당량 초과)' : ''}: ${shortResult.error}`);
             return { index: si, ok: false, error: shortResult.error, quotaExceeded: !!shortResult.quotaExceeded };
@@ -1744,8 +1815,8 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
         for (const r of results) {
           if (r.ok) {
             nextUrls[r.index] = r.url;
-            // [2026-09-06 03:30] R2 용량 절약 — 이 숏츠도 유튜브 업로드 성공했으니 R2에서 삭제
-            await env.MEDIA.delete(allShortKeys[r.index]).catch(() => {});
+            // [2026-09-06 04:00] 즉시삭제 대신 큐에 등록 — 조회수 2회 이상 확인되면 폴링에서 R2 삭제
+            await enqueueR2Cleanup({ slug, kind: 'short', idx: r.index, youtubeId: r.youtubeId, r2Key: allShortKeys[r.index] }, env);
           } else {
             nextErrors[r.index] = r.quotaExceeded ? '할당량 초과로 실패 — 대기열에서 차례가 되면 자동 재시도' : r.error;
             if (r.quotaExceeded) anyShortStillBlocked = true;
