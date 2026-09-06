@@ -1,8 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 03:00 (KST) — 진짜 원인 발견/수정: reeditForTtsPacing이 "5초 분량"
- * 지시를 잘못 해석해서 "오늘은." "운적석이." 처럼 단어 하나짜리 초단문으로 쪼개버렸음 — TTS가 한
- * 단어만 읽고 끊기고 자막도 그 짧은 조각만 뜨던 원인. 프롬프트에 최소 4어절 명시 + 결과 평균 문장
- * 길이가 15자 미만이면 재편집을 버리고 원문 사용하는 안전장치 추가
+ * 생성(마지막 작업): 2026-09-06 03:30 (KST) — 유튜브 업로드 성공 시 R2의 mp4/숏츠를 삭제하도록 변경
+ * (R2 용량 절약, 유튜브가 원본 보관소 역할) — 삭제 후엔 글 페이지에서 유튜브 임베드로, 관리자
+ * 썸네일은 유튜브 썸네일 이미지로 자동 대체
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1689,6 +1688,14 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
       freshPost.youtubeError = null;
       freshPost.youtubeQuotaExceeded = false;
       if (!post0.youtubeUrl) console.log(`[youtube:${slug}] 본편 업로드 성공: ${result.youtubeUrl}`);
+      // [2026-09-06 03:30] R2 용량 절약 — 유튜브 업로드 성공하면 mp4는 유튜브가 원본 보관소 역할을
+      // 하므로 R2에서 지움(사이트는 이제 유튜브 임베드로 재생). 큐 재시도 등으로 이 함수가 다시
+      // 불려도 이미 지웠으면(videoDeletedFromR2) 또 지우려 하지 않음.
+      if (!post0.videoDeletedFromR2 && r2Key) {
+        await env.MEDIA.delete(r2Key).catch(() => {});
+        freshPost.videoDeletedFromR2 = true;
+        console.log(`[youtube:${slug}] R2 mp4 삭제(유튜브가 원본 보관): ${r2Key}`);
+      }
     } else {
       mainStillBlocked = !!result.quotaExceeded;
       freshPost.youtubeErrorRaw = result.error;
@@ -1737,6 +1744,8 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
         for (const r of results) {
           if (r.ok) {
             nextUrls[r.index] = r.url;
+            // [2026-09-06 03:30] R2 용량 절약 — 이 숏츠도 유튜브 업로드 성공했으니 R2에서 삭제
+            await env.MEDIA.delete(allShortKeys[r.index]).catch(() => {});
           } else {
             nextErrors[r.index] = r.quotaExceeded ? '할당량 초과로 실패 — 대기열에서 차례가 되면 자동 재시도' : r.error;
             if (r.quotaExceeded) anyShortStillBlocked = true;
@@ -2573,12 +2582,22 @@ async function renderPostPage(env, slug) {
       : p.youtubeError
         ? `· ⚠️ 유튜브 업로드 실패(${escapeHtml(p.youtubeError.slice(0, 200))})`
         : `· 유튜브 업로드 중${typeof p.youtubeUploadPercent === 'number' ? ` ${p.youtubeUploadPercent}%` : '…'}`;
-  const veoVideoBlock = p.video
+  // [2026-09-06 03:30] R2에 mp4가 아직 있으면(유튜브 업로드 전) R2에서 직접 재생, 유튜브 업로드
+  // 성공 후 R2에서 지워졌으면(videoDeletedFromR2) 유튜브 임베드로 대체 재생.
+  const mainVideoInR2 = p.video && !p.videoDeletedFromR2;
+  const veoVideoBlock = mainVideoInR2
     ? `<div style="margin:20px 0;">
         <video controls preload="metadata" style="width:100%;border-radius:10px;background:#000;" src="/media/${p.video}"></video>
         <p class="mono" style="font-size:12px;color:var(--muted);margin-top:8px;">🎬 실제 영상 파일(mp4) <span id="yt-status" data-slug="${p.slug}">${youtubeStatusText}</span></p>
       </div>`
-    : '';
+    : p.youtubeId
+      ? `<div style="margin:20px 0;">
+          <div style="position:relative;padding-bottom:56.25%;height:0;overflow:hidden;border-radius:10px;background:#000;">
+            <iframe src="https://www.youtube.com/embed/${escapeHtml(p.youtubeId)}" style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;" allowfullscreen loading="lazy"></iframe>
+          </div>
+          <p class="mono" style="font-size:12px;color:var(--muted);margin-top:8px;">🎬 유튜브에서 재생 중 <span id="yt-status" data-slug="${p.slug}">${youtubeStatusText}</span></p>
+        </div>`
+      : '';
   // 관리자 페이지의 pollRender()와 같은 원리의 초경량 폴링 — 결과가 나올 때까지(또는 진행이 멈춰서 포기할 때까지)만 돎.
   const youtubePollScript = needsYoutubePoll ? `<script>
     (function(){
@@ -2792,11 +2811,14 @@ async function renderAdminPage(env, requestUrl) {
       progressPct = 0;
     }
 
-    const thumb = p.video
+    // [2026-09-06 03:30] R2 mp4가 지워졌으면(유튜브 업로드 성공 후) 유튜브 썸네일 이미지로 대체
+    const thumb = (p.video && !p.videoDeletedFromR2)
       ? `<video muted preload="metadata" src="/media/${p.video}#t=0.1"></video>`
-      : p.images?.[0]
-        ? (p.images[0].endsWith('.mp4') ? `<video muted preload="metadata" src="/media/${p.images[0]}#t=0.1"></video>` : `<img src="/media/${p.images[0]}" alt="">`)
-        : `<div class="placeholder">📄</div>`;
+      : p.youtubeId
+        ? `<img src="https://img.youtube.com/vi/${escapeHtml(p.youtubeId)}/hqdefault.jpg" alt="">`
+        : p.images?.[0]
+          ? (p.images[0].endsWith('.mp4') ? `<video muted preload="metadata" src="/media/${p.images[0]}#t=0.1"></video>` : `<img src="/media/${p.images[0]}" alt="">`)
+          : `<div class="placeholder">📄</div>`;
     const durBadge = p.videoDurationSec && p.video ? `<span class="dur-badge">${fmtDurSec(p.videoDurationSec)}${shortsCountNum ? ` · 🩳${shortsCountNum}` : ''}</span>` : '';
 
     const retryBtn = (!p.video && !isRendering && p.videoError) ? `<form method="POST" action="/admin/retry-render"><input type="hidden" name="slug" value="${escapeHtml(p.slug)}"><button type="submit">🔁재시도</button></form>` : '';
