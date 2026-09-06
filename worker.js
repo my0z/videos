@@ -1,6 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 17:00 (KST) — 관리자 페이지 진행바 폴링 주기 단축(렌더링 3초→1초,
- * 생성 1.5초→1초) — 더 실시간처럼 느껴지게 함
+ * 생성(마지막 작업): 2026-09-06 19:15 (KST) — 진짜 원인 발견/수정: /admin/generate-step 요청이 응답을
+ * 오래 못 받으면(네트워크/AI API 지연 등) data-inflight가 '1'로 계속 남아 다음 폴링이 전부 무시되고
+ * 새로고침 전까진 진행상황이 멈춘 것처럼 보였음 — 25초 제한시간(AbortController)을 걸어 오래 걸리면
+ * 포기하고 바로 다음 틱에 재시도되게 함. render-progress/generate-step 요청에 cache:'no-store'도 추가
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2961,7 +2963,7 @@ async function renderAdminPage(env, requestUrl) {
           var card = el.closest('.admin-card');
           // [2026-09-06 16:35] relay 실시간 로그 패널 — 데이터 오면 채우고 보이게 함
           var logEl = card ? card.querySelector('.render-log') : null;
-          fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
+          fetch('/admin/render-progress?slug=' + encodeURIComponent(slug), { cache: 'no-store' })
             .then(function(r){ return r.json(); })
             .then(function(data){
               if (logEl && Array.isArray(data.logs) && data.logs.length) {
@@ -3046,12 +3048,21 @@ async function renderAdminPage(env, requestUrl) {
           }, 500);
 
           var id = el.dataset.id;
+          // [2026-09-06 19:15] 버그 수정 — 이 요청이 응답을 오래 못 받으면(네트워크 문제, AI API 지연
+          // 등) data-inflight가 '1'로 계속 남아서 다음 폴링이 전부 무시되고, 새로고침 전까진 화면이
+          // 영원히 멈춰있는 것처럼 보였음. 25초 넘으면 강제로 포기하고 다음 틱에 바로 재시도되게
+          // AbortController로 제한시간을 걺.
+          var ctrl = new AbortController();
+          var timeoutId = setTimeout(function(){ ctrl.abort(); }, 25000);
           fetch('/admin/generate-step', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ id: id }),
+            signal: ctrl.signal,
+            cache: 'no-store',
           })
             .then(function(r){ return r.json(); })
             .then(function(data){
+              clearTimeout(timeoutId);
               clearInterval(tickId);
               el.dataset.inflight = '0';
               // [2026-09-06 16:50] 실시간 로그 패널 갱신
@@ -3087,6 +3098,7 @@ async function renderAdminPage(env, requestUrl) {
               setBar(card, (data.percent || 0) * 0.5);
             })
             .catch(function(){
+              clearTimeout(timeoutId);
               clearInterval(tickId);
               el.dataset.inflight = '0';
             });
