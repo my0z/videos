@@ -1,8 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-06 22:00 (KST) — 진짜 원인 발견/수정: relay.js가 파이썬(PIL)으로 자막을
- * 그리는 방식으로 바뀐 뒤에도 자막이 네모(□)로 깨지는 게 남아있었던 이유 — fonttools로 실측 검사
- * 해보니 songmyung/gaegu/cutefont/yeonsung/gugi/sunflower 6개 폰트가 완성형 한글 11,172자 중
- * 2,350자(21%)만 담고 있었음. CAPTION_FONT_CHOICES에서 6개 제거, 100% 커버리지인 9개만 남김
+ * 생성(마지막 작업): 2026-09-06 22:40 (KST) — 후보 폰트 8종 fonttools 실측 검사 결과 나눔명조·
+ * 나눔고딕코딩만 한글 100% 커버(나머지 6종은 20%대 탈락) — CAPTION_FONT_CHOICES에 2종 추가(총 11개)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -68,6 +66,9 @@ const CAPTION_FONT_CHOICES = [
   { key: 'singleday', css: "'Single Day',cursive" },
   { key: 'stylish', css: "'Stylish',sans-serif" },
   { key: 'nanumbrush', css: "'Nanum Brush Script',cursive" },
+  // [2026-09-06 22:40] fonttools 실측 검사로 100% 통과 확인된 폰트 2종 추가(relay.js CAPTION_FONT_PATHS 참고)
+  { key: 'nanummyeongjo', css: "'Nanum Myeongjo',serif" },
+  { key: 'nanumgothiccoding', css: "'Nanum Gothic Coding',monospace" },
 ];
 const CAPTION_COLOR_CHOICES = ['#ffffff', '#FFD93D', '#FF6FA5', '#4FC3F7', '#6EE7B7', '#FFA94D', '#B197FC', '#FF8787'];
 function pickCaptionStyle() {
