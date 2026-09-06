@@ -1,6 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-06 22:40 (KST) — 후보 폰트 8종 fonttools 실측 검사 결과 나눔명조·
- * 나눔고딕코딩만 한글 100% 커버(나머지 6종은 20%대 탈락) — CAPTION_FONT_CHOICES에 2종 추가(총 11개)
+ * 생성(마지막 작업): 2026-09-06 23:00 (KST) — 2차 후보 폰트 3종(Gothic A1, IBM Plex Sans KR, Nanum
+ * Gothic) fonttools 검사 전부 100% 통과 — CAPTION_FONT_CHOICES에 추가(총 14개 폰트, 전부 한글 완전 지원)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -69,6 +69,10 @@ const CAPTION_FONT_CHOICES = [
   // [2026-09-06 22:40] fonttools 실측 검사로 100% 통과 확인된 폰트 2종 추가(relay.js CAPTION_FONT_PATHS 참고)
   { key: 'nanummyeongjo', css: "'Nanum Myeongjo',serif" },
   { key: 'nanumgothiccoding', css: "'Nanum Gothic Coding',monospace" },
+  // [2026-09-06 23:00] 2차 후보 검사 통과 3종 추가(relay.js CAPTION_FONT_PATHS 참고)
+  { key: 'gothica1', css: "'Gothic A1',sans-serif" },
+  { key: 'ibmplexsanskr', css: "'IBM Plex Sans KR',sans-serif" },
+  { key: 'nanumgothic', css: "'Nanum Gothic',sans-serif" },
 ];
 const CAPTION_COLOR_CHOICES = ['#ffffff', '#FFD93D', '#FF6FA5', '#4FC3F7', '#6EE7B7', '#FFA94D', '#B197FC', '#FF8787'];
 function pickCaptionStyle() {
