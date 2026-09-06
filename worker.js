@@ -1,8 +1,9 @@
 /**
- * 생성(마지막 작업): 2026-09-06 11:35 (KST) — 진짜 원인 발견/수정: 나레이션이 짧은 영상(문장 수 <
- * 이미지 20장)에서 빈 이미지가 "이동"만으론 다 안 채워졌고, relay.js는 자막 빈 이미지가 하나라도
- * 있으면 세그먼트 실측 전체를 포기하고 추정 폴백으로 빠져서 자막이 겹치거나 잘려 보이던 원인.
- * 이동으로 못 채운 칸은 이웃 문장을 복사해서 항상 채우도록 splitTextIntoNChunks 보강
+ * 생성(마지막 작업): 2026-09-06 15:15 (KST) — 진짜 원인 발견/수정: 영상 순서와 나레이션이 안 맞던
+ * 문제 — splitTextIntoNChunks가 문장을 임계값으로 대충 나눈 뒤 빈 이미지를 앞쪽 큰 덩어리에서
+ * pop()으로 채우다 보니 항상 "뒤에서부터" 꺼내져서 뒤쪽 이미지일수록 순서가 뒤섞였음. 문장을 앞에서
+ * 부터만 순서대로 소비하는 방식으로 전면 재작성(테스트로 여러 문장수/이미지수 조합에서 순서 유지+
+ * 빈 이미지 없음 확인 완료)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2145,65 +2146,39 @@ function splitTextIntoNChunks(sentenceInfos, n) {
   if (n <= 0) return [];
   if (!sentences.length) return Array.from({ length: n }, () => ({ sentences: [], weight: 1 / n }));
 
-  const totalChars = sentences.reduce((sum, s) => sum + s.text.length, 0) || 1;
-  const target = totalChars / n;
-  const chunks = [];
-  let current = [];
-  let currentLen = 0;
-  for (const sentence of sentences) {
-    current.push(sentence);
-    currentLen += sentence.text.length;
-    if (currentLen >= target && chunks.length < n - 1) {
-      chunks.push(current);
-      current = [];
-      currentLen = 0;
+  // [2026-09-06 15:15] 진짜 원인 발견/수정 — 예전 방식(글자수 임계값으로 대충 나눈 뒤, 빈 칸을
+  // "이웃한테서 하나씩 이동/pop"으로 채우는 방식)은 문장이 이미지 수보다 어중간하게 많을 때
+  // (예: 문장 30개, 이미지 20장) 초반 임계값 계산이 문장을 한쪽에 몰아버리고 뒤쪽 이미지들이
+  // 무더기로 비었음. 그 빈 칸들을 채우려고 앞쪽 큰 덩어리에서 pop()으로 계속 꺼내다 보니 항상
+  // "뒤에서부터" 꺼내져서 뒤쪽 이미지일수록 문장 순서가 거꾸로 뒤섞였음(실제 증상: 영상 순서와
+  // 나레이션 내용이 하나도 안 맞음). 아래는 처음부터 순서를 흐트러뜨릴 수 없는 방식으로 재작성 —
+  // 문장을 앞에서부터 순서대로만 소비하고(idx는 항상 앞으로만 이동), 절대 뒤로 안 감.
+  const chunks = Array.from({ length: n }, () => []);
+  if (sentences.length >= n) {
+    // 문장이 이미지 수 이상 — 이미지마다 최소 1문장은 보장하면서 글자수 비례로 몇 개씩 가져갈지 조정.
+    // idx는 절대 되돌아가지 않으므로 순서가 원천적으로 안 깨짐.
+    const totalChars = sentences.reduce((sum, s) => sum + s.text.length, 0) || 1;
+    const target = totalChars / n;
+    let idx = 0;
+    for (let c = 0; c < n; c++) {
+      chunks[c].push(sentences[idx++]);
+      let charLen = chunks[c][0].text.length;
+      const remainingImages = n - c - 1; // 이 청크 뒤에 아직 채워야 할 이미지 수
+      // 목표 글자수에 도달할 때까지 계속 채우되, 뒤 이미지들 몫(최소 1개씩)은 항상 남겨둠
+      while (c < n - 1 && idx < sentences.length && charLen < target && (sentences.length - idx) > remainingImages) {
+        chunks[c].push(sentences[idx]);
+        charLen += sentences[idx].text.length;
+        idx++;
+      }
     }
-  }
-  if (current.length) chunks.push(current);
-  while (chunks.length < n) chunks.push([]);
-  if (chunks.length > n) {
-    const overflow = chunks.splice(n - 1).flat();
-    chunks.push(overflow);
-  }
-
-  // [2026-08-31] 실제 버그였음: 위 while(빈 배열 채우기)이나 문장 분포가 치우치는 경우, 어떤 이미지는
-  // 문장이 0개로 남을 수 있었음 — relay.js의 computeSegmentBeatTimeline은 문장 0개인 이미지가 하나라도
-  // 있으면 "폴백 모드"(부정확한 무음구간 추정)로 빠지는데, 이게 자막 씽크 드리프트의 원인이었고, 숏츠는
-  // 폴백 모드에선 segmentCount가 없어서 아예 생성 자체가 스킵됐음(본편만 만들어지던 원인).
-  // → 빈 청크가 있으면 문장이 2개 이상인 이웃(가까운 순서)한테서 하나씩 빌려와 반드시 채움.
-  // 이미지 수(n)보다 문장 수가 항상 훨씬 많으므로(현재 나레이션 기준 100문장 이상 vs 이미지 20장)
-  // 이 보정으로 빈 이미지를 완전히 없앨 수 있음.
-  for (let i = 0; i < chunks.length; i++) {
-    if (chunks[i].length > 0) continue;
-    let donorIdx = -1;
-    for (let d = 1; d < chunks.length; d++) {
-      const left = i - d, right = i + d;
-      if (left >= 0 && chunks[left].length > 1) { donorIdx = left; break; }
-      if (right < chunks.length && chunks[right].length > 1) { donorIdx = right; break; }
+    while (idx < sentences.length) chunks[n - 1].push(sentences[idx++]); // 혹시 남으면 마지막 이미지에 몰아줌
+  } else {
+    // 문장이 이미지 수보다 적음 — 각 이미지에 문장 하나씩 순서대로 이어붙이되, 문장이 모자라면
+    // "복사"(이동 아님)로 채움. 뒤로 갈수록 하나만 반복되지 않게 전체 구간에 고르게 펴서 복사함.
+    for (let c = 0; c < n; c++) {
+      const srcIdx = Math.min(Math.floor((c * sentences.length) / n), sentences.length - 1);
+      chunks[c] = [sentences[srcIdx]];
     }
-    if (donorIdx === -1) continue; // 이동으론 못 채움 — 아래 복사 단계에서 마저 채움
-    // 빌려주는 청크가 앞쪽이면 그 청크의 마지막 문장을(순서상 더 가까움), 뒤쪽이면 첫 문장을 넘겨줌
-    const donor = chunks[donorIdx];
-    chunks[i].push(donorIdx < i ? donor.pop() : donor.shift());
-  }
-
-  // [2026-09-06 11:35] 진짜 버그 수정 — 나레이션이 짧은 영상(문장 수 < 이미지 20장)에서는 위 "이동"
-  // 방식으로 다 채워지지 않는 이미지가 남았음(문장 2개 이상인 이웃이 하나도 없으면 donorIdx=-1로
-  // 그냥 비워뒀음). relay.js는 자막이 빈 이미지가 하나라도 있으면 세그먼트 실측 타이밍 전체를
-  // 포기하고 부정확한 추정 모드로 폴백하는데, 이게 항상 문장<이미지인 짧은 영상마다 자막이
-  // 겹치거나 잘려 보이던 원인이었음. 이동으로 못 채운 칸은 "복사"(이동이 아니라 복제)로 채움 —
-  // 이웃 이미지랑 같은 문장을 나눠서 보여주게 되지만(같은 자막을 두 이미지가 걸쳐서 표시), 실측
-  // 타이밍이 살아남아 겹침/잘림보다 훨씬 낫다.
-  for (let i = 0; i < chunks.length; i++) {
-    if (chunks[i].length > 0) continue;
-    let nearestIdx = -1;
-    for (let d = 1; d < chunks.length; d++) {
-      const left = i - d, right = i + d;
-      if (left >= 0 && chunks[left].length > 0) { nearestIdx = left; break; }
-      if (right < chunks.length && chunks[right].length > 0) { nearestIdx = right; break; }
-    }
-    if (nearestIdx === -1) continue; // 문장이 아예 0개(발화 없음) 등 극단적 경우만 — 사실상 발생 안 함
-    chunks[i] = [...chunks[nearestIdx]]; // 복사(이동 아님) — 이웃은 그대로 유지, 이 칸도 같은 문장으로 채움
   }
 
   // 문장이 끝날 때마다 TTS가 짧게 쉬는 시간(정지)이 있는데, 글자수만 세면 이게 빠져서
