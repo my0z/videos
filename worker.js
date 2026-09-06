@@ -1,9 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 15:15 (KST) — 진짜 원인 발견/수정: 영상 순서와 나레이션이 안 맞던
- * 문제 — splitTextIntoNChunks가 문장을 임계값으로 대충 나눈 뒤 빈 이미지를 앞쪽 큰 덩어리에서
- * pop()으로 채우다 보니 항상 "뒤에서부터" 꺼내져서 뒤쪽 이미지일수록 순서가 뒤섞였음. 문장을 앞에서
- * 부터만 순서대로 소비하는 방식으로 전면 재작성(테스트로 여러 문장수/이미지수 조합에서 순서 유지+
- * 빈 이미지 없음 확인 완료)
+ * 생성(마지막 작업): 2026-09-06 16:35 (KST) — 관리자 페이지에 렌더링 중 relay 실시간 로그 패널 추가
+ * (SSH+journalctl 없이도 진행 상황 상세 확인 가능) — /admin/render-progress 응답에 relay의
+ * /render/status가 내려주는 logs 배열을 그대로 전달, 카드에 검정 로그창으로 표시
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2901,6 +2899,7 @@ async function renderAdminPage(env, requestUrl) {
       <div class="topic">${escapeHtml(p.topic)}</div>
       <div class="status-line media-status">${mediaStatus}</div>
       <div class="status-line yt-status">${statusLine}</div>
+      ${isRendering ? `<pre class="render-log" data-slug="${escapeHtml(p.slug)}" style="margin:6px 0 0;padding:6px 8px;background:#0b0b0b;color:#8f8;font-size:10px;line-height:1.4;max-height:90px;overflow-y:auto;border-radius:6px;white-space:pre-wrap;word-break:break-all;display:none;"></pre>` : ''}
       ${(isPendingCard || isFailedCard) ? `<div class="progress-track"><div class="progress-fill" style="width:${progressPct}%"></div></div>` : ''}
       <div class="date">${new Date(p.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}</div>
       <div class="actions">
@@ -2943,6 +2942,7 @@ async function renderAdminPage(env, requestUrl) {
           '<div class="topic"></div>' +
           '<div class="status-line media-status">' + ((p.imageCount ? ('🖼️ ' + p.imageCount + '장') : '이미지 없음') + (p.audio ? ' · 🔊 음성' : (p.audioError ? ' · ⚠️ 음성실패' : ' · 🔇 음성없음')) + (p.usedNews ? ' · 📰 뉴스참고' : '')) + '</div>' +
           '<div class="status-line yt-status"><span class="render-progress" data-slug="' + p.slug + '">⏳ 렌더링 대기 중</span></div>' +
+          '<pre class="render-log" data-slug="' + p.slug + '" style="margin:6px 0 0;padding:6px 8px;background:#0b0b0b;color:#8f8;font-size:10px;line-height:1.4;max-height:90px;overflow-y:auto;border-radius:6px;white-space:pre-wrap;word-break:break-all;display:none;"></pre>' +
           '<div class="progress-track"><div class="progress-fill" style="width:50%"></div></div>' +
           '<div class="date"></div>' +
           '<div class="actions"><a href="/' + p.slug + '" target="_blank">보기</a>' +
@@ -2959,9 +2959,16 @@ async function renderAdminPage(env, requestUrl) {
           if (el.dataset.terminal === '1') return;
           var slug = el.dataset.slug;
           var card = el.closest('.admin-card');
+          // [2026-09-06 16:35] relay 실시간 로그 패널 — 데이터 오면 채우고 보이게 함
+          var logEl = card ? card.querySelector('.render-log') : null;
           fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
             .then(function(r){ return r.json(); })
             .then(function(data){
+              if (logEl && Array.isArray(data.logs) && data.logs.length) {
+                logEl.style.display = 'block';
+                logEl.textContent = data.logs.join('\n');
+                logEl.scrollTop = logEl.scrollHeight;
+              }
               if (data.status === 'done') {
                 var mediaEl = card ? card.querySelector('.media-status') : null;
                 if (mediaEl) mediaEl.textContent = '✅ mp4로 통합됨';
@@ -3567,7 +3574,7 @@ async function handleRenderProgress(request, env, ctx) {
     } else if (data.status === 'failed') {
       await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
     }
-    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, youtubeUrl, youtubeError, youtubeQuotaExceeded, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl, youtubeShortsUrls, youtubeShortsErrors, youtubeShortsSkippedReason, youtubeQueuePosition }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, logs: data?.logs || [], youtubeUrl, youtubeError, youtubeQuotaExceeded, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl, youtubeShortsUrls, youtubeShortsErrors, youtubeShortsSkippedReason, youtubeQueuePosition }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e) {
     return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
   }
