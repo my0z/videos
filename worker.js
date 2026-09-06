@@ -1,7 +1,6 @@
 /**
- * 생성(마지막 작업): 2026-09-06 02:10 (KST) — 웹 자막의 왼쪽아래/오른쪽아래 위치가 화면 폭 55%로
- * 갇혀있던 버그 수정(좁은 화면+커진 폰트에서 한 줄에 몇 글자만 보이고 나머지 잘리던 원인) — 폭 제한
- * 풀고 정렬만 유지
+ * 생성(마지막 작업): 2026-09-06 02:20 (KST) — "내가 쓸 수 있는 양" 표시 추가: 이번 달 아웃바운드
+ * 네트워크 누적량 / Oracle Always Free 한도(월 10TB) 대비 사용률(%) 함께 표시
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1445,16 +1444,16 @@ async function ociSignedRequest(env, method, url, bodyObj) {
 // 합계"가 1분마다 찍혀서 마지막 값 하나만 써도 실제보다 훨씬 크게 나왔음(네트워크가 200GB로 보이던 원인).
 // [1m] 구간으로 바꿔서 분당 값들을 받은 뒤, CPU는 평균(mean of means)·네트워크는 합계(총 전송량)로
 // 직접 집계함 — 이래야 진짜 "최근 1시간" 수치가 됨.
-async function fetchOciMetricSeries(env, mql) {
+async function fetchOciMetricSeries(env, mql, startTime, endTime, resolution = '1m') {
   try {
     const region = env.OCI_REGION;
     const url = `https://telemetry.${region}.oraclecloud.com/20180401/metrics/actions/summarizeMetricsData?compartmentId=${encodeURIComponent(env.OCI_TENANCY_OCID)}`;
     const res = await ociSignedRequest(env, 'POST', url, {
       namespace: 'oci_computeagent',
       query: mql,
-      resolution: '1m',
-      startTime: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
-      endTime: new Date().toISOString(),
+      resolution,
+      startTime: (startTime || new Date(Date.now() - 60 * 60 * 1000)).toISOString(),
+      endTime: (endTime || new Date()).toISOString(),
     });
     if (!res.ok) {
       await res.text().catch(() => {});
@@ -1476,10 +1475,16 @@ async function getOracleVmStats(env) {
   }
   try {
     const filter = `{resourceId = "${env.OCI_INSTANCE_OCID}"}`;
-    const [cpuPoints, netInPoints, netOutPoints] = await Promise.all([
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)); // 이번 달 1일 00:00 UTC
+    const [cpuPoints, netInPoints, netOutPoints, monthNetOutPoints] = await Promise.all([
       fetchOciMetricSeries(env, `CpuUtilization[1m]${filter}.mean()`),
       fetchOciMetricSeries(env, `NetworksBytesIn[1m]${filter}.mean()`),
       fetchOciMetricSeries(env, `NetworksBytesOut[1m]${filter}.mean()`),
+      // [2026-09-06 02:20] "내가 쓸 수 있는 양" — Oracle Free Tier에서 실제로 한도가 있는 건
+      // 아웃바운드(외부로 나가는) 네트워크뿐(월 10TB, 넘으면 과금). 컴퓨트/스토리지는 이 VM 스펙
+      // 안에서는 원래 무료라 별도 한도 표시가 의미 없어서 제외. 한 달치라 데이터가 많아 1시간 해상도로 조회.
+      fetchOciMetricSeries(env, `NetworksBytesOut[1h]${filter}.mean()`, monthStart, now, '1h'),
     ]);
     const avgOf = (pts) => (pts && pts.length ? pts.reduce((a, b) => a + b.value, 0) / pts.length : null);
     // [2026-09-06 01:30] NetworksBytesIn/Out은 분당 전송량이 아니라 부팅 이후 계속 늘어나는 누적
@@ -1493,10 +1498,14 @@ async function getOracleVmStats(env) {
     const cpu = avgOf(cpuPoints); // CPU는 분당 평균들의 평균 — 지난 1시간 평균 사용률
     const netIn = deltaOf(netInPoints);
     const netOut = deltaOf(netOutPoints);
+    const monthNetOut = deltaOf(monthNetOutPoints);
+    const FREE_EGRESS_LIMIT_GB = 10 * 1024; // Oracle Always Free 아웃바운드 한도: 월 10TB
     return {
       cpuPercent: typeof cpu === 'number' ? Math.round(cpu * 10) / 10 : null,
       netInMb: typeof netIn === 'number' ? Math.round((netIn / 1024 / 1024) * 10) / 10 : null,
       netOutMb: typeof netOut === 'number' ? Math.round((netOut / 1024 / 1024) * 10) / 10 : null,
+      monthNetOutGb: typeof monthNetOut === 'number' ? Math.round((monthNetOut / 1024 / 1024 / 1024) * 100) / 100 : null,
+      egressLimitGb: FREE_EGRESS_LIMIT_GB,
     };
   } catch (e) {
     console.log(`Oracle VM 사용량 조회 실패: ${e.message}`);
@@ -2972,8 +2981,9 @@ async function renderAdminPage(env, requestUrl) {
     })();
   </script>` : '';
 
+  const monthUsagePctText = (v) => (oracleStats?.monthNetOutGb != null && oracleStats?.egressLimitGb) ? ` · 📊 이번달 아웃바운드 ${oracleStats.monthNetOutGb}GB / ${(oracleStats.egressLimitGb / 1024)}TB(무료한도 ${Math.round((oracleStats.monthNetOutGb / oracleStats.egressLimitGb) * 1000) / 10}% 사용)` : '';
   const oracleStatsBar = `<div class="mono" id="oracle-stats-bar" style="font-size:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;margin-bottom:12px;${oracleStats ? '' : 'display:none;'}">
-    🖥️ Oracle VM 최근 1시간 — CPU 평균 ${oracleStats?.cpuPercent ?? '—'}%${oracleStats?.netInMb != null ? ` · 📥 ${oracleStats.netInMb}MB` : ''}${oracleStats?.netOutMb != null ? ` · 📤 ${oracleStats.netOutMb}MB` : ''} · 💰 Always Free 사용 중($0)
+    🖥️ Oracle VM 최근 1시간 — CPU 평균 ${oracleStats?.cpuPercent ?? '—'}%${oracleStats?.netInMb != null ? ` · 📥 ${oracleStats.netInMb}MB` : ''}${oracleStats?.netOutMb != null ? ` · 📤 ${oracleStats.netOutMb}MB` : ''}${monthUsagePctText()} · 💰 Always Free 사용 중($0)
   </div>
   <script>
     // [2026-09-06 02:00] 30초마다 갱신 — OCI 메트릭은 1분 해상도라 이보다 더 자주 갱신해도 의미 없음
@@ -2984,9 +2994,16 @@ async function renderAdminPage(env, requestUrl) {
         fetch('/admin/oracle-stats').then(function(r){ return r.json(); }).then(function(s){
           if (!s || s.cpuPercent === undefined) return; // 시크릿 미설정 등 — 조용히 무시
           bar.style.display = '';
+          // [2026-09-06 02:20] 이번 달 아웃바운드 사용량 / 무료 한도(10TB) — "내가 쓸 수 있는 양" 표시
+          var monthText = '';
+          if (s.monthNetOutGb != null && s.egressLimitGb) {
+            var pct = Math.round((s.monthNetOutGb / s.egressLimitGb) * 1000) / 10;
+            monthText = ' · 📊 이번달 아웃바운드 ' + s.monthNetOutGb + 'GB / ' + (s.egressLimitGb / 1024) + 'TB(무료한도 ' + pct + '% 사용)';
+          }
           bar.textContent = '🖥️ Oracle VM 최근 1시간 — CPU 평균 ' + (s.cpuPercent ?? '—') + '%'
             + (s.netInMb != null ? ' · 📥 ' + s.netInMb + 'MB' : '')
             + (s.netOutMb != null ? ' · 📤 ' + s.netOutMb + 'MB' : '')
+            + monthText
             + ' · 💰 Always Free 사용 중($0)';
         }).catch(function(){});
       }
