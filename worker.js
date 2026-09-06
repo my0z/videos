@@ -1,8 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 23:15 (KST) — TTS 발음 정정 추가: "42.195km"처럼 소수+단위 표기를
- * 그냥 보내면 TTS가 소수점 뒤를 하나의 수로 잘못 읽는 문제(마라톤 "사십이점백구십오케이엠") — 소수점
- * 뒤는 숫자를 하나씩 읽도록(일구오) 미리 한글 발음으로 변환하는 normalizeNumbersForTts 추가,
- * normalizeNarrationSpacing 안에서 자동 적용됨(테스트로 정상 변환 확인 완료)
+ * 생성(마지막 작업): 2026-09-06 23:30 (KST) — 진행 메시지가 새로고침해야만 갱신되던 문제 — 클라이언트
+ * cache:'no-store'는 브라우저 로컬 캐시만 막고 Cloudflare 엣지 캐시는 못 막음. /admin/render-progress,
+ * /admin/generate-step, 관리자 페이지 자체(refreshAdminList가 다시 fetch하는 대상) 응답에 전부
+ * Cache-Control: no-store 헤더를 직접 실어서 엣지에서 캐싱될 가능성 자체를 차단
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -3314,7 +3314,7 @@ async function renderAdminPage(env, requestUrl) {
     }
   </script>${progressScript}`;
 
-  return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
 }
 
 // 생성 과정을 "한 단계씩" 잘게 쪼갠 상태머신 — 매 호출마다 딱 한 걸음만 진행하고 KV에 상태를 저장.
@@ -3532,23 +3532,23 @@ async function handleGenerateStep(request, env) {
   try {
     body = await request.json();
   } catch (e) {
-    return new Response(JSON.stringify({ error: 'invalid json' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ error: 'invalid json' }), { status: 400, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   }
   const id = body.id;
-  if (!id) return new Response(JSON.stringify({ error: 'id 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  if (!id) return new Response(JSON.stringify({ error: 'id 필요' }), { status: 400, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
 
   const raw = await env.POSTS.get(`genJob:${id}`);
-  if (!raw) return new Response(JSON.stringify({ status: 'not_found' }), { headers: { 'Content-Type': 'application/json' } });
+  if (!raw) return new Response(JSON.stringify({ status: 'not_found' }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   let job = JSON.parse(raw);
 
   if (job.failed) {
-    return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: job.error }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: job.error }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   }
 
   // [2026-09-02 20:21] 동시실행 방지 — 방금 다른 경로(1분 크론/relay tick)가 이 job을 잡았으면
   // 이번 호출은 아무것도 안 하고 현재 상태만 그대로 돌려줌(진행률 표시는 계속 자연스럽게 보임)
   if (job.lockedAt && Date.now() - job.lockedAt < GEN_JOB_LOCK_MS) {
-    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent, logs: job.logs || [] }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent, logs: job.logs || [] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   }
   await env.POSTS.put(`genJob:${id}`, JSON.stringify({ ...job, lockedAt: Date.now() })).catch(() => {});
 
@@ -3567,21 +3567,21 @@ async function handleGenerateStep(request, env) {
           imageCount: post.images?.length || 0, audio: !!post.audio, audioError: post.audioError || null, usedNews: !!post.usedNews,
           createdAtText: new Date(post.createdAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }),
         } : null,
-      }), { headers: { 'Content-Type': 'application/json' } });
+      }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
     }
     job.startedAt = Date.now(); // 마지막 갱신 시각(멈춤 판정용)
     await env.POSTS.put(`genJob:${id}`, JSON.stringify(job));
-    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent, logs: job.logs || [] }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent, logs: job.logs || [] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   } catch (e) {
     await env.POSTS.put(`genJob:${id}`, JSON.stringify({ ...job, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() }));
-    return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: e.message }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: e.message }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   }
 }
 
 async function handleRenderProgress(request, env, ctx) {
   const url = new URL(request.url);
   const slug = url.searchParams.get('slug');
-  if (!slug) return new Response(JSON.stringify({ error: 'slug 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  if (!slug) return new Response(JSON.stringify({ error: 'slug 필요' }), { status: 400, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
 
   const jobRaw = await env.POSTS.get(`renderJob:${slug}`);
   if (!jobRaw) {
@@ -3606,11 +3606,11 @@ async function handleRenderProgress(request, env, ctx) {
       youtubeUploadSec: post?.youtubeUploadSec ?? null,
       youtubeShortsUrl: post?.youtubeShortsUrl || null,
       youtubeShortsUrls: post?.youtubeShortsUrls || null,
-    }), { headers: { 'Content-Type': 'application/json' } });
+    }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   }
   const job = JSON.parse(jobRaw);
   if (!env.RELAY_URL || !env.RELAY_SECRET) {
-    return new Response(JSON.stringify({ status: 'processing', stage: '진행 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: 'processing', stage: '진행 중', percent: 0 }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   }
   try {
     const res = await fetch(`${env.RELAY_URL}/render/status?jobId=${encodeURIComponent(job.jobId)}`, {
@@ -3623,11 +3623,11 @@ async function handleRenderProgress(request, env, ctx) {
       if (Date.now() - (job.startedAt || 0) > 15000) {
         await resubmitLostRenderJob(job, `renderJob:${slug}`, env);
       }
-      return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중(재제출 시도)', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중(재제출 시도)', percent: 0 }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
     }
     if (!res.ok) {
       await res.text().catch(() => {});
-      return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
     }
     const data = await res.json();
     // 릴레이가 done/failed라고 하면 여기서 바로 post에 반영 — 5분 크론까지 기다리게 하지 않음
@@ -3662,9 +3662,9 @@ async function handleRenderProgress(request, env, ctx) {
     } else if (data.status === 'failed') {
       await finalizeRenderFailed(job, `renderJob:${slug}`, data?.error || '알 수 없는 오류', env);
     }
-    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, logs: data?.logs || [], youtubeUrl, youtubeError, youtubeQuotaExceeded, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl, youtubeShortsUrls, youtubeShortsErrors, youtubeShortsSkippedReason, youtubeQueuePosition }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent, error: data?.error || null, logs: data?.logs || [], youtubeUrl, youtubeError, youtubeQuotaExceeded, youtubeUploadPercent, youtubeUploadSec, youtubeShortsUrl, youtubeShortsUrls, youtubeShortsErrors, youtubeShortsSkippedReason, youtubeQueuePosition }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   } catch (e) {
-    return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   }
 }
 
