@@ -1,6 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 23:00 (KST) — 2차 후보 폰트 3종(Gothic A1, IBM Plex Sans KR, Nanum
- * Gothic) fonttools 검사 전부 100% 통과 — CAPTION_FONT_CHOICES에 추가(총 14개 폰트, 전부 한글 완전 지원)
+ * 생성(마지막 작업): 2026-09-06 23:15 (KST) — TTS 발음 정정 추가: "42.195km"처럼 소수+단위 표기를
+ * 그냥 보내면 TTS가 소수점 뒤를 하나의 수로 잘못 읽는 문제(마라톤 "사십이점백구십오케이엠") — 소수점
+ * 뒤는 숫자를 하나씩 읽도록(일구오) 미리 한글 발음으로 변환하는 normalizeNumbersForTts 추가,
+ * normalizeNarrationSpacing 안에서 자동 적용됨(테스트로 정상 변환 확인 완료)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1068,8 +1070,56 @@ function trimNarrationToSentence(text, maxChars) {
 // 강제 보정함. 마침표·물음표·느낌표·쉼표 뒤에 공백이 없으면 넣어주고, 문장부호 앞에 붙은 불필요한 공백은
 // 제거해서 리듬이 자연스럽게 유지되게 함. 이 정규화는 자막 표시 문장과도 100% 동일 텍스트에 적용되므로
 // 자막-음성 매칭에는 영향 없음(양쪽 다 같은 결과를 봄).
+// [2026-09-06 23:15] TTS 발음 정정 — "42.195km" 같은 소수+단위 표기를 그냥 보내면 TTS가 소수점 뒤
+// "195"를 하나의 수(백구십오)로 읽어버림(마라톤 "사십이점백구십오케이엠"). 원래는 소수점 뒤는 숫자를
+// 하나씩(일구오) 읽어야 맞음. TTS에 보내기 전에 미리 올바른 한글 발음 문자열로 바꿔줌.
+const SINO_DIGITS = ['', '일', '이', '삼', '사', '오', '육', '칠', '팔', '구'];
+const SINO_UNITS_SMALL = ['', '십', '백', '천'];
+const SINO_UNITS_BIG = ['', '만', '억', '조'];
+function sinoKoreanNumber(n) {
+  if (n === 0) return '영';
+  const groups = [];
+  let num = n;
+  while (num > 0) {
+    groups.push(num % 10000);
+    num = Math.floor(num / 10000);
+  }
+  let result = '';
+  for (let i = groups.length - 1; i >= 0; i--) {
+    const g = groups[i];
+    if (g === 0) continue;
+    let groupStr = '';
+    const digits = [Math.floor(g / 1000) % 10, Math.floor(g / 100) % 10, Math.floor(g / 10) % 10, g % 10];
+    for (let d = 0; d < 4; d++) {
+      const digit = digits[d];
+      if (digit === 0) continue;
+      // 십/백/천 자리의 "1"은 보통 생략해서 읽음(100=백, 일백 아님) — 단 만 단위(그룹) 자체가 1이면 자릿수 규칙과 무관하게 나중에 그냥 "만"으로 처리됨
+      const digitStr = (digit === 1 && d < 3) ? '' : SINO_DIGITS[digit];
+      groupStr += digitStr + SINO_UNITS_SMALL[3 - d];
+    }
+    result += groupStr + SINO_UNITS_BIG[i];
+  }
+  return result;
+}
+function decimalDigitsToKorean(decStr) {
+  return decStr.split('').map((d) => SINO_DIGITS[parseInt(d, 10)] || '영').join('');
+}
+const TTS_UNIT_KOREAN = {
+  km: '킬로미터', kg: '킬로그램', cm: '센티미터', mm: '밀리미터', m: '미터', g: '그램',
+  kcal: '킬로칼로리', cal: '칼로리', mah: '밀리암페어시', l: '리터', ml: '밀리리터',
+  '%': '퍼센트', '℃': '도',
+};
+function normalizeNumbersForTts(text) {
+  return (text || '').replace(/(\d+)\.(\d+)\s*(km|kg|cm|mm|kcal|mah|ml|cal|[a-zA-Z%℃]{1,4})?/gi, (match, intPart, decPart, unit) => {
+    const intKr = sinoKoreanNumber(parseInt(intPart, 10));
+    const decKr = decimalDigitsToKorean(decPart);
+    const unitKr = unit ? (TTS_UNIT_KOREAN[unit.toLowerCase()] || TTS_UNIT_KOREAN[unit] || unit) : '';
+    return `${intKr}점${decKr}${unitKr}`;
+  });
+}
+
 function normalizeNarrationSpacing(text) {
-  return (text || '')
+  return normalizeNumbersForTts(text || '')
     .replace(/\s+([.!?,])/g, '$1') // 문장부호 앞의 공백 제거(". " 처럼 앞에 붙어있던 경우)
     .replace(/([.!?,])(?=\S)/g, '$1 ') // 문장부호 뒤에 공백이 없으면 하나 넣음(붙여 읽기 방지의 핵심)
     .replace(/\s+/g, ' ')
