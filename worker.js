@@ -1,7 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 04:00 (KST) — R2 삭제 시점 변경: 유튜브 업로드 성공 즉시 삭제하던 것을
- * 큐에 등록해두고, 이후 폴링에서 유튜브 조회수가 2회 이상 확인된 뒤에 삭제하도록 변경(유튜브 처리
- * 대기 중 어디서도 재생 안 되는 공백 방지). r2CleanupQueue/pollR2CleanupQueue 추가, runVideoPollTick에 등록
+ * 생성(마지막 작업): 2026-09-06 11:35 (KST) — 진짜 원인 발견/수정: 나레이션이 짧은 영상(문장 수 <
+ * 이미지 20장)에서 빈 이미지가 "이동"만으론 다 안 채워졌고, relay.js는 자막 빈 이미지가 하나라도
+ * 있으면 세그먼트 실측 전체를 포기하고 추정 폴백으로 빠져서 자막이 겹치거나 잘려 보이던 원인.
+ * 이동으로 못 채운 칸은 이웃 문장을 복사해서 항상 채우도록 splitTextIntoNChunks 보강
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2180,10 +2181,29 @@ function splitTextIntoNChunks(sentenceInfos, n) {
       if (left >= 0 && chunks[left].length > 1) { donorIdx = left; break; }
       if (right < chunks.length && chunks[right].length > 1) { donorIdx = right; break; }
     }
-    if (donorIdx === -1) continue; // 문장이 극단적으로 적은 경우(거의 없음) — 그냥 빈 채로 둠, 폴백이 안전망
+    if (donorIdx === -1) continue; // 이동으론 못 채움 — 아래 복사 단계에서 마저 채움
     // 빌려주는 청크가 앞쪽이면 그 청크의 마지막 문장을(순서상 더 가까움), 뒤쪽이면 첫 문장을 넘겨줌
     const donor = chunks[donorIdx];
     chunks[i].push(donorIdx < i ? donor.pop() : donor.shift());
+  }
+
+  // [2026-09-06 11:35] 진짜 버그 수정 — 나레이션이 짧은 영상(문장 수 < 이미지 20장)에서는 위 "이동"
+  // 방식으로 다 채워지지 않는 이미지가 남았음(문장 2개 이상인 이웃이 하나도 없으면 donorIdx=-1로
+  // 그냥 비워뒀음). relay.js는 자막이 빈 이미지가 하나라도 있으면 세그먼트 실측 타이밍 전체를
+  // 포기하고 부정확한 추정 모드로 폴백하는데, 이게 항상 문장<이미지인 짧은 영상마다 자막이
+  // 겹치거나 잘려 보이던 원인이었음. 이동으로 못 채운 칸은 "복사"(이동이 아니라 복제)로 채움 —
+  // 이웃 이미지랑 같은 문장을 나눠서 보여주게 되지만(같은 자막을 두 이미지가 걸쳐서 표시), 실측
+  // 타이밍이 살아남아 겹침/잘림보다 훨씬 낫다.
+  for (let i = 0; i < chunks.length; i++) {
+    if (chunks[i].length > 0) continue;
+    let nearestIdx = -1;
+    for (let d = 1; d < chunks.length; d++) {
+      const left = i - d, right = i + d;
+      if (left >= 0 && chunks[left].length > 0) { nearestIdx = left; break; }
+      if (right < chunks.length && chunks[right].length > 0) { nearestIdx = right; break; }
+    }
+    if (nearestIdx === -1) continue; // 문장이 아예 0개(발화 없음) 등 극단적 경우만 — 사실상 발생 안 함
+    chunks[i] = [...chunks[nearestIdx]]; // 복사(이동 아님) — 이웃은 그대로 유지, 이 칸도 같은 문장으로 채움
   }
 
   // 문장이 끝날 때마다 TTS가 짧게 쉬는 시간(정지)이 있는데, 글자수만 세면 이게 빠져서
