@@ -1,8 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-06 23:30 (KST) — 진행 메시지가 새로고침해야만 갱신되던 문제 — 클라이언트
- * cache:'no-store'는 브라우저 로컬 캐시만 막고 Cloudflare 엣지 캐시는 못 막음. /admin/render-progress,
- * /admin/generate-step, 관리자 페이지 자체(refreshAdminList가 다시 fetch하는 대상) 응답에 전부
- * Cache-Control: no-store 헤더를 직접 실어서 엣지에서 캐싱될 가능성 자체를 차단
+ * 생성(마지막 작업): 2026-09-06 23:45 (KST) — TTS 발음 정정 확장: 소수점 있는 숫자뿐 아니라 정수+
+ * 시간/측정 단위(10분, 5초, 9월 15일, 5000원 등)도 한자어 발음으로 변환(SINO_ONLY_UNITS). "개/명/살/
+ * 번/마리" 같은 고유어 전용 단위는 절대 건드리지 않음(건드리면 오히려 틀림) — 테스트로 검증 완료
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1109,13 +1108,27 @@ const TTS_UNIT_KOREAN = {
   kcal: '킬로칼로리', cal: '칼로리', mah: '밀리암페어시', l: '리터', ml: '밀리리터',
   '%': '퍼센트', '℃': '도',
 };
+// [2026-09-06 23:45] 정수(소수점 없는) + "항상 한자어(사·오·구...)로 읽는 단위" 조합도 변환.
+// 예: "10분"을 그냥 두면 TTS가 고유어(열분)로 읽을 위험이 있음 — 시간/측정 단위는 숫자 크기와
+// 무관하게 항상 한자어로 읽는 게 맞아서(3시간=세시간X, "세시간"이 아니라 "삼시간"?) 실제로는
+// "시간"만 예외(한 시간/두 시간처럼 고유어 사용)이므로 시간(hour)은 목록에서 제외하고, 분/초/년/월/일
+// 등 명확히 한자어로만 읽는 단위만 포함함. "개/명/살/번/마리" 같은 고유어 전용 단위는 절대 포함하지 않음
+// (포함하면 오히려 틀리게 됨 — 예: "3개"는 "삼개"가 아니라 "세 개"가 맞음).
+const SINO_ONLY_UNITS = ['분', '초', '개월', '년', '월', '일', '주일', '회', '차', '원'];
 function normalizeNumbersForTts(text) {
-  return (text || '').replace(/(\d+)\.(\d+)\s*(km|kg|cm|mm|kcal|mah|ml|cal|[a-zA-Z%℃]{1,4})?/gi, (match, intPart, decPart, unit) => {
+  let result = (text || '').replace(/(\d+)\.(\d+)\s*(km|kg|cm|mm|kcal|mah|ml|cal|[a-zA-Z%℃]{1,4})?/gi, (match, intPart, decPart, unit) => {
     const intKr = sinoKoreanNumber(parseInt(intPart, 10));
     const decKr = decimalDigitsToKorean(decPart);
     const unitKr = unit ? (TTS_UNIT_KOREAN[unit.toLowerCase()] || TTS_UNIT_KOREAN[unit] || unit) : '';
     return `${intKr}점${decKr}${unitKr}`;
   });
+  result = result.replace(/(\d+)\s*(km|kg|cm|mm|kcal|mah|ml|cal|%|℃)/gi, (match, intPart, unit) => {
+    const unitKr = TTS_UNIT_KOREAN[unit.toLowerCase()] || TTS_UNIT_KOREAN[unit] || unit;
+    return `${sinoKoreanNumber(parseInt(intPart, 10))}${unitKr}`;
+  });
+  const sinoUnitPattern = new RegExp(`(\\d+)(${SINO_ONLY_UNITS.join('|')})`, 'g');
+  result = result.replace(sinoUnitPattern, (match, intPart, unit) => `${sinoKoreanNumber(parseInt(intPart, 10))}${unit}`);
+  return result;
 }
 
 function normalizeNarrationSpacing(text) {
