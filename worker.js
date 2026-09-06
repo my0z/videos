@@ -1,8 +1,9 @@
 /**
- * 생성(마지막 작업): 2026-09-06 19:15 (KST) — 진짜 원인 발견/수정: /admin/generate-step 요청이 응답을
- * 오래 못 받으면(네트워크/AI API 지연 등) data-inflight가 '1'로 계속 남아 다음 폴링이 전부 무시되고
- * 새로고침 전까진 진행상황이 멈춘 것처럼 보였음 — 25초 제한시간(AbortController)을 걸어 오래 걸리면
- * 포기하고 바로 다음 틱에 재시도되게 함. render-progress/generate-step 요청에 cache:'no-store'도 추가
+ * 생성(마지막 작업): 2026-09-06 20:15 (KST) — 진짜 원인 발견/수정: 자막이 "깨진다"던 게 사실은
+ * ffmpeg 단독 테스트로 확인해보니 화면 폭(1280px) 넘는 줄이 그냥 프레임 밖으로 계속 그려져서 안
+ * 보이는 것뿐이었음(폰트/인코딩 문제 아니었음). 예전에 "마지막 줄에 남은 단어 다 몰아넣기"로 고친
+ * 게 재발 원인 — 그 몰아넣은 줄이 가끔 폭을 넘었음. maxLines 제한을 아예 없애고 줄당 글자수만
+ * 지켜서 계속 줄바꿈하도록 wrapCaptionLines 재작성(세로로 길어질 순 있어도 가로 폭은 절대 안 넘침)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -2231,22 +2232,19 @@ function buildCaptionBeats(sentences, positionIndex) {
 }
 
 function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
-  // [2026-09-06 01:45] 버그 수정 — 예전엔 maxLines를 넘기면 break로 루프를 통째로 빠져나가서
-  // 그 뒤에 남은 단어들이 전부 사라졌음(문장이 중간에 잘려 보이던 원인). 이제 마지막 줄 한도에
-  // 도달하면 남은 단어를 전부 마지막 줄에 이어붙여서 내용이 아무리 길어도 절대 버려지지 않게 함
-  // (줄이 조금 길어질 수는 있지만, 내용이 통째로 사라지는 것보다 훨씬 안전함).
+  // [2026-09-06 20:15] 진짜 원인 발견/수정 — ffmpeg 단독 테스트로 확인: 줄바꿈 없이 화면 폭(1280px)을
+  // 넘는 텍스트는 ffmpeg가 그냥 화면 밖으로 계속 그려버림(글씨가 깨지는 게 아니라 물리적으로 프레임
+  // 밖으로 나가서 안 보이는 것 — 압축된 미리보기에서 깨진 것처럼 보였을 뿐). 예전 수정(마지막 줄
+  // 한도를 넘으면 남은 단어를 전부 그 줄에 몰아넣기)이 바로 이 문제의 재발 원인이었음 — 몰아넣은
+  // 마지막 줄이 가끔 화면 폭을 넘었음. 이제 줄 수 제한(maxLines)을 아예 없애고, 아무리 길어도 항상
+  // 줄당 글자수(maxCharsPerLine)만 지켜서 계속 줄바꿈함 — 세로로 좀 길어질 수는 있어도 가로로는
+  // 절대 넘치지 않음(내용 유실도 없음).
   const words = (text || '').split(/\s+/).filter(Boolean);
   const lines = [];
   let current = '';
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
+  for (const w of words) {
     const candidate = current ? current + ' ' + w : w;
     if (candidate.length > maxCharsPerLine && current) {
-      if (lines.length >= maxLines - 1) {
-        // 마지막 줄 한도 — 지금까지 모은 current + 남은 단어 전부를 마지막 줄로 합쳐서 절대 유실 없이 끝냄
-        lines.push([current, ...words.slice(i)].join(' '));
-        return lines;
-      }
       lines.push(current);
       current = w;
     } else {
@@ -2254,7 +2252,7 @@ function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
     }
   }
   if (current) lines.push(current);
-  return lines.slice(0, maxLines);
+  return lines;
 }
 
 // 동시성 제한된 map — 한꺼번에 다 병렬로 쏘면 Pixabay 초당 요청 제한(429)에 바로 걸림
