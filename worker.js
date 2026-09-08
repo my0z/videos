@@ -1,7 +1,10 @@
 /**
- * 생성(마지막 작업): 2026-09-07 00:50 (KST) — 사이트에 빠져있던 SEO/구독 기본 기능 3종 추가:
- * /sitemap.xml(검색엔진용 전체 글 목록), /robots.txt(/admin 크롤링 차단 포함), /rss.xml(최근 30개
- * 피드) — 영상 생성 파이프라인과 무관한 독립 기능, 기존 escapeXml 함수 재사용
+ * 생성(마지막 작업): 2026-09-07 01:10 (KST) — 쿠팡파트너스 관련 상품 추천 기능 추가: 글 생성(finalize
+ * 단계)에서 주제로 쿠팡 오픈API 상품검색(HMAC-SHA256 서명, coupangAuthHeader — 실제 서명 생성
+ * 테스트로 형식 검증 완료) → post.coupangProducts에 저장 → 글 페이지 하단에 "쿠팡 파트너스 활동의
+ * 일환으로 수수료를 제공받습니다" 법적 고지와 함께 표시. COUPANG_ACCESS_KEY/COUPANG_SECRET_KEY
+ * 시크릿 없으면 조용히 건너뜀(발행 자체는 안 막힘). 응답 필드명은 문서 기준 추정이라 실제 승인
+ * 계정으로 첫 호출 시 로그로 원본 응답을 확인해서 필요하면 조정 필요
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1308,6 +1311,61 @@ async function fetchVeoVideoBytes(videoUri, videoBase64, env) {
 }
 
 const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서 접근할 이미지/음성 URL의 기준 도메인
+
+// ---------- 쿠팡파트너스 관련 상품 추천 — 작업: 2026-09-07 01:10 ----------
+// 주제로 상품을 검색해서 글 하단에 파트너스 링크로 게시함. 오픈API는 HMAC-SHA256 서명이 필요
+// (쿠팡파트너스 공식 예제 방식 그대로 구현). COUPANG_ACCESS_KEY/COUPANG_SECRET_KEY 시크릿 필요 —
+// 둘 다 없으면 이 기능은 조용히 건너뜀(글 생성 자체가 막히면 안 되므로).
+function coupangSignedDate() {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${String(d.getUTCFullYear()).slice(2)}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}T${p2(d.getUTCHours())}${p2(d.getUTCMinutes())}${p2(d.getUTCSeconds())}Z`;
+}
+async function coupangAuthHeader(method, pathAndQuery, env) {
+  const [path, query] = pathAndQuery.split('?');
+  const datetime = coupangSignedDate();
+  const message = datetime + method + path + (query || '');
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.COUPANG_SECRET_KEY), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  const signature = Array.from(new Uint8Array(sigBuf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `CEA algorithm=HmacSHA256, access-key=${env.COUPANG_ACCESS_KEY}, signed-date=${datetime}, signature=${signature}`;
+}
+// 주제로 관련 상품 검색 — 응답 필드는 쿠팡 공식 문서 기준으로 짰지만, 실제 승인 계정으로 첫 호출
+// 해보고 필드명이 다르면(예: data.productData vs data) 로그로 원본을 남겨서 바로 확인 가능하게 함.
+async function searchCoupangProducts(keyword, env, limit = 3) {
+  if (!env.COUPANG_ACCESS_KEY || !env.COUPANG_SECRET_KEY) return [];
+  try {
+    const pathAndQuery = `/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword=${encodeURIComponent(keyword)}&limit=${limit}`;
+    const auth = await coupangAuthHeader('GET', pathAndQuery, env);
+    const res = await fetch(`https://api-gateway.coupang.com${pathAndQuery}`, {
+      headers: { Authorization: auth },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => '');
+      console.log(`쿠팡 상품검색 실패("${keyword}"): HTTP ${res.status} ${bodyText.slice(0, 300)}`);
+      return [];
+    }
+    const data = await res.json();
+    // 문서 기준 productData 배열 — 혹시 필드명이 다르면 raw를 로그로 남겨 확인
+    const products = data?.data?.productData || data?.rData?.productData || data?.data || [];
+    if (!Array.isArray(products) || !products.length) {
+      console.log(`쿠팡 상품검색 결과 없음/형식 다름("${keyword}"): ${JSON.stringify(data).slice(0, 300)}`);
+      return [];
+    }
+    return products.slice(0, limit).map((p) => ({
+      name: p.productName || p.title || '',
+      price: p.productPrice || p.price || null,
+      image: p.productImage || p.imageUrl || '',
+      url: p.productUrl || p.url || '',
+      isRocket: !!(p.isRocket || p.rocket),
+    })).filter((p) => p.url);
+  } catch (e) {
+    console.log(`쿠팡 상품검색 오류("${keyword}"): ${e.message}`);
+    return [];
+  }
+}
+
 
 // [2026-08-30 23:31] 스레드 공유 캡션 — 훅 / 요약 / 해시태그 / 링크를 빈 줄로 나눠 보기 좋게 구성.
 // AI가 줄바꿈 없이 한 덩어리로 준 경우에도 첫 문장(훅)과 해시태그를 분리해 자동으로 재구성함.
@@ -2917,6 +2975,18 @@ async function renderPostPage(env, slug) {
       ${p.intro}
       ${sectionsHtml}
       ${p.outro}
+      ${(p.coupangProducts && p.coupangProducts.length) ? `
+      <div style="margin:32px 0 0;padding:16px 18px;border:1px solid var(--border);border-radius:10px;">
+        <h3 style="margin:0 0 4px;font-size:16px;">🛒 관련 상품</h3>
+        <p class="mono" style="margin:0 0 12px;font-size:11px;color:var(--muted);">이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.</p>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;">
+          ${p.coupangProducts.map((prod) => `<a href="${escapeHtml(prod.url)}" target="_blank" rel="nofollow noopener sponsored" style="display:block;width:140px;text-decoration:none;color:var(--text);">
+            ${prod.image ? `<img src="${escapeHtml(prod.image)}" alt="${escapeHtml(prod.name)}" style="width:140px;height:140px;object-fit:cover;border-radius:8px;background:var(--surface);">` : ''}
+            <div style="font-size:12px;margin-top:6px;line-height:1.4;">${escapeHtml((prod.name || '').slice(0, 40))}</div>
+            ${prod.price ? `<div style="font-size:13px;font-weight:700;margin-top:2px;">${Number(prod.price).toLocaleString('ko-KR')}원</div>` : ''}
+          </a>`).join('')}
+        </div>
+      </div>` : ''}
       <div style="display:flex;gap:12px;align-items:flex-start;background:#FFFBEB;border:1.5px solid var(--amber);border-radius:10px;padding:16px 18px;margin:32px 0 0;">
         <span style="font-size:20px;line-height:1;">⚠️</span>
         <p style="margin:0;font-size:14px;line-height:1.6;color:#7C2D12;">이 글과 이미지/음성은 AI가 자동 생성한 참고용 콘텐츠이며, 실제 사실과 다를 수 있습니다.${p.usedNews ? ' 실제 뉴스 검색 결과를 참고해 작성했지만, 원문과 대조 확인을 권장합니다.' : ' 실시간 뉴스 검색 없이 작성된 내용이니 최신성이 중요한 정보는 별도로 확인해주세요.'}</p>
@@ -3700,10 +3770,12 @@ async function runGenerationStep(job, env) {
     }
     // [2026-09-02 21:05] 쇼츠용 하이라이트 구간 — 실패해도 발행은 막지 않음(null이면 relay가 예전 로직으로 폴백)
     const highlightSegRange = await pickHighlightRange(job.segTexts || [], topic, env);
+    // [2026-09-07 01:10] 쿠팡파트너스 관련 상품 — 실패해도(키 미설정/API 오류) 발행은 막지 않음
+    const coupangProducts = await searchCoupangProducts(topic, env, 3);
     const post = {
       slug: job.slug, topic, title: job.article.title, createdAt: new Date().toISOString(),
       intro: job.article.intro_html, sections: job.article.sections || [], outro: job.article.outro_html,
-      images: job.images, audio: job.audioKey, audioSegments: job.audioSegmentKeys, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange,
+      images: job.images, audio: job.audioKey, audioSegments: job.audioSegmentKeys, audioError: job.audioError, usedNews: job.usedNews, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange, coupangProducts,
       generationSec: job.createdAt ? Math.round((Date.now() - job.createdAt) / 1000) : null, // [2026-08-30 19:45] 생성 버튼 → 글 저장까지 걸린 시간(관리자 표시용)
       threadsText: (job.article.threads_text || '').toString().slice(0, 450), // [2026-08-30 22:20] 스레드 공유용 홍보문(글 생성 때 같이 만들어짐)
     };
@@ -3716,7 +3788,7 @@ async function runGenerationStep(job, env) {
     await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
     return {
       ...job, captionWeights, captionBeats, captionFontKey, captionColor, highlightSegRange, stage: 'render', percent: 90,
-      logs: pushLog(job, `💾 글 저장 완료 — 이미지 ${job.images.length}장, 렌더링 대기열 등록 중`),
+      logs: pushLog(job, `💾 글 저장 완료 — 이미지 ${job.images.length}장${coupangProducts.length ? `, 쿠팡 상품 ${coupangProducts.length}개` : ''}, 렌더링 대기열 등록 중`),
     };
   }
 
