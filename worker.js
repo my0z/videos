@@ -1,8 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-07 00:20 (KST) — "대본 먼저 만들기" 관련 버그 수정: 대본에 특수문자
- * (&,<,>,따옴표)가 있으면 escapeHtml → stripHtml 왕복 과정에서 "&amp;" 같은 엔티티가 안 풀려서
- * 나레이션/TTS/이미지검색 키워드에 그대로 섞여 들어가던 문제 — stripHtml이 태그 제거 후 엔티티도
- * 복원하도록 수정(테스트로 정상 복원 확인 완료)
+ * 생성(마지막 작업): 2026-09-07 00:50 (KST) — 사이트에 빠져있던 SEO/구독 기본 기능 3종 추가:
+ * /sitemap.xml(검색엔진용 전체 글 목록), /robots.txt(/admin 크롤링 차단 포함), /rss.xml(최근 30개
+ * 피드) — 영상 생성 파이프라인과 무관한 독립 기능, 기존 escapeXml 함수 재사용
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -171,6 +170,9 @@ export default {
     const path = url.pathname;
     try {
       if (path === '/') return await renderHomePage(env);
+      if (path === '/sitemap.xml') return await handleSitemap(env);
+      if (path === '/robots.txt') return handleRobotsTxt();
+      if (path === '/rss.xml' || path === '/feed.xml') return await handleRssFeed(env);
       if (path === '/admin') return await renderAdminPage(env, url);
       if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env);
       if (path === '/admin/generate-script' && request.method === 'POST') return await handleGenerateScript(request, env);
@@ -610,22 +612,28 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
+// [2026-09-07 00:35] 정확도 개선 — 예전엔 "관련 있음/없음"만 판단했는데, 이제 겹치는 단어 개수로
+// "얼마나" 관련 있는지 점수를 매김. 검색 결과 여러 개 중 가장 점수 높은 걸 고르는 데 씀.
+function relevanceScore(query, metaText) {
+  if (!metaText) return 0;
+  const stopwords = new Set(['the', 'and', 'with', 'for', 'from', 'this', 'that']);
+  const queryWords = query.toLowerCase().split(/[^a-z0-9가-힣]+/).filter((w) => w.length >= 3 && !stopwords.has(w));
+  if (!queryWords.length) return 1; // 쿼리 자체가 너무 짧으면 걸러낼 기준이 없으니 일단 통과 취급
+  const lowerMeta = metaText.toLowerCase();
+  return queryWords.reduce((score, w) => score + (lowerMeta.includes(w) ? 1 : 0), 0);
+}
 // 검색 결과가 실제로 쿼리랑 관련 있는지 대충 확인 — Pixabay tags / Pexels alt 텍스트에
 // 쿼리 단어가 하나라도 들어있으면 "관련 있음"으로 판단. 이걸 통과 못 하면 그 이미지는 버리고
 // 다음 소스(Pexels → 그래도 없으면 FLUX 생성)로 넘어가게 함.
 function isRelevantMatch(query, metaText) {
-  if (!metaText) return false;
-  const stopwords = new Set(['the', 'and', 'with', 'for', 'from', 'this', 'that']);
-  const queryWords = query.toLowerCase().split(/[^a-z0-9가-힣]+/).filter((w) => w.length >= 3 && !stopwords.has(w));
-  if (!queryWords.length) return true; // 쿼리 자체가 너무 짧으면 걸러낼 기준이 없으니 통과시킴
-  const lowerMeta = metaText.toLowerCase();
-  return queryWords.some((w) => lowerMeta.includes(w));
+  return relevanceScore(query, metaText) > 0;
 }
 
 async function searchPixabayImage(query, env, attempt = 0) {
   if (!env.PIXABAY_API_KEY) return null;
   try {
-    const res = await fetch(`https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&image_type=photo&orientation=horizontal&per_page=3&safesearch=true`, { signal: AbortSignal.timeout(10000) });
+    // [2026-09-07 00:35] per_page 3→8로 늘려서 고를 후보를 넓힘(정확도 개선)
+    const res = await fetch(`https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&image_type=photo&orientation=horizontal&per_page=8&safesearch=true`, { signal: AbortSignal.timeout(10000) });
     if (res.status === 429 && attempt < 2) {
       await res.text().catch(() => {});
       const backoffMs = 800 * (attempt + 1); // 레이트리밋이면 잠깐 쉬었다가 최대 2번 더 시도
@@ -639,13 +647,21 @@ async function searchPixabayImage(query, env, attempt = 0) {
       return null;
     }
     const data = await res.json();
-    const hit = data?.hits?.[0];
-    if (!hit) return null;
-    if (!isRelevantMatch(query, hit.tags)) {
-      console.log(`Pixabay 결과가 "${query}"랑 안 맞아 보임(태그: ${hit.tags}) — 건너뜀`);
+    const hits = data?.hits || [];
+    if (!hits.length) return null;
+    // [2026-09-07 00:35] 정확도 개선 — 1등만 보고 안 맞으면 포기하던 것을, 후보들 중 태그 겹침
+    // 점수가 가장 높은 걸 고르는 방식으로 변경(더 정확한 이미지를 찾을 확률이 크게 올라감)
+    let best = null;
+    let bestScore = 0;
+    for (const hit of hits) {
+      const score = relevanceScore(query, hit.tags);
+      if (score > bestScore) { bestScore = score; best = hit; }
+    }
+    if (!best) {
+      console.log(`Pixabay 결과 ${hits.length}개 다 "${query}"랑 안 맞아 보임 — 건너뜀`);
       return null;
     }
-    const imageUrl = hit?.largeImageURL || hit?.webformatURL;
+    const imageUrl = best?.largeImageURL || best?.webformatURL;
     if (!imageUrl) return null;
     const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
     if (!imgRes.ok) {
@@ -667,7 +683,8 @@ async function searchPixabayImage(query, env, attempt = 0) {
 async function searchPexelsImage(query, env, attempt = 0) {
   if (!env.PEXELS_API_KEY) return null;
   try {
-    const res = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape`, {
+    // [2026-09-07 00:35] per_page 1→8로 늘려서 고를 후보를 넓힘(정확도 개선)
+    const res = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=8&orientation=landscape`, {
       headers: { Authorization: env.PEXELS_API_KEY },
       signal: AbortSignal.timeout(10000),
     });
@@ -684,13 +701,21 @@ async function searchPexelsImage(query, env, attempt = 0) {
       return null;
     }
     const data = await res.json();
-    const photo = data?.photos?.[0];
-    if (!photo) return null;
-    if (!isRelevantMatch(query, photo.alt)) {
-      console.log(`Pexels 결과가 "${query}"랑 안 맞아 보임(alt: ${photo.alt}) — 건너뜀`);
+    const photos = data?.photos || [];
+    if (!photos.length) return null;
+    // [2026-09-07 00:35] 정확도 개선 — 1등만 보고 안 맞으면 포기하던 것을, 후보들 중 alt 텍스트
+    // 겹침 점수가 가장 높은 걸 고르는 방식으로 변경
+    let best = null;
+    let bestScore = 0;
+    for (const photo of photos) {
+      const score = relevanceScore(query, photo.alt);
+      if (score > bestScore) { bestScore = score; best = photo; }
+    }
+    if (!best) {
+      console.log(`Pexels 결과 ${photos.length}개 다 "${query}"랑 안 맞아 보임 — 건너뜀`);
       return null;
     }
-    const imageUrl = photo?.src?.large || photo?.src?.medium;
+    const imageUrl = best?.src?.large || best?.src?.medium;
     if (!imageUrl) return null;
     const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
     if (!imgRes.ok) {
@@ -712,7 +737,8 @@ async function searchPexelsImage(query, env, attempt = 0) {
 async function searchUnsplashImage(query, env) {
   if (!env.UNSPLASH_ACCESS_KEY) return null;
   try {
-    const res = await fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape`, {
+    // [2026-09-07 00:35] per_page 1→5(요청 제한이 시간당 50건이라 늘려도 API 호출 횟수는 그대로임)
+    const res = await fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=5&orientation=landscape`, {
       headers: { Authorization: `Client-ID ${env.UNSPLASH_ACCESS_KEY}` },
       signal: AbortSignal.timeout(10000),
     });
@@ -722,14 +748,21 @@ async function searchUnsplashImage(query, env) {
       return null;
     }
     const data = await res.json();
-    const photo = data?.results?.[0];
-    if (!photo) return null;
-    const altText = [photo.alt_description, photo.description].filter(Boolean).join(' ');
-    if (!isRelevantMatch(query, altText)) {
-      console.log(`Unsplash 결과가 "${query}"랑 안 맞아 보임(설명: ${altText}) — 건너뜀`);
+    const photos = data?.results || [];
+    if (!photos.length) return null;
+    // [2026-09-07 00:35] 정확도 개선 — 후보들 중 설명 텍스트 겹침 점수가 가장 높은 걸 고름
+    let best = null;
+    let bestScore = 0;
+    for (const p of photos) {
+      const altText = [p.alt_description, p.description].filter(Boolean).join(' ');
+      const score = relevanceScore(query, altText);
+      if (score > bestScore) { bestScore = score; best = p; }
+    }
+    if (!best) {
+      console.log(`Unsplash 결과 ${photos.length}개 다 "${query}"랑 안 맞아 보임 — 건너뜀`);
       return null;
     }
-    const imageUrl = photo?.urls?.regular || photo?.urls?.small;
+    const imageUrl = best?.urls?.regular || best?.urls?.small;
     if (!imageUrl) return null;
     const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(10000) });
     if (!imgRes.ok) {
@@ -2706,6 +2739,57 @@ function renderSlideshow(post) {
     })();
   </script>`;
   return `<div class="slideshow" id="slideshow-${post.slug}">${slides}${captionBox}${playBtn}</div>${audioTag}${script}`;
+}
+
+// [2026-09-07 00:50] SEO/구독 기본 기능 3종 추가 — 지금까지 사이트에 sitemap.xml/robots.txt/RSS가
+// 아예 없었음. 검색엔진 노출과 외부 구독(피드리더 등)에 기본적인데 빠져있어서 추가함. 영상 생성
+// 파이프라인과는 완전히 무관한 독립 기능이라 안전하게 추가할 수 있음(escapeXml은 기존 함수 재사용).
+async function handleSitemap(env) {
+  const idxRaw = await env.POSTS.get('index');
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  const urls = [`  <url><loc>${SITE_ORIGIN}/</loc><changefreq>daily</changefreq><priority>1.0</priority></url>`];
+  for (const slug of idx.slice(0, 2000)) { // 사이트맵 규격상 URL 5만 개까지 가능하지만 넉넉히 2000개로 제한
+    const raw = await env.POSTS.get(`post:${slug}`);
+    if (!raw) continue;
+    const post = JSON.parse(raw);
+    const lastmod = new Date(post.createdAt).toISOString().slice(0, 10);
+    urls.push(`  <url><loc>${SITE_ORIGIN}/${escapeXml(post.slug)}</loc><lastmod>${lastmod}</lastmod><changefreq>monthly</changefreq></url>`);
+  }
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.join('\n')}\n</urlset>`;
+  return new Response(xml, { headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' } });
+}
+function handleRobotsTxt() {
+  const body = `User-agent: *\nAllow: /\nDisallow: /admin\nSitemap: ${SITE_ORIGIN}/sitemap.xml\n`;
+  return new Response(body, { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600' } });
+}
+async function handleRssFeed(env) {
+  const idxRaw = await env.POSTS.get('index');
+  const idx = idxRaw ? JSON.parse(idxRaw) : [];
+  const items = [];
+  for (const slug of idx.slice(0, 30)) { // 최근 30개만 — RSS 관례상 전체를 다 실을 필요 없음
+    const raw = await env.POSTS.get(`post:${slug}`);
+    if (!raw) continue;
+    const post = JSON.parse(raw);
+    const excerpt = makeExcerpt(post.intro, 200);
+    items.push(`  <item>
+    <title>${escapeXml(post.title)}</title>
+    <link>${SITE_ORIGIN}/${escapeXml(post.slug)}</link>
+    <guid isPermaLink="true">${SITE_ORIGIN}/${escapeXml(post.slug)}</guid>
+    <pubDate>${new Date(post.createdAt).toUTCString()}</pubDate>
+    <description>${escapeXml(excerpt)}</description>
+  </item>`);
+  }
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+  <title>life.news</title>
+  <link>${SITE_ORIGIN}/</link>
+  <description>생활뉴스 · 글+슬라이드쇼</description>
+  <language>ko-kr</language>
+${items.join('\n')}
+</channel>
+</rss>`;
+  return new Response(xml, { headers: { 'Content-Type': 'application/rss+xml; charset=utf-8', 'Cache-Control': 'public, max-age=1800' } });
 }
 
 async function renderHomePage(env) {
