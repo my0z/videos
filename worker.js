@@ -1,7 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-06 23:45 (KST) — TTS 발음 정정 확장: 소수점 있는 숫자뿐 아니라 정수+
- * 시간/측정 단위(10분, 5초, 9월 15일, 5000원 등)도 한자어 발음으로 변환(SINO_ONLY_UNITS). "개/명/살/
- * 번/마리" 같은 고유어 전용 단위는 절대 건드리지 않음(건드리면 오히려 틀림) — 테스트로 검증 완료
+ * 생성(마지막 작업): 2026-09-07 00:20 (KST) — "대본 먼저 만들기" 관련 버그 수정: 대본에 특수문자
+ * (&,<,>,따옴표)가 있으면 escapeHtml → stripHtml 왕복 과정에서 "&amp;" 같은 엔티티가 안 풀려서
+ * 나레이션/TTS/이미지검색 키워드에 그대로 섞여 들어가던 문제 — stripHtml이 태그 제거 후 엔티티도
+ * 복원하도록 수정(테스트로 정상 복원 확인 완료)
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -172,6 +173,7 @@ export default {
       if (path === '/') return await renderHomePage(env);
       if (path === '/admin') return await renderAdminPage(env, url);
       if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env);
+      if (path === '/admin/generate-script' && request.method === 'POST') return await handleGenerateScript(request, env);
       if (path === '/api/generate' && request.method === 'POST') return await handleApiGenerate(request, env);
       if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
       if (path === '/admin/dismiss-fail' && request.method === 'POST') { // [2026-08-30 19:52] 렌더링 실패 기록 확인 후 지우기
@@ -246,8 +248,17 @@ function makeExcerpt(html, maxLen = 130) {
   return text.length > maxLen ? text.slice(0, maxLen).trim() + '…' : text;
 }
 
+// [2026-09-07 00:20] 버그 수정 — "대본 먼저 만들기"에서 사용자가 &,<,>,따옴표 등을 쓰면
+// parseScriptToArticle이 안전하게 escapeHtml() 처리해서 body_html에 넣는데(글 페이지에 그대로
+// 렌더링되므로 이스케이프 자체는 맞음), 이걸 다시 나레이션/이미지검색 키워드용 텍스트로 뽑을 때
+// (stripHtml) 엔티티가 안 풀려서 "&amp;" 같은 게 그대로 섞여 들어갔음. 태그 제거 후 엔티티도 복원.
 function stripHtml(html) {
-  return (html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return (html || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 // [2026-09-01] 초 단위 시간을 "N분 M초"/"N초"로 표시 — admin 목록, 글 페이지 등 여러 곳에서 공용으로 씀
@@ -448,6 +459,57 @@ async function generateArticle(topic, newsResults, env, detail) {
 
   const { result, error, modelUsed } = await callAiChain(systemPrompt, userPrompt, env);
   return { article: result, error, modelUsed };
+}
+
+// [2026-09-07 00:10] "대본 먼저 만들기" 기능 — article 객체(title/intro_html/sections/outro_html)를
+// 사람이 읽고 고치기 편한 평문 텍스트로 바꾸고, 고친 뒤 다시 article 객체로 되돌리는 왕복 변환.
+// 구분자는 고정 포맷([도입부]/[소제목: ...]/[마무리])이라 사용자가 텍스트만 자유롭게 고쳐도 파싱이 깨지지 않음.
+function stripHtmlToText(html) {
+  return (html || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+}
+function formatArticleAsScript(article) {
+  const lines = [`제목: ${article.title || ''}`, '', '[도입부]', stripHtmlToText(article.intro_html)];
+  (article.sections || []).forEach((s) => {
+    lines.push('', `[소제목: ${s.heading || ''}]`, stripHtmlToText(s.body_html));
+  });
+  lines.push('', '[마무리]', stripHtmlToText(article.outro_html));
+  return lines.join('\n');
+}
+function parseScriptToArticle(scriptText, fallbackTitle) {
+  const text = (scriptText || '').replace(/\r\n/g, '\n');
+  const titleMatch = text.match(/^제목:\s*(.+)$/m);
+  const title = (titleMatch ? titleMatch[1].trim() : '') || fallbackTitle || '';
+  // 텍스트를 [마커] 기준으로 조각냄 — 마커 자체와 그 뒤 내용을 순서대로 수집
+  const markerRe = /\[(도입부|소제목:\s*[^\]]*|마무리)\]/g;
+  const parts = [];
+  let lastIndex = 0;
+  let lastMarker = null;
+  let m;
+  while ((m = markerRe.exec(text))) {
+    if (lastMarker) parts.push({ marker: lastMarker, body: text.slice(lastIndex, m.index) });
+    lastMarker = m[1];
+    lastIndex = markerRe.lastIndex;
+  }
+  if (lastMarker) parts.push({ marker: lastMarker, body: text.slice(lastIndex) });
+
+  let introHtml = '';
+  let outroHtml = '';
+  const sections = [];
+  for (const part of parts) {
+    const body = part.body.trim();
+    const bodyHtml = body ? `<p>${escapeHtml(body)}</p>` : '';
+    if (part.marker === '도입부') {
+      introHtml = bodyHtml;
+    } else if (part.marker === '마무리') {
+      outroHtml = bodyHtml;
+    } else {
+      const headingMatch = part.marker.match(/^소제목:\s*(.*)$/);
+      sections.push({ heading: (headingMatch ? headingMatch[1].trim() : ''), body_html: bodyHtml });
+    }
+  }
+  // 마커를 하나도 못 찾았으면(사용자가 형식을 다 지워버린 경우) 전체를 도입부 하나로 취급 — 유실 방지
+  if (!parts.length) introHtml = `<p>${escapeHtml(text.replace(/^제목:.*\n?/, '').trim())}</p>`;
+  return { title, intro_html: introHtml, sections, outro_html: outroHtml, threads_text: '' };
 }
 
 // [2026-09-02 21:20] 생성된 글을 다시 한 번 AI로 다듬어 TTS가 자연스럽게 읽도록 함 — 원래 글쓰기
@@ -3204,16 +3266,73 @@ async function renderAdminPage(env, requestUrl) {
     <h2>관리자 (총 ${idx.length}건)</h2>
     <p class="mono" style="color:var(--muted);font-size:12px;">생성은 백그라운드로 처리돼요 — 눌러도 바로 페이지가 돌아와요. 이 페이지를 열어두면 1.5초마다 빠르게 진행되고, 닫아도 1분마다 크론이 대신 이어서 진행해요(다만 느려요).</p>
     <form method="POST" action="/admin/generate" style="display:flex;gap:8px;margin:16px 0;flex-wrap:wrap;" id="gen-form" onsubmit="this.querySelector('button[type=submit]').disabled=true; this.querySelector('button[type=submit]').textContent='생성 중...';">
-      <input type="text" name="topic" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;min-width:200px;" required>
+      <input type="text" name="topic" id="topic-input" placeholder="생활뉴스 주제 (예: 여름철 냉방병 예방법)" maxlength="100" style="flex:1;min-width:200px;" required>
       <button type="button" id="media-upload-btn">📎 미디어 추가</button>
+      <button type="button" id="script-btn">📝 대본 먼저 만들기</button>
       <button type="submit">글+슬라이드쇼 생성</button>
-      <textarea name="detail" placeholder="상세 내용(선택) — 다룰 내용을 자세히 적을수록 글과 이미지 정확도가 올라가요" maxlength="2000" rows="2" style="width:100%;resize:vertical;padding:9px 12px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;font-family:inherit;"></textarea>
+      <textarea name="detail" id="detail-input" placeholder="상세 내용(선택) — 다룰 내용을 자세히 적을수록 글과 이미지 정확도가 올라가요" maxlength="2000" rows="2" style="width:100%;resize:vertical;padding:9px 12px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;font-family:inherit;"></textarea>
       <input type="hidden" name="userMediaKeys" id="user-media-keys-input" value="[]">
+      <input type="hidden" name="customScript" id="custom-script-input" value="">
       <input type="file" id="media-upload-input" accept="image/*,video/*" multiple style="display:none;">
       <div id="media-upload-list" style="width:100%;"></div>
+      <div id="script-preview" style="display:none;width:100%;">
+        <p class="mono" style="color:var(--muted);font-size:12px;margin:8px 0 4px;">대본을 검토/수정한 뒤 "이 대본으로 생성"을 누르세요. 형식([도입부]/[소제목: ...]/[마무리])만 그대로 두면 자유롭게 고쳐도 됩니다.</p>
+        <textarea id="script-textarea" rows="16" style="width:100%;resize:vertical;padding:9px 12px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;font-family:inherit;white-space:pre-wrap;"></textarea>
+        <div style="display:flex;gap:8px;margin-top:6px;">
+          <button type="button" id="script-use-btn">✅ 이 대본으로 생성</button>
+          <button type="button" id="script-cancel-btn">취소</button>
+        </div>
+      </div>
     </form>
     <div class="admin-grid" id="admin-tbody">${renderFailCards}${genJobCards}<div id="posts-anchor" style="display:none;"></div>${postCards || '<p id="empty-row" style="grid-column:1/-1;color:var(--muted);">글이 없습니다.</p>'}</div>
   </div><script>
+    // [2026-09-07 00:10] "대본 먼저 만들기" — 이미지/음성/렌더링 없이 글쓰기만 빠르게 해서 미리 보여주고,
+    // 검토/수정 후 그 내용 그대로(또는 고친 대로) 최종 생성에 넘김.
+    (function(){
+      var scriptBtn = document.getElementById('script-btn');
+      var scriptPreview = document.getElementById('script-preview');
+      var scriptTextarea = document.getElementById('script-textarea');
+      var customScriptInput = document.getElementById('custom-script-input');
+      var useBtn = document.getElementById('script-use-btn');
+      var cancelBtn = document.getElementById('script-cancel-btn');
+      var genForm = document.getElementById('gen-form');
+      var submitBtn = genForm.querySelector('button[type=submit]');
+      if (!scriptBtn) return;
+      scriptBtn.addEventListener('click', function(){
+        var topic = document.getElementById('topic-input').value.trim();
+        if (!topic) { alert('주제를 먼저 입력해주세요'); return; }
+        var detail = document.getElementById('detail-input').value.trim();
+        scriptBtn.disabled = true;
+        scriptBtn.textContent = '대본 만드는 중...';
+        fetch('/admin/generate-script', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ topic: topic, detail: detail }),
+        })
+          .then(function(r){ return r.json(); })
+          .then(function(data){
+            scriptBtn.disabled = false;
+            scriptBtn.textContent = '📝 대본 먼저 만들기';
+            if (!data.ok) { alert('대본 생성 실패: ' + (data.error || '알 수 없는 오류')); return; }
+            scriptTextarea.value = data.scriptText;
+            scriptPreview.style.display = 'block';
+            submitBtn.style.display = 'none'; // 대본 검토 중엔 "바로 생성" 버튼 숨김(혼동 방지)
+          })
+          .catch(function(e){
+            scriptBtn.disabled = false;
+            scriptBtn.textContent = '📝 대본 먼저 만들기';
+            alert('대본 생성 중 오류: ' + e.message);
+          });
+      });
+      useBtn.addEventListener('click', function(){
+        customScriptInput.value = scriptTextarea.value;
+        genForm.requestSubmit ? genForm.requestSubmit() : genForm.submit();
+      });
+      cancelBtn.addEventListener('click', function(){
+        scriptPreview.style.display = 'none';
+        customScriptInput.value = '';
+        submitBtn.style.display = '';
+      });
+    })();
     // [2026-09-02 20:45] 첨부 미디어 업로드 — 사진은 canvas로 리사이즈(전송 용이)해서 보내고,
     // 동영상은 어차피 relay가 최종 렌더링 때 다시 인코딩하므로 원본 그대로 올림.
     (function(){
@@ -3345,9 +3464,18 @@ async function runGenerationStep(job, env) {
 
   if (job.stage === 'start') {
     const slug = String(Date.now());
-    const newsResults = await searchNaverNews(topic, env);
-    const { article, error: articleError } = await generateArticle(topic, newsResults, env, job.detail);
-    if (!article) throw new Error(`글 생성 실패 — ${articleError || '알 수 없는 오류'}`);
+    let article, usedNews;
+    if (job.customScript) {
+      // [2026-09-07 00:10] 미리 검토/수정한 대본이 있으면 AI 글쓰기를 건너뛰고 그 대본을 그대로 씀
+      article = parseScriptToArticle(job.customScript, topic);
+      usedNews = false;
+    } else {
+      const newsResults = await searchNaverNews(topic, env);
+      const { article: generated, error: articleError } = await generateArticle(topic, newsResults, env, job.detail);
+      if (!generated) throw new Error(`글 생성 실패 — ${articleError || '알 수 없는 오류'}`);
+      article = generated;
+      usedNews = newsResults.length > 0;
+    }
     // [2026-09-02 21:20] 문장을 5초 단위로 자연스럽게 재편집(reeditForTtsPacing)한 뒤 정규화/자름
     const rawNarration = [stripHtml(article.intro_html), ...(article.sections || []).map((s) => stripHtml(s.body_html)), stripHtml(article.outro_html)].join(' ');
     const pacedNarration = await reeditForTtsPacing(rawNarration, env);
@@ -3356,11 +3484,11 @@ async function runGenerationStep(job, env) {
     // 목소리는 여기서 한 번 뽑아 영상 전체에 고정 — 세그먼트마다 목소리가 바뀌면 안 되니까.
     const segments = planAudioSegments(prepareNarrationSentences(narrationText), 1); // [2026-08-30 21:51] 문장 하나 = 조각 하나: 모든 문장 시작마다 타이밍이 실측값으로 리셋돼 싱크가 엉킬 수 없음(사용자 제안)
     return {
-      ...job, slug, article, usedNews: newsResults.length > 0, narrationText,
+      ...job, slug, article, usedNews, narrationText,
       segTexts: segments.map((s) => s.text), segSentences: segments.map((s) => s.sentences),
       ttsVoices: pickTtsVoices(), segDone: 0, audioSegmentKeys: [],
       stage: 'audio', percent: 15,
-      logs: pushLog(job, `📝 글쓰기 완료: "${article.title}" (${narrationText.length}자, 문장 ${segments.length}개${newsResults.length ? `, 뉴스 ${newsResults.length}건 참고` : ''})`),
+      logs: pushLog(job, `📝 ${job.customScript ? '검토된 대본 사용' : '글쓰기 완료'}: "${article.title}" (${narrationText.length}자, 문장 ${segments.length}개${usedNews ? `, 뉴스 ${newsResults.length}건 참고` : ''})`),
     };
   }
 
@@ -3768,11 +3896,40 @@ async function handleUploadMedia(request, env) {
   return new Response(JSON.stringify({ ok: true, files: uploaded }), { headers: { 'Content-Type': 'application/json' } });
 }
 
+// [2026-09-07 00:10] "대본 먼저 만들기" — 이미지/음성/렌더링 없이 글쓰기만 빠르게 해서 사용자가
+// 검토/수정할 수 있게 함. 여기서 만든 텍스트를 그대로(또는 고쳐서) /admin/generate에 customScript로
+// 넘기면 실제 생성 단계에서 AI 글쓰기를 다시 안 하고 이 내용을 그대로 씀.
+async function handleGenerateScript(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: '요청 형식 오류' }), { status: 400, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+  }
+  const topic = (body.topic || '').toString().trim().slice(0, 100);
+  const detail = (body.detail || '').toString().trim().slice(0, 2000);
+  if (!topic) return new Response(JSON.stringify({ ok: false, error: '주제를 입력해주세요' }), { status: 400, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+  try {
+    const newsResults = await searchNaverNews(topic, env);
+    const { article, error: articleError } = await generateArticle(topic, newsResults, env, detail);
+    if (!article) {
+      return new Response(JSON.stringify({ ok: false, error: `글 생성 실패 — ${articleError || '알 수 없는 오류'}` }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+    }
+    const scriptText = formatArticleAsScript(article);
+    return new Response(JSON.stringify({ ok: true, scriptText, usedNews: newsResults.length > 0 }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: e.message }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+  }
+}
+
 async function handleGenerate(request, env) {
   const form = await request.formData();
   const topic = (form.get('topic') || '').toString().trim().slice(0, 100);
   if (!topic) return new Response('주제를 입력해주세요', { status: 400 });
   const detail = (form.get('detail') || '').toString().trim().slice(0, 2000); // [2026-09-06 00:20] 상세 내용(선택) — 글쓰기/이미지 검색어 정확도용
+  // [2026-09-07 00:10] "대본 먼저 만들기"로 미리 검토/수정한 대본이 있으면 그걸 그대로 씀 — 있으면
+  // 실제 생성 단계에서 AI 글쓰기(generateArticle)를 다시 하지 않고 이 대본을 파싱해서 바로 사용함.
+  const customScript = (form.get('customScript') || '').toString().trim().slice(0, 6000);
 
   // 같은 주제로 최근에 이미 처리 중이거나 방금 만들어진 게 있으면 중복 생성 막음
   // (진행 상황이 안 보여서 여러 번 누르는 경우가 많았음 — 서버가 대신 걸러줌)
@@ -3817,7 +3974,7 @@ async function handleGenerate(request, env) {
   // 여기선 작업 "등록"만 하고, 실제 진행은 관리자 페이지가 /admin/generate-step을 반복 호출하며
   // 한 단계씩(글쓰기/음성/이미지 1장씩/저장/렌더링등록) 진행시킴. 각 단계는 몇 초 안에 끝나서 시간제한에 안 걸림.
   const jobId = crypto.randomUUID();
-  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, detail, stage: 'start', percent: 0, startedAt: Date.now(), createdAt: Date.now(), userMediaKeys /* [2026-08-30 19:45] 생성 소요시간 측정용(startedAt은 스텝마다 갱신됨) */ }));
+  await env.POSTS.put(`genJob:${jobId}`, JSON.stringify({ topic, detail, customScript, stage: 'start', percent: 0, startedAt: Date.now(), createdAt: Date.now(), userMediaKeys /* [2026-08-30 19:45] 생성 소요시간 측정용(startedAt은 스텝마다 갱신됨) */ }));
 
   return new Response(null, { status: 302, headers: { Location: '/admin?genId=' + jobId + '&msg=' + encodeURIComponent(`생성 시작됨: ${topic} (진행률은 아래 목록에서 확인)`) } });
 }
