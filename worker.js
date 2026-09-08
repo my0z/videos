@@ -1,10 +1,9 @@
 /**
- * 생성(마지막 작업): 2026-09-07 01:10 (KST) — 쿠팡파트너스 관련 상품 추천 기능 추가: 글 생성(finalize
- * 단계)에서 주제로 쿠팡 오픈API 상품검색(HMAC-SHA256 서명, coupangAuthHeader — 실제 서명 생성
- * 테스트로 형식 검증 완료) → post.coupangProducts에 저장 → 글 페이지 하단에 "쿠팡 파트너스 활동의
- * 일환으로 수수료를 제공받습니다" 법적 고지와 함께 표시. COUPANG_ACCESS_KEY/COUPANG_SECRET_KEY
- * 시크릿 없으면 조용히 건너뜀(발행 자체는 안 막힘). 응답 필드명은 문서 기준 추정이라 실제 승인
- * 계정으로 첫 호출 시 로그로 원본 응답을 확인해서 필요하면 조정 필요
+ * 생성(마지막 작업): 2026-09-07 01:45 (KST) — 첨부 미디어 AI 분석 기능 추가: 사용자가 직접 첨부한
+ * 사진(첫 번째)을 SambaNova 비전 모델(Llama-4-Maverick, SAMBANOVA_API_KEY 이미 등록됨)로 분석해서
+ * 뭐가 나오는지 파악 → AI가 만드는 나머지 장면 키워드가 첨부 이미지 분위기/소재와 더 잘 어울리게
+ * generateScenePrompts에 반영(analyzeAttachedMediaForContext). Gemini는 막혀있어서 안 씀, Groq
+ * 비전은 프리뷰(불안정)라 배제하고 SambaNova로 결정
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1332,6 +1331,44 @@ async function coupangAuthHeader(method, pathAndQuery, env) {
 }
 // 주제로 관련 상품 검색 — 응답 필드는 쿠팡 공식 문서 기준으로 짰지만, 실제 승인 계정으로 첫 호출
 // 해보고 필드명이 다르면(예: data.productData vs data) 로그로 원본을 남겨서 바로 확인 가능하게 함.
+// ---------- 첨부 미디어 AI 분석(장면 이미지 검색 정확도 향상용) — 작업: 2026-09-07 01:45 ----------
+// 사용자가 직접 첨부한 미디어를 SambaNova 비전 모델로 분석해서 "뭐가 나오는지" 짧게 설명을 뽑고,
+// 그 설명을 generateScenePrompts에 같이 넘겨서 AI가 만드는 나머지 장면들이 첨부 미디어의 분위기/
+// 소재와 더 잘 어울리게(검색 키워드가 더 정확하게) 유도함. Gemini는 막혀있어서 안 씀.
+async function analyzeAttachedMediaForContext(imageBuffer, contentType, env) {
+  if (!env.SAMBANOVA_API_KEY) return '';
+  try {
+    const base64 = arrayBufferToBase64(imageBuffer);
+    const res = await fetch('https://api.sambanova.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.SAMBANOVA_API_KEY}` },
+      body: JSON.stringify({
+        model: 'Llama-4-Maverick-17B-128E-Instruct',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: '이 이미지에 뭐가 나오는지 영어로 짧게(10단어 이내) 스톡사진 검색어처럼 설명해줘. 다른 말은 하지 말고 설명만.' },
+            { type: 'image_url', image_url: { url: `data:${contentType || 'image/jpeg'};base64,${base64}` } },
+          ],
+        }],
+        temperature: 0.3,
+        max_tokens: 60,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) {
+      await res.text().catch(() => {});
+      console.log(`첨부 미디어 분석 실패: HTTP ${res.status}`);
+      return '';
+    }
+    const data = await res.json();
+    return (data?.choices?.[0]?.message?.content || '').trim();
+  } catch (e) {
+    console.log(`첨부 미디어 분석 오류: ${e.message}`);
+    return '';
+  }
+}
+
 async function searchCoupangProducts(keyword, env, limit = 3) {
   if (!env.COUPANG_ACCESS_KEY || !env.COUPANG_SECRET_KEY) return [];
   try {
@@ -3229,6 +3266,14 @@ async function renderAdminPage(env, requestUrl) {
         card.querySelector('.date').textContent = esc(p.createdAtText);
         anchor.insertAdjacentElement('afterend', card);
       }
+      // [2026-09-07 01:30] 폴링이 실제로 살아있는지 눈으로 바로 확인할 수 있게, 진행 상황 옆에
+      // "확인 HH:MM:SS" 시각을 매번 찍음 — 이 시각이 계속 바뀌면 폴링은 정상, 안 바뀌면 배포가
+      // 안 됐거나 다른 문제가 있는 것으로 바로 구분됨.
+      function nowHMS(){
+        var d = new Date();
+        function p2(n){ return String(n).padStart(2, '0'); }
+        return p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+      }
       function pollRender(){
         var renderEls = document.querySelectorAll('.render-progress');
         renderEls.forEach(function(el){
@@ -3301,7 +3346,7 @@ async function renderAdminPage(env, requestUrl) {
               }
               // relay가 주는 자체 percent(0~100)를 50~80% 구간으로 매핑
               var relayPct = typeof data.percent === 'number' ? data.percent : 0;
-              el.textContent = (data.stage || '렌더링 중') + ' · ' + relayPct + '%';
+              el.textContent = (data.stage || '렌더링 중') + ' · ' + relayPct + '% · 확인 ' + nowHMS();
               setBar(card, 50 + relayPct * 0.3);
             })
             .catch(function(){});
@@ -3368,7 +3413,7 @@ async function renderAdminPage(env, requestUrl) {
                 refreshAdminList();
                 return;
               }
-              el.textContent = (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
+              el.textContent = (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '% · 확인 ' + nowHMS();
               setBar(card, (data.percent || 0) * 0.5);
             })
             .catch(function(){
@@ -3693,10 +3738,21 @@ async function runGenerationStep(job, env) {
     // AI는 나머지 자리(SCENE_COUNT - 첨부 개수)만 생성하도록 요청 장면 수를 줄임
     const userMediaKeys = Array.isArray(job.userMediaKeys) ? job.userMediaKeys : [];
     const wantAiScenes = Math.max(0, SCENE_COUNT - userMediaKeys.length);
-    const scenes = wantAiScenes ? await generateScenePrompts(topic, job.article.title, env, wantAiScenes, buildArticleDigestForScenes(job.article)) : [];
+    // [2026-09-07 01:45] 첨부 미디어(첫 번째 이미지, 클립 제외)를 AI로 분석해서 뭐가 나오는지 파악
+    // → AI가 만드는 나머지 장면 키워드가 첨부 이미지 분위기/소재와 더 잘 어울리게 유도(정확도 개선)
+    let attachedMediaContext = '';
+    const firstAttachedImageKey = userMediaKeys.find((k) => !/\.mp4$/i.test(k));
+    if (firstAttachedImageKey && env.MEDIA) {
+      const mediaObj = await env.MEDIA.get(firstAttachedImageKey);
+      if (mediaObj) {
+        const desc = await analyzeAttachedMediaForContext(await mediaObj.arrayBuffer(), mediaObj.httpMetadata?.contentType, env);
+        if (desc) attachedMediaContext = `\n\n사용자가 직접 첨부한 사진에는 이런 게 나옵니다(참고해서 나머지 장면들의 분위기/소재를 맞춰줘): ${desc}`;
+      }
+    }
+    const scenes = wantAiScenes ? await generateScenePrompts(topic, job.article.title, env, wantAiScenes, buildArticleDigestForScenes(job.article) + attachedMediaContext) : [];
     return {
       ...job, audioKey, audioError: null, scenes, sceneIndex: 0, images: userMediaKeys.slice(), stage: scenes.length ? 'images' : 'finalize', percent: 30,
-      logs: pushLog(job, `🎬 장면 구상 완료: AI 장면 ${scenes.length}개${userMediaKeys.length ? ` + 첨부 미디어 ${userMediaKeys.length}개` : ''}`),
+      logs: pushLog(job, `🎬 장면 구상 완료: AI 장면 ${scenes.length}개${userMediaKeys.length ? ` + 첨부 미디어 ${userMediaKeys.length}개` : ''}${attachedMediaContext ? ' (첨부 이미지 분석 반영됨)' : ''}`),
     };
   }
 
