@@ -1,9 +1,8 @@
 /**
- * 생성(마지막 작업): 2026-09-09 20:35 (KST) — 렌더링 요청이 이상한 형식의 500 에러로 실패하는 문제
- * 진단: nginx 로그 확인 결과 실패한 요청들이 User-Agent 없이(-) 찍혀있었음 — User-Agent 없는
- * 요청을 막는 보안모듈(fail2ban/ModSecurity 등)에 걸릴 가능성을 배제하려고 Worker→relay 요청
- * 전부(health/render/render-status 2곳)에 명시적 User-Agent 헤더 추가. 실제 원인이었는지는 배포
- * 후 결과로 확인 필요
+ * 생성(마지막 작업): 2026-09-10 06:01 (KST) — "확인 HH:MM:SS"가 계속 안 보이는 문제 — 여러 번 확인해도
+ * 폴링 스크립트가 실행되는 흔적이 전혀 없어서, 실행 중 어디선가 조용히 멈추고 있는 것으로 추정.
+ * 개발자도구 없이(모바일 포함) 바로 원인을 볼 수 있게 progressScript 전체를 try-catch로 감싸서,
+ * 오류가 나면 화면 맨 위에 빨간 배너로 에러 메시지+스택을 직접 출력하도록 함
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -3265,6 +3264,7 @@ async function renderAdminPage(env, requestUrl) {
   const hasGenPending = genJobs.some((j) => !j.failed);
   const progressScript = (hasPending || hasGenPending) ? `<script>
     (function(){
+      try {
       function bumpCount(delta){
         var h2 = document.querySelector('h2');
         if (!h2) return;
@@ -3463,6 +3463,15 @@ async function renderAdminPage(env, requestUrl) {
       stepGen();
       setInterval(pollRender, 1000);
       setInterval(stepGen, 1000);
+      } catch (e) {
+        // [2026-09-10 05:55] 개발자도구 없이(특히 모바일) 바로 원인을 볼 수 있게, 폴링 스크립트
+        // 초기화 중 어떤 오류든 나면 화면 맨 위에 눈에 보이게 직접 찍음 — 이게 뜨면 그 메시지 그대로
+        // 알려주면 정확한 원인을 바로 잡을 수 있음.
+        var banner = document.createElement('div');
+        banner.style.cssText = 'background:#DC2626;color:white;padding:12px 16px;font-size:14px;font-family:monospace;white-space:pre-wrap;position:sticky;top:0;z-index:9999;';
+        banner.textContent = '⚠️ 진행률 스크립트 오류: ' + (e && e.message ? e.message : String(e)) + (e && e.stack ? ('\\n' + e.stack.split('\\n').slice(0,3).join('\\n')) : '');
+        document.body.insertBefore(banner, document.body.firstChild);
+      }
     })();
   </script>` : '';
 
