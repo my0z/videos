@@ -1,9 +1,7 @@
 /**
- * 생성(마지막 작업): 2026-09-07 01:45 (KST) — 첨부 미디어 AI 분석 기능 추가: 사용자가 직접 첨부한
- * 사진(첫 번째)을 SambaNova 비전 모델(Llama-4-Maverick, SAMBANOVA_API_KEY 이미 등록됨)로 분석해서
- * 뭐가 나오는지 파악 → AI가 만드는 나머지 장면 키워드가 첨부 이미지 분위기/소재와 더 잘 어울리게
- * generateScenePrompts에 반영(analyzeAttachedMediaForContext). Gemini는 막혀있어서 안 씀, Groq
- * 비전은 프리뷰(불안정)라 배제하고 SambaNova로 결정
+ * 생성(마지막 작업): 2026-09-07 02:15 (KST) — 글쓰기/이미지/음성 단계(genJob) 실패가 3분만 보이고
+ * 흔적 없이 사라지던 문제 수정: 렌더링 실패(renderFail)처럼 genFail:{id}로 3일간 영구 기록을 남기고
+ * 관리자 페이지 상단에 표시(recordGenFailure) — dismiss-fail이 genId도 받아서 지울 수 있게 확장
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -180,10 +178,12 @@ export default {
       if (path === '/admin/generate-script' && request.method === 'POST') return await handleGenerateScript(request, env);
       if (path === '/api/generate' && request.method === 'POST') return await handleApiGenerate(request, env);
       if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
-      if (path === '/admin/dismiss-fail' && request.method === 'POST') { // [2026-08-30 19:52] 렌더링 실패 기록 확인 후 지우기
+      if (path === '/admin/dismiss-fail' && request.method === 'POST') { // [2026-08-30 19:52] 렌더링/생성 실패 기록 확인 후 지우기
         const form = await request.formData();
         const failSlug = (form.get('slug') || '').toString();
+        const failGenId = (form.get('genId') || '').toString(); // [2026-09-07 02:15] 생성 단계 실패 기록용
         if (failSlug) await env.POSTS.delete(`renderFail:${failSlug}`);
+        if (failGenId) await env.POSTS.delete(`genFail:${failGenId}`);
         return new Response(null, { status: 302, headers: { Location: '/admin' } });
       }
       if (path === '/admin/render-progress') return await handleRenderProgress(request, env, ctx);
@@ -2095,6 +2095,19 @@ async function triggerYoutubeUpload(slug, r2Key, env) {
 
 // [2026-08-30 19:52] 렌더링 실패 기록 — 실패 이유가 화면에서 사라지지 않도록 KV에 3일간 보관.
 // 특히 오디오 검증 실패(NO_AUDIO_TRACK)는 글 자체가 삭제돼서 이 기록이 유일한 흔적이 됨(관리자 상단에 표시).
+// [2026-09-07 02:15] 글쓰기/이미지/음성 단계(genJob) 실패도 렌더링 실패와 똑같이 며칠간 기록을
+// 남김 — 예전엔 실패 화면에 3분만 보이고 아무 흔적도 없이 지워져서, 그 사이 못 보면 원인을 영영
+// 알 수 없었음(이번 "newsResults is not defined" 사례가 그 예).
+async function recordGenFailure(id, topic, errMsg, env) {
+  try {
+    await env.POSTS.put(`genFail:${id}`, JSON.stringify({
+      id, topic: (topic || '').slice(0, 100), error: (errMsg || '').slice(0, 500), at: new Date().toISOString(),
+    }), { expirationTtl: 3 * 24 * 3600 });
+  } catch (e) {
+    console.log(`생성 실패 기록 실패(무시): ${e.message}`);
+  }
+}
+
 async function recordRenderFailure(slug, errMsg, postDeleted, env) {
   try {
     const postRaw = await env.POSTS.get(`post:${slug}`);
@@ -2273,6 +2286,7 @@ async function pollPendingGenJobs(env) {
       await env.POSTS.put(keyInfo.name, JSON.stringify(job));
     } catch (e) {
       await env.POSTS.put(keyInfo.name, JSON.stringify({ ...job, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() })).catch(() => {});
+      await recordGenFailure(keyInfo.name.split(':')[1], job.topic, e.message, env);
       console.log(`[${keyInfo.name}] 크론 진행 중 실패: ${e.message}`);
     }
   }
@@ -3098,6 +3112,23 @@ async function renderAdminPage(env, requestUrl) {
     </div>
   </div>`).join('');
 
+  // [2026-09-07 02:15] 글쓰기/이미지/음성 단계(genJob) 실패 기록 — 렌더링 실패랑 똑같이 며칠간 남겨서
+  // 화면 갱신 타이밍을 놓쳐도 원인을 나중에 확인할 수 있게 함(예전엔 3분 지나면 흔적도 없이 사라졌음)
+  const genFailsRaw = await env.POSTS.list({ prefix: 'genFail:' });
+  const genFails = [];
+  for (const k of genFailsRaw.keys.slice(0, 5)) {
+    const raw = await env.POSTS.get(k.name);
+    if (raw) genFails.push(JSON.parse(raw));
+  }
+  genFails.sort((a, b) => new Date(b.at) - new Date(a.at));
+  const genFailCards = genFails.map((f) => `<div class="admin-card is-failed" style="grid-column:1/-1;display:block;">
+    <div class="body">
+      <div class="status-line" style="color:#92400E;">📝❌ 생성 실패(${new Date(f.at).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}) — ${escapeHtml(f.topic || '(주제 없음)')}<br>
+      사유: ${escapeHtml(f.error || '기록 없음')}</div>
+      <div class="actions"><form method="POST" action="/admin/dismiss-fail"><input type="hidden" name="genId" value="${escapeHtml(f.id)}"><button type="submit">확인(지우기)</button></form></div>
+    </div>
+  </div>`).join('');
+
   // [2026-09-02 20:30] 전체진행률(0~100)을 하나의 바로 계산 — 글쓰기/음성/이미지(0~50%) → mp4 렌더링(50~80%) →
   // 유튜브 업로드(80~100%) 세 단계를 이어붙여서 보여줌. 서버 렌더링 시점의 초기값이고, 이후엔 클라이언트
   // 폴링(pollRender/stepGen)이 실측값으로 계속 갱신함.
@@ -3483,7 +3514,7 @@ async function renderAdminPage(env, requestUrl) {
         </div>
       </div>
     </form>
-    <div class="admin-grid" id="admin-tbody">${renderFailCards}${genJobCards}<div id="posts-anchor" style="display:none;"></div>${postCards || '<p id="empty-row" style="grid-column:1/-1;color:var(--muted);">글이 없습니다.</p>'}</div>
+    <div class="admin-grid" id="admin-tbody">${renderFailCards}${genFailCards}${genJobCards}<div id="posts-anchor" style="display:none;"></div>${postCards || '<p id="empty-row" style="grid-column:1/-1;color:var(--muted);">글이 없습니다.</p>'}</div>
   </div><script>
     // [2026-09-07 00:10] "대본 먼저 만들기" — 이미지/음성/렌더링 없이 글쓰기만 빠르게 해서 미리 보여주고,
     // 검토/수정 후 그 내용 그대로(또는 고친 대로) 최종 생성에 넘김.
@@ -3664,12 +3695,15 @@ async function runGenerationStep(job, env) {
   if (job.stage === 'start') {
     const slug = String(Date.now());
     let article, usedNews;
+    let newsResults = []; // [2026-09-07 02:00] 버그 수정 — customScript 경로에서 이 변수가 아예
+    // 안 만들어지던 문제로 "newsResults is not defined" 오류가 났음. 항상 바깥 스코프에 빈 배열로
+    // 미리 선언해서, 아래 로그 줄에서 어느 경로를 타든 절대 참조 오류가 안 나게 함.
     if (job.customScript) {
       // [2026-09-07 00:10] 미리 검토/수정한 대본이 있으면 AI 글쓰기를 건너뛰고 그 대본을 그대로 씀
       article = parseScriptToArticle(job.customScript, topic);
       usedNews = false;
     } else {
-      const newsResults = await searchNaverNews(topic, env);
+      newsResults = await searchNaverNews(topic, env);
       const { article: generated, error: articleError } = await generateArticle(topic, newsResults, env, job.detail);
       if (!generated) throw new Error(`글 생성 실패 — ${articleError || '알 수 없는 오류'}`);
       article = generated;
@@ -3927,6 +3961,7 @@ async function handleGenerateStep(request, env) {
     return new Response(JSON.stringify({ status: 'processing', topic: job.topic, stage: job.stage, percent: job.percent, logs: job.logs || [] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   } catch (e) {
     await env.POSTS.put(`genJob:${id}`, JSON.stringify({ ...job, stage: '실패', percent: 0, error: e.message, failed: true, startedAt: Date.now() }));
+    await recordGenFailure(id, job.topic, e.message, env);
     return new Response(JSON.stringify({ status: 'failed', topic: job.topic, error: e.message }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
   }
 }
