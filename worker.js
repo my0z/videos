@@ -1,8 +1,9 @@
 /**
- * 생성(마지막 작업): 2026-09-09 20:02 (KST) — 제목 작성 원칙 3가지 추가(A/B 실험 결과 기반, 사용자
- * 제공): 1) 시간/상황을 구체적 숫자·장면으로 박기 2) 결론을 바로 안 주고 뻔한 답부터 지워서
- * 궁금하게 만들기 3) 설명이 아니라 장면이 떠오르는 문장으로 쓰기 — generateArticle의 두 systemPrompt
- * (뉴스 있음/없음) 모두에 반영
+ * 생성(마지막 작업): 2026-09-09 20:35 (KST) — 렌더링 요청이 이상한 형식의 500 에러로 실패하는 문제
+ * 진단: nginx 로그 확인 결과 실패한 요청들이 User-Agent 없이(-) 찍혀있었음 — User-Agent 없는
+ * 요청을 막는 보안모듈(fail2ban/ModSecurity 등)에 걸릴 가능성을 배제하려고 Worker→relay 요청
+ * 전부(health/render/render-status 2곳)에 명시적 User-Agent 헤더 추가. 실제 원인이었는지는 배포
+ * 후 결과로 확인 필요
  * life-news - 생활뉴스 주제를 입력하면 글과 진짜 mp4 영상(이미지 슬라이드쇼+내레이션 음성)을 만드는 워커
  *
  * 글: 낭독 약 4분(공백 포함 1,700~2,000자) 분량, 싱크 친화 문장 규칙(20~45자 짧은 문장, 특수기호 금지 등) 적용
@@ -1451,7 +1452,7 @@ async function startRelayRender(imageKeys, audioKey, audioSegmentKeys, outputKey
 
     const res = await fetch(`${env.RELAY_URL}/render`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
+      headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET, 'User-Agent': 'life-news-worker/1.0' },
       // weights: 이미지별 노출시간 배분 비율, captionBeats: 이미지별 자막 "비트" 배열(그 이미지가 떠 있는
       // 동안 순서대로 갈아끼울 문장들 — drawtext에 시간대별로 나눠서 그림; 비트마다 segIndex로 음성 세그먼트 매핑)
       // captionFontKey/captionColor: 이 영상 전체에 고정으로 쓸 폰트 키/색 하나(위치도 영상당 하나로 고정 — captionBeats의 styleIndex가 이미 전부 동일한 값으로 옴)
@@ -1856,8 +1857,11 @@ async function getOracleVmStats(env) {
 async function checkRelayHealth(env) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return; // env 미설정이면 체크 스킵
   try {
+    // [2026-09-09 20:35] nginx 로그에서 실패한 요청들이 User-Agent 없이(-) 찍히는 게 확인돼서,
+    // User-Agent 없는 요청을 막는 보안 모듈(fail2ban/ModSecurity 등)에 걸릴 가능성을 배제하려고
+    // 명시적으로 넣음 — 실제 원인이 이거였는지는 이 배포 후 결과로 확인 필요.
     const res = await fetch(`${env.RELAY_URL}/health`, {
-      headers: { 'x-relay-secret': env.RELAY_SECRET },
+      headers: { 'x-relay-secret': env.RELAY_SECRET, 'User-Agent': 'life-news-worker/1.0' },
       signal: AbortSignal.timeout(5000),
     });
     if (res.ok) {
@@ -2213,7 +2217,7 @@ async function pollPendingRenderJobs(env, ctx) {
     let res;
     try {
       res = await fetch(`${env.RELAY_URL}/render/status?jobId=${encodeURIComponent(job.jobId)}`, {
-        headers: { 'x-relay-secret': env.RELAY_SECRET },
+        headers: { 'x-relay-secret': env.RELAY_SECRET, 'User-Agent': 'life-news-worker/1.0' },
         signal: AbortSignal.timeout(10000),
       });
     } catch (e) {
@@ -4003,7 +4007,7 @@ async function handleRenderProgress(request, env, ctx) {
   }
   try {
     const res = await fetch(`${env.RELAY_URL}/render/status?jobId=${encodeURIComponent(job.jobId)}`, {
-      headers: { 'x-relay-secret': env.RELAY_SECRET },
+      headers: { 'x-relay-secret': env.RELAY_SECRET, 'User-Agent': 'life-news-worker/1.0' },
       signal: AbortSignal.timeout(8000),
     });
     if (res.status === 404) {
